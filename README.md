@@ -1,27 +1,42 @@
-# WingSAXS｜二维小角散射蝴蝶图样分析工具
+<h1 align="center">
+  <img src="assets/readme/hero.png" width="100%" alt="WingSAXS: conceptual illustration of butterfly-pattern 2D SAXS analysis, with observed lobes and trajectories; 二维小角散射蝴蝶图样分析概念图">
+</h1>
 
-[![CI](https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml/badge.svg)](https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/Python-3.11--3.13-blue)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center">
+  <strong>Trace observed butterfly trajectories across 2D SAXS images and follow their evolution through an in-situ series.</strong><br>
+  从二维 SAXS 图像中提取可观测蝴蝶轨迹，并跟踪其在原位序列中的演化。
+</p>
 
-**Identify and parameterize butterfly-pattern 2D SAXS, then review an in-situ series without treating a solver bound as a measured structure.**
+<p align="center">
+  <a href="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml"><img src="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/Python-3.11--3.13-blue" alt="Python 3.11 to 3.13">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
+</p>
 
-WingSAXS reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), builds physical `q`, `chi`, `qx`, and `qy` from a PONI file through pyFAI, traces observed butterfly arcs, and reports what the image actually supports:
+<p align="center">
+  <a href="#english">English</a> · <a href="#中文说明">中文说明</a> · <a href="#quick-start">Quick start</a> · <a href="#安装与启动">安装与启动</a> · <a href="#documentation">Documentation / 文档</a> · <a href="#scientific-scope">Scientific scope / 科学边界</a>
+</p>
 
-| Observed data | Fitted estimates and interpretation |
+## English
+
+WingSAXS reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), derives physical `q`, `χ`, `qx`, and `qy` from PONI geometry through pyFAI, and traces the butterfly arcs supported by the measured intensity.
+
+| Observed evidence / 观测证据 | Reported quantities / 输出量 |
 | --- | --- |
-| q-ring profiles, observed petal trajectories, quality, and flags | First-order `q*` and **L ring** = `2π/q*` |
-| Occupied sides and supported branches | Apparent `a`, `b/a`, `θ`, with support and confidence |
-| Missing lobes/rings remain missing | Unpublished **Ln / Lz / L major** candidates |
-| Ring diagnosis and explicit fit limitations | Boundary/extrapolated candidates remain available; ring L and Ln stay distinct |
+| q-ring profiles and observed petal trajectories<br>q 环剖面与实测花瓣轨迹 | First-order `q*` and ring period `L = 2π/q*`<br>一阶 `q*` 与环尺度 `L = 2π/q*` |
+| Occupied sides and supported branches<br>实际占据象限与有数据支持的分支 | Apparent `a`, `b/a`, and `θ`, with support and confidence<br>表观 `a`、`b/a`、`θ`，并附观测支持与可信度 |
+| Missing lobes and rings remain missing<br>缺失花瓣与 q 环保持缺失 | Conditional **Ln / Lz / L major** candidates<br>附条件的 **Ln / Lz / 长轴 L** 候选 |
+| Ring diagnosis and fit limitations<br>环诊断与拟合限制 | Finite boundary or extrapolated candidates remain inspectable; ring L and Ln stay distinct<br>有限边界值或外推候选仍可检查；环尺度 L 与 Ln 分列 |
 
-`success=True` is not scientific acceptance. Pixel-q never invents a physical period. Opposite quadrants are never fabricated.
+A successful fit is not scientific acceptance. Pixel-q does not provide a physical period, and missing quadrants are never synthesized.<br>
+拟合成功不等于科学结论已获接受；像素 q 不能给出物理周期，也不会补造缺失象限。
 
-[中文说明](#中文说明) · [Install](#install) · [Quick start](#quick-start) · [Docs](#documentation) · [Scientific scope](#scientific-scope)
+### Example / 示例
 
 ![Synthetic butterfly pattern with an origin-centred double-ellipse overlay](docs/assets/refinement-ui.png)
 
-Synthetic demonstration (pixel-q): the empirical double ellipse drawn on a generated butterfly. Inspect the observed trajectories and confidence information alongside the overlay.
+Synthetic demonstration (pixel-q): the empirical double ellipse is overlaid on a generated butterfly pattern. The measured trajectories and confidence information remain visible.<br>
+合成示例（pixel-q）：在生成的蝴蝶图样上叠加经验双椭圆，同时保留实测轨迹与可信度信息。
 
 ## What it does
 
