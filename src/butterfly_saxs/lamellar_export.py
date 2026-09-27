@@ -561,21 +561,25 @@ def _sequence_parameter_rows(frame_entries: Sequence[Mapping[str, Any]], scenes:
     return rows
 
 
-def _blank_scene(index: int, reason: str) -> Any:
+def _blank_scene(index: int, reason: str, *, length_unit: str = "relative") -> Any:
     return SimpleNamespace(
         status="unavailable",
         message=reason,
         source_identity=f"frame_{index:04d}",
-        length_unit="relative",
+        length_unit=length_unit,
         metadata={"frame_index": index},
         vertices=np.empty((0, 8, 3), dtype=float),
         bounds=np.asarray(((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)), dtype=float),
     )
 
 
-def _sequence_bounds(scenes: Sequence[Any]) -> np.ndarray:
+def _sequence_bounds(scenes: Sequence[Any], *, length_unit: str | None = None) -> np.ndarray:
     points: list[np.ndarray] = []
     for scene in scenes:
+        if scene is None:
+            continue
+        if length_unit is not None and str(_get(scene, "length_unit", "relative")) != length_unit:
+            continue
         try:
             vertices = np.asarray(_get(scene, "vertices", np.empty((0, 8, 3))), dtype=float)
         except (TypeError, ValueError):
@@ -632,7 +636,26 @@ def export_lamellar_sequence(
         raise ValueError("at least one scene is required")
     _check_cancel(cancel_event)
     target, stage = _new_stage(destination)
-    viewport = _sequence_bounds(scene_list)
+    scene_units = {
+        str(_get(scene, "length_unit", "relative"))
+        for scene in scene_list
+        if scene is not None
+    }
+    blank_unit = next(iter(scene_units)) if len(scene_units) == 1 else "relative"
+    viewport_units = set(scene_units)
+    if any(scene is None for scene in scene_list):
+        viewport_units.add(blank_unit)
+    if not viewport_units:
+        viewport_units.add(blank_unit)
+    viewport_by_unit = {
+        unit: _sequence_bounds(scene_list, length_unit=unit)
+        for unit in sorted(viewport_units)
+    }
+    viewport = (
+        next(iter(viewport_by_unit.values()))
+        if len(viewport_by_unit) == 1
+        else viewport_by_unit
+    )
     frame_entries: list[dict[str, Any]] = []
     provenance_scenes: list[Any] = []
     frame_paths: list[Path] = []
@@ -641,7 +664,7 @@ def export_lamellar_sequence(
             _check_cancel(cancel_event)
             source_scene = original
             if source_scene is None:
-                source_scene = _blank_scene(index, "Frame is missing; no geometry was supplied" if str(language).lower().startswith("en") else "帧缺失，未提供几何数据")
+                source_scene = _blank_scene(index, "Frame is missing; no geometry was supplied" if str(language).lower().startswith("en") else "帧缺失，未提供几何数据", length_unit=blank_unit)
             scene = source_scene
             status = _status(scene)
             missing = original is None or status in {"unavailable", "stale"} or not _has_geometry(scene)
@@ -661,9 +684,9 @@ def export_lamellar_sequence(
                 capture = None
                 observed = qmap_observed if qmap_observed is not None else image_item
             if observed is not None or capture is not None:
-                figure = render_lamellar_combined(scene, observed=observed, qx=qx, qy=qy, image_3d=capture, camera=camera, language=language, bounds=viewport)
+                figure = render_lamellar_combined(scene, observed=observed, qx=qx, qy=qy, image_3d=capture, camera=camera, language=language, bounds=viewport_by_unit.get(str(scene.length_unit)))
             else:
-                figure = render_lamellar_2d(scene, language=language, bounds=viewport)
+                figure = render_lamellar_2d(scene, language=language, bounds=viewport_by_unit.get(str(scene.length_unit)))
             frame_path = stage / f"frame_{index:04d}.png"
             figure.savefig(frame_path, format="png", dpi=220, bbox_inches="tight")
             frame_paths.append(frame_path)
@@ -717,6 +740,7 @@ def export_lamellar_sequence(
             "frame_count": len(scene_list),
             "frames": frame_entries,
             "viewport_bounds": _jsonable(viewport),
+            "viewport_bounds_by_unit": _jsonable(viewport_by_unit),
             "files": [path.name for path in frame_paths] + [gif_path.name, parameter_sources_path.name],
         }
         _write_json(stage / "manifest.json", manifest)

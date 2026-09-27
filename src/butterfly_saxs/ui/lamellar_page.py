@@ -22,25 +22,89 @@ from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .workers import AnalysisWorker
 
 
+def _default_page_settings() -> dict[str, Any]:
+    """Start the workbench in a dense, clearly schematic field organization."""
+
+    return LamellarSettings.from_mapping(
+        {
+            "mode": "multi",
+            "period_source": "radial",
+            "layer_count": 5,
+            "stack_count": 64,
+            "thickness_ratio": 0.70,
+            "width_ratio": 3.2,
+            "depth_ratio": 1.8,
+            "spread_deg": 4.0,
+            "spacing_jitter_pct": 6.0,
+            "position_jitter_pct": 70.0,
+            "lateral_shift_ratio": 0.18,
+            "out_of_plane_deg": 0.0,
+            "seed": 42,
+        }
+    ).to_dict()
+
+
 def _build_scenes(sources: list[Any], values: dict[str, Any], cancel: threading.Event) -> list[Any]:
     settings = LamellarSettings.from_mapping(values)
+    # Build a multi-frame preview without a saved common reference first.  A
+    # stored reference has no unit in the settings schema, so it cannot safely
+    # be applied until the available frames' length units are known.
+    initial_settings = (
+        replace(settings, reference_period=None)
+        if len(sources) > 1 and settings.period_source != "manual"
+        else settings
+    )
     scenes = []
     for source in sources:
         if cancel.is_set():
             raise RuntimeError("cancelled")
-        scenes.append(build_lamellar_scene(source, settings))
+        scenes.append(build_lamellar_scene(source, initial_settings))
         scenes[-1].metadata["display_q_window"] = field(field(source, "analysis", {}), "q_window")
-    if len(scenes) > 1 and settings.reference_period is None:
-        periods = [float(scene.metadata["reference_period"]) for scene in scenes
-                   if scene.metadata.get("available") and scene.metadata.get("reference_period")]
-        if periods:
-            settings = replace(settings, reference_period=max(periods))
-            scenes = []
-            for source in sources:
-                if cancel.is_set():
-                    raise RuntimeError("cancelled")
-                scenes.append(build_lamellar_scene(source, settings))
-                scenes[-1].metadata["display_q_window"] = field(field(source, "analysis", {}), "q_window")
+    if len(scenes) > 1:
+        sequence_units = set()
+        for scene in scenes:
+            population_units = {
+                str(population["length_unit"])
+                for population in scene.metadata.get("populations", [])
+                if population.get("length_unit") in {"nm", "relative"}
+                and population.get("period") is not None
+            }
+            if population_units:
+                sequence_units.update(population_units)
+            elif scene.metadata.get("available"):
+                sequence_units.add(str(scene.length_unit))
+        # `reference_period` is only meaningful within one length unit.  In a
+        # mixed physical/relative sequence, keep each frame on its own scale;
+        # in a homogeneous sequence, retain the shared-layout behavior.
+        if len(sequence_units) <= 1:
+            periods = [
+                float(scene.metadata["reference_period"])
+                for scene in scenes
+                if scene.metadata.get("available") and scene.metadata.get("reference_period")
+            ]
+            if settings.reference_period is not None:
+                periods.append(float(settings.reference_period))
+            if periods:
+                common_period = max(periods)
+                needs_rebuild = initial_settings.reference_period is None or not np.isclose(
+                    float(initial_settings.reference_period), common_period, rtol=1e-12, atol=0.0
+                ) or any(
+                    not np.isclose(
+                        float(scene.metadata.get("reference_period", common_period)),
+                        common_period,
+                        rtol=1e-12,
+                        atol=0.0,
+                    )
+                    for scene in scenes
+                )
+                if needs_rebuild:
+                    shared_settings = replace(settings, reference_period=common_period)
+                    scenes = []
+                    for source in sources:
+                        if cancel.is_set():
+                            raise RuntimeError("cancelled")
+                        scenes.append(build_lamellar_scene(source, shared_settings))
+                        scenes[-1].metadata["display_q_window"] = field(field(source, "analysis", {}), "q_window")
     return scenes
 
 
@@ -62,7 +126,7 @@ if QT_AVAILABLE:
             super().__init__(parent)
             self.setObjectName("lamellarPage")
             self.language = language
-            self.settings = LamellarSettings().to_dict()
+            self.settings = _default_page_settings()
             self._palette = "blue_orange"
             self._publication_document: dict[str, Any] = {}
             self._publication_dialog: Any = None
@@ -149,6 +213,8 @@ if QT_AVAILABLE:
             self.settings_button.setCheckable(True)
             self.settings_button.setChecked(True)
             header.addWidget(self.settings_button)
+            self.scattering_button = self._button("scattering", self.open_projected_fft, tool=True)
+            header.addWidget(self.scattering_button)
             self.publication_button = self._button("publication", self.open_publication, tool=True)
             header.addWidget(self.publication_button)
             self.export_button = self._button("export", lambda: None, tool=True)
@@ -187,19 +253,21 @@ if QT_AVAILABLE:
             self.splitter.addWidget(self._panel("three_d", self.view3d))
             self.control_scroll = QtWidgets.QScrollArea()
             self.control_scroll.setWidgetResizable(True)
-            self.control_scroll.setMinimumWidth(248)
-            self.control_scroll.setMaximumWidth(320)
+            self.control_scroll.setMinimumWidth(300)
+            self.control_scroll.setMaximumWidth(360)
+            self.control_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.control_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
             self.controls = LamellarControls(language=self.language)
             self.controls.settingsChanged.connect(self.update_settings)
             self.controls.presentationChanged.connect(self.set_palette)
             self.controls.resetRequested.connect(self.reset_settings)
+            self.controls.presetRequested.connect(self.apply_preview_preset)
             self.control_scroll.setWidget(self.controls)
             self.splitter.addWidget(self.control_scroll)
             self.splitter.setStretchFactor(0, 3)
             self.splitter.setStretchFactor(1, 5)
             self.splitter.setStretchFactor(2, 0)
-            self.splitter.setSizes([330, 520, 260])
+            self.splitter.setSizes([320, 500, 340])
             self.splitter.setChildrenCollapsible(False)
             root.addWidget(self.splitter, 1)
             self.frame_text = QtWidgets.QLabel()
@@ -359,7 +427,41 @@ if QT_AVAILABLE:
             self.documentChanged.emit()
 
         def reset_settings(self) -> None:
-            self.update_settings(LamellarSettings().to_dict())
+            self.update_settings(_default_page_settings())
+
+        def apply_preview_preset(self, mode: str) -> None:
+            """Apply a packet/field preset, using manual relative units when fit data is absent."""
+
+            if mode not in {"single", "multi"}:
+                return
+            values = dict(self.settings)
+            if not self.sources or not self._fresh:
+                values.update(
+                    period_source="manual",
+                    manual_period=1.0,
+                    manual_angle_deg=30.0,
+                    manual_second_orientation=mode == "multi",
+                    manual_second_angle_deg=120.0,
+                    manual_unit="relative",
+                    selected_branch=-1,
+                )
+            else:
+                values["manual_second_orientation"] = False
+            values.update(
+                mode=mode,
+                layer_count=5,
+                stack_count=1 if mode == "single" else 64,
+                thickness_ratio=0.70,
+                width_ratio=3.2,
+                depth_ratio=1.8,
+                spread_deg=0.0 if mode == "single" else 4.0,
+                spacing_jitter_pct=0.0 if mode == "single" else 6.0,
+                position_jitter_pct=0.0 if mode == "single" else 70.0,
+                lateral_shift_ratio=0.18,
+                out_of_plane_deg=0.0,
+                seed=42,
+            )
+            self.update_settings(values)
 
         def _history_settings(self) -> dict[str, Any]:
             return {**deepcopy(self.settings), "_palette": self._palette}
@@ -542,19 +644,18 @@ if QT_AVAILABLE:
 
             self.current_scene = self.scenes[self.current_index]
             scene = self.current_scene
+            self._bounds = padded_bounds(self.scenes, length_unit=scene.length_unit)
             population_text = []
             for population in scene.metadata.get("populations", []):
                 if population.get("period") is not None:
                     name = "AB"[population["branch_id"]] if population["branch_id"] in (0, 1) else str(population["branch_id"])
-                    population_text.append(f"{name}: L_app = {population['period']:.4g} {scene.length_unit}")
+                    population_unit = population.get("length_unit", scene.length_unit)
+                    population_text.append(f"{name}: L_app = {population['period']:.4g} {population_unit}")
             self.period_readout.setText("    ·    ".join(population_text))
             self.figure.clear()
-            self.figure.subplots_adjust(left=.18, right=.97, bottom=.28, top=.97)
+            self.figure.subplots_adjust(left=.02, right=.98, bottom=.23, top=.90)
             axis = self.figure.add_subplot(111)
             render_lamellar_2d(scene, ax=axis, language=self.language, bounds=self._bounds, decorate=False)
-            axis.tick_params(labelsize=8, pad=2)
-            axis.xaxis.label.set_size(8)
-            axis.yaxis.label.set_size(8)
             self.canvas.draw_idle()
             self.view3d.set_scene(scene, bounds=self._bounds, reset_camera=False)
             self.view3d.set_selected_branch(self.settings["selected_branch"])
@@ -671,6 +772,7 @@ if QT_AVAILABLE:
             ready = bool(self.current_scene is not None and self.current_scene.metadata.get("available") and not self._image_error)
             busy = bool(self._active)
             self.export_button.setEnabled(ready and not any(kind in self._active for kind in ("build", "export", "images")))
+            self.scattering_button.setEnabled(ready and not any(kind in self._active for kind in ("build", "images")))
             self.publication_button.setEnabled(ready and not any(kind in self._active for kind in ("build", "images")))
             self.export_actions[1].setEnabled(len(self.scenes) > 1 and ready)
             self.cancel_button.setVisible(busy)
@@ -851,7 +953,10 @@ if QT_AVAILABLE:
             self._context_signature = context_signature
             self._import_path = document.get("import_path")
             saved_context = document.get("context_sha256")
-            matches = saved_context is None or saved_context == self._context_hash(context_signature)
+            matches = (
+                not context_signature
+                or (saved_context is not None and saved_context == self._context_hash(context_signature))
+            )
             self._fresh = bool(document.get("fresh") and matches)
             if not matches:
                 self._publication_document.update(camera=None, camera_auto=True)
@@ -904,6 +1009,16 @@ if QT_AVAILABLE:
                 self._publication_dialog.finished.connect(self._publication_closed)
             self._publication_dialog.show()
             self._publication_dialog.raise_()
+
+        def open_projected_fft(self) -> None:
+            if self.current_scene is None or not self.current_scene.metadata.get("available"):
+                return
+            from .lamellar_scattering_dialog import LamellarScatteringDialog
+
+            dialog = LamellarScatteringDialog(
+                self.current_scene, parent=self, language=self.language
+            )
+            dialog.exec()
 
         def _save_publication_document(self, document: Mapping[str, Any]) -> None:
             self._publication_document = deepcopy(dict(document))

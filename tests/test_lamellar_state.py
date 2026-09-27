@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
-from butterfly_saxs.ui.lamellar_state import FrameImageReader, compact_source, source_images
+from butterfly_saxs.ui.lamellar_state import FrameImageReader, compact_source, padded_bounds, source_images
 
 
 def test_native_array_keys_select_the_actual_physical_frame(tmp_path):
@@ -37,3 +38,22 @@ def test_sequence_images_keep_bounded_cache():
         assert np.all(images[index] == index)
         assert qmaps[index] == (None, None)
         assert len(reader.cache) <= 3
+
+
+def test_mixed_length_units_use_separate_viewport_bounds():
+    physical = SimpleNamespace(
+        bounds=np.asarray([[-100., -50., -20.], [100., 50., 20.]]),
+        length_unit="nm",
+        metadata={"available": True},
+    )
+    relative = SimpleNamespace(
+        bounds=np.asarray([[-1., -2., -3.], [1., 2., 3.]]),
+        length_unit="relative",
+        metadata={"available": True},
+    )
+
+    assert padded_bounds([physical, relative]) is None
+    physical_bounds = padded_bounds([physical, relative], length_unit="nm")
+    relative_bounds = padded_bounds([physical, relative], length_unit="relative")
+    assert np.max(np.abs(physical_bounds)) > 100.
+    assert np.max(np.abs(relative_bounds)) < 4.

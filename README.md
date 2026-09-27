@@ -25,6 +25,8 @@ Synthetic demonstration (pixel-q): the empirical double ellipse drawn on a gener
 
 ## What it does
 
+- **Independent 2D measurements**: point/line/local-region measurements and annular azimuthal peak fits use the current image, calibration and mask without requiring an ellipse fit. No standalone 1D spectrum workflow is added. See the [2D measurement guide](docs/image_measurements_zh.md).
+- **SAXSAnalyzer migration**: reopen 2D images, inspect historical evidence, and use sector-based low-q diagnostics within the image workbench. See the [migration guide](docs/saxsanalyzer_migration_zh.md).
 - **Butterfly arcs** (`ridge_method=butterfly_curvature`): curvature ridges, branch/side labels (QI+QIII vs QII+QIV), first-order family vs harmonics, sparse-ring fill. See the [butterfly arc guide](docs/butterfly_arcs_zh.md).
 - **Annular butterfly trajectories**: the new workbench session defaults to fixed-q annuli and angular profiles `I(χ)`, connecting up to four observed lobe maxima into long butterfly petals. Each ring retains its raw profile, counts, and coverage; missing lobes/rings remain missing. See the [annular trajectory guide](docs/annular_trajectories_zh.md).
 - **Independent radial diagnostics**: `radial_sector` measures fixed-χ `I(q)` profiles for a separate check. Its `q*` values are not the default butterfly trajectory or the primary ellipse input. See the [radial-sector guide](docs/sector_peaks_zh.md).

@@ -23,11 +23,17 @@ class LamellarSettings:
     width_ratio: float = 4.0
     depth_ratio: float = 4.0
     spread_deg: float = 0.0
+    spacing_jitter_pct: float = 0.0
+    # Retain the former 0.12-period maximum displacement when new settings
+    # files omit this field. Page presets may select a wider visual spread.
+    position_jitter_pct: float = 24.0
     lateral_shift_ratio: float = 0.0
     out_of_plane_deg: float = 0.0
     seed: int = 0
     manual_period: float = 1.0
     manual_angle_deg: float = 30.0
+    manual_second_orientation: bool = False
+    manual_second_angle_deg: float = 120.0
     manual_unit: str = "relative"
     selected_branch: int = -1
     reference_period: float | None = None
@@ -70,17 +76,32 @@ class LamellarSettings:
         if not 0.0 < float(self.thickness_ratio) < 1.0:
             raise ValueError("thickness_ratio must be greater than 0 and less than 1")
         spread = _finite(self.spread_deg)
+        spacing_jitter = _finite(self.spacing_jitter_pct)
+        position_jitter = _finite(self.position_jitter_pct)
         lateral = _finite(self.lateral_shift_ratio)
         tilt = _finite(self.out_of_plane_deg)
         angle = _finite(self.manual_angle_deg)
+        second_angle = _finite(self.manual_second_angle_deg)
         if spread is None or spread < 0.0 or spread > 180.0:
             raise ValueError("spread_deg must be finite in [0, 180]")
+        if spacing_jitter is None or spacing_jitter < 0.0 or spacing_jitter > 50.0:
+            raise ValueError("spacing_jitter_pct must be finite in [0, 50]")
+        if spacing_jitter > 100.0 * (1.0 - float(self.thickness_ratio)) + 1e-12:
+            raise ValueError(
+                "spacing_jitter_pct must not reduce the minimum layer gap below its thickness"
+            )
+        if position_jitter is None or position_jitter < 0.0 or position_jitter > 100.0:
+            raise ValueError("position_jitter_pct must be finite in [0, 100]")
         if lateral is None:
             raise ValueError("lateral_shift_ratio must be finite")
         if tilt is None or abs(tilt) > 90.0:
             raise ValueError("out_of_plane_deg must be finite in [-90, 90]")
         if angle is None:
             raise ValueError("manual_angle_deg must be finite")
+        if second_angle is None:
+            raise ValueError("manual_second_angle_deg must be finite")
+        if not isinstance(self.manual_second_orientation, bool):
+            raise ValueError("manual_second_orientation must be a boolean")
         if self.reference_period is not None:
             reference = _finite_positive(self.reference_period)
             if reference is None:
@@ -119,11 +140,15 @@ class LamellarSettings:
             "width_ratio": float(self.width_ratio),
             "depth_ratio": float(self.depth_ratio),
             "spread_deg": float(self.spread_deg),
+            "spacing_jitter_pct": float(self.spacing_jitter_pct),
+            "position_jitter_pct": float(self.position_jitter_pct),
             "lateral_shift_ratio": float(self.lateral_shift_ratio),
             "out_of_plane_deg": float(self.out_of_plane_deg),
             "seed": int(self.seed),
             "manual_period": float(self.manual_period),
             "manual_angle_deg": float(self.manual_angle_deg),
+            "manual_second_orientation": bool(self.manual_second_orientation),
+            "manual_second_angle_deg": float(self.manual_second_angle_deg),
             "manual_unit": self.manual_unit,
             "selected_branch": int(self.selected_branch),
             "reference_period": None

@@ -534,10 +534,10 @@ _EN = {
     "dialog.export_butterfly": "Select a parent folder for butterfly analysis export",
     "filter.all_files": "All files (*)",
     "filter.poni": "PONI files (*.poni);;{all_files}",
-    "filter.images": "Detector images (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5);;{all_files}",
-    "filter.images_batch": "Detector images (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5);;{all_files}",
+    "filter.images": "Detector images (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5 *.csv *.txt *.mccd *.img *.sfrm *.mar3450 *.mar2300 *.msk *.dat *.png *.bmp *.jpg *.jpeg);;{all_files}",
+    "filter.images_batch": "Detector images (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5 *.csv *.txt *.mccd *.img *.sfrm *.mar3450 *.mar2300 *.msk *.dat *.png *.bmp *.jpg *.jpeg);;{all_files}",
     "filter.masks": (
-        "Mask files (*.npy *.npz *.cbf *.edf *.tif *.tiff *.h5 *.hdf5 *.csv *.txt);;{all_files}"
+        "Mask files (*.npy *.npz *.cbf *.edf *.tif *.tiff *.h5 *.hdf5 *.csv *.txt *.mccd *.img *.sfrm *.mar3450 *.mar2300 *.msk *.dat *.png *.bmp *.jpg *.jpeg);;{all_files}"
     ),
     "filter.project": "JSON project (*.json)",
     "job.preview": "preview",
@@ -1156,9 +1156,9 @@ _ZH = {
     "dialog.export_butterfly": "选择用于导出蝴蝶分析的父文件夹",
     "filter.all_files": "所有文件 (*)",
     "filter.poni": "PONI 文件 (*.poni);;{all_files}",
-    "filter.images": "探测器图像 (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5);;{all_files}",
-    "filter.images_batch": "探测器图像 (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5);;{all_files}",
-    "filter.masks": "detector mask 文件 (*.npy *.npz *.cbf *.edf *.tif *.tiff *.h5 *.hdf5 *.csv *.txt);;{all_files}",
+    "filter.images": "探测器图像 (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5 *.csv *.txt *.mccd *.img *.sfrm *.mar3450 *.mar2300 *.msk *.dat *.png *.bmp *.jpg *.jpeg);;{all_files}",
+    "filter.images_batch": "探测器图像 (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5 *.csv *.txt *.mccd *.img *.sfrm *.mar3450 *.mar2300 *.msk *.dat *.png *.bmp *.jpg *.jpeg);;{all_files}",
+    "filter.masks": "detector mask 文件 (*.npy *.npz *.cbf *.edf *.tif *.tiff *.h5 *.hdf5 *.csv *.txt *.mccd *.img *.sfrm *.mar3450 *.mar2300 *.msk *.dat *.png *.bmp *.jpg *.jpeg);;{all_files}",
     "filter.project": "JSON 项目 (*.json)",
     "job.preview": "Preview",
     "job.optimize": "Optimize",
