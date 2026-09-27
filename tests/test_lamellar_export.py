@@ -141,6 +141,30 @@ def test_core_sequence_manifest_preserves_nested_identity_and_scene_provenance(t
     assert "unit" in csv_text
 
 
+def test_mixed_unit_sequence_exports_unit_specific_viewports(tmp_path: Path) -> None:
+    def make_scene(q_unit: str, frame: int):
+        return build_lamellar_scene({
+            "source_identity": {"source": "mixed.cbf", "frame": frame},
+            "q_unit": q_unit,
+            "lobe_radial_peaks": [
+                {"angle_deg": 30., "q_star": .2, "q_unit": q_unit, "valid": True, "branch_id": 0},
+                {"angle_deg": 210., "q_star": .2, "q_unit": q_unit, "valid": True, "branch_id": 0},
+            ],
+        }, {"layer_count": 1, "stack_count": 2})
+
+    physical, relative = make_scene("nm^-1", 0), make_scene("unknown", 1)
+    output = export_lamellar_sequence([physical, relative], tmp_path / "mixed-units")
+    manifest = json.loads(output["manifest"].read_text(encoding="utf-8"))
+
+    assert set(manifest["viewport_bounds_by_unit"]) == {"nm", "relative"}
+    assert isinstance(manifest["viewport_bounds"], dict)
+    assert manifest["viewport_bounds"]["nm"] == manifest["viewport_bounds_by_unit"]["nm"]
+    assert manifest["viewport_bounds"]["relative"] == manifest["viewport_bounds_by_unit"]["relative"]
+    nm_bounds = np.asarray(manifest["viewport_bounds_by_unit"]["nm"])
+    relative_bounds = np.asarray(manifest["viewport_bounds_by_unit"]["relative"])
+    assert np.max(np.abs(nm_bounds)) > 10. * np.max(np.abs(relative_bounds))
+
+
 def test_sequence_loader_error_propagates_and_unpublished_stage_is_removed(tmp_path: Path) -> None:
     class FailingLoader:
         def __len__(self) -> int:

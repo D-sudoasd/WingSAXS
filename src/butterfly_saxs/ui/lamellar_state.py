@@ -114,9 +114,18 @@ def rgba_image(image: Any) -> np.ndarray:
     return rows[:, :converted.width() * 4].reshape(converted.height(), converted.width(), 4).copy()
 
 
-def padded_bounds(scenes: list[Any]) -> np.ndarray | None:
-    available = [np.asarray(scene.bounds, dtype=float) for scene in scenes
-                 if scene.metadata.get("available")]
+def padded_bounds(scenes: list[Any], *, length_unit: str | None = None) -> np.ndarray | None:
+    available_scenes = [scene for scene in scenes if scene.metadata.get("available")]
+    if length_unit is None:
+        units = {str(getattr(scene, "length_unit", "relative")) for scene in available_scenes}
+        if len(units) > 1:
+            return None
+    else:
+        available_scenes = [
+            scene for scene in available_scenes
+            if str(getattr(scene, "length_unit", "relative")) == str(length_unit)
+        ]
+    available = [np.asarray(scene.bounds, dtype=float) for scene in available_scenes]
     if not available:
         return None
     bounds = np.array([np.min([b[0] for b in available], axis=0),

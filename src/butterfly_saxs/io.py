@@ -136,12 +136,23 @@ DataFrame = LoadedImage
 _IMAGE_SUFFIXES = {
     ".cbf": "fabio",
     ".edf": "fabio",
+    ".mccd": "fabio",
+    ".img": "fabio",
+    ".sfrm": "fabio",
+    ".mar3450": "fabio",
+    ".mar2300": "fabio",
+    ".msk": "fabio",
     ".tif": "tiff",
     ".tiff": "tiff",
     ".npy": "npy",
     ".npz": "npz",
     ".csv": "csv",
     ".txt": "csv",
+    ".dat": "csv",
+    ".png": "raster",
+    ".bmp": "raster",
+    ".jpg": "raster",
+    ".jpeg": "raster",
     ".h5": "hdf5",
     ".hdf5": "hdf5",
     ".hdf": "hdf5",
@@ -215,6 +226,22 @@ def load_image(
     elif kind == "tiff":
         array, metadata, selected_frame = _read_tiff(source, frame=frame)
         selected_dataset = None
+    elif kind == "raster":
+        if dataset is not None or frame is not None:
+            raise DataIOError("frame/dataset selectors are not applicable to a raster image")
+        from PIL import Image
+
+        with Image.open(source) as image:
+            if image.mode not in {"1", "L", "I", "I;16", "F"}:
+                raise DataShapeError(
+                    "colour/palette images are not scalar intensity data; "
+                    "export the original 2-D intensity matrix or a grayscale image"
+                )
+            array = np.array(image)
+        metadata = {"format": suffix.lstrip("."), "raster_intensity": True}
+        if suffix in {".jpg", ".jpeg"}:
+            metadata["warning"] = "lossy JPEG intensity; use original detector values for quantitative measurements"
+        selected_frame = selected_dataset = None
     elif kind == "npy":
         if dataset is not None:
             raise DatasetSelectionError("dataset is not applicable to NPY")

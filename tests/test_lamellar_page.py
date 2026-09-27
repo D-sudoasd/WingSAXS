@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 import threading
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -99,6 +101,143 @@ def test_settings_are_independent_and_undo_restores_geometry(page, qtbot):
     assert page.current_scene.metadata["settings"]["thickness_ratio"] == .5
 
 
+def test_meso_preview_without_fit_uses_two_manual_directions(page, qtbot):
+    page.controls.meso_preview_button.click()
+    ready(qtbot, page)
+
+    assert page.settings["period_source"] == "manual"
+    assert page.settings["manual_second_orientation"] is True
+    assert page.settings["thickness_ratio"] == pytest.approx(.70)
+    assert page.settings["out_of_plane_deg"] == pytest.approx(0.)
+    assert page.current_scene.metadata["status"] == "manual"
+    assert set(page.current_scene.branch_ids.tolist()) == {0, 1}
+    assert set(page.current_scene.stack_ids.tolist()) == set(range(64))
+    assert [item["angle_deg"] for item in page.current_scene.metadata["populations"]] == [30., 120.]
+    assert any("not fitted populations" in item for item in page.current_scene.metadata["assumptions"])
+
+
+def test_fit_driven_preview_retains_observed_branches_and_period(page, qtbot):
+    page.set_source(source(.2))
+    ready(qtbot, page)
+    page.controls.meso_preview_button.click()
+    ready(qtbot, page)
+
+    assert page.settings["period_source"] == "radial"
+    assert page.settings["manual_second_orientation"] is False
+    assert page.current_scene.metadata["populations"][0]["period"] == pytest.approx(2. * np.pi / .2)
+    assert set(page.current_scene.branch_ids.tolist()) == {0}
+    assert set(page.current_scene.stack_ids.tolist()) == set(range(0, 64, 2))
+
+
+def test_sequence_promotes_an_explicit_small_reference_to_a_shared_safe_scale():
+    both = source(.2, 0, image=False)
+    both["lobe_radial_peaks"].extend(
+        [
+            {"q_star": .1, "angle": 5. * np.pi / 6., "valid": True, "q_unit": "nm^-1", "branch_id": 1},
+            {"q_star": .1, "angle": 11. * np.pi / 6., "valid": True, "q_unit": "nm^-1", "branch_id": 1},
+        ]
+    )
+    only_a = source(.2, 1, image=False)
+    settings = {
+        "mode": "multi",
+        "period_source": "radial",
+        "layer_count": 1,
+        "stack_count": 12,
+        "reference_period": 1.0,
+        "position_jitter_pct": 70.0,
+        "seed": 19,
+    }
+
+    scenes = page_module._build_scenes([both, only_a], settings, threading.Event())
+
+    common = 2. * np.pi / .1
+    assert [item.metadata["reference_period"] for item in scenes] == pytest.approx([common, common])
+    by_id = [
+        {int(stack): center for stack, center, branch in zip(scene.stack_ids, scene.centers, scene.branch_ids)
+         if int(branch) == 0 and int(stack) % 2 == 0}
+        for scene in scenes
+    ]
+    for stack in by_id[1]:
+        np.testing.assert_allclose(by_id[0][stack], by_id[1][stack])
+
+
+@pytest.mark.parametrize("explicit_reference", [None, 100.0])
+def test_sequence_does_not_share_reference_period_across_physical_and_unknown_q_units(explicit_reference):
+    physical = source(.2, 0, image=False)
+    unknown = source(.2, 1, image=False)
+    unknown["q_unit"] = "unknown"
+    for peak in unknown["lobe_radial_peaks"]:
+        peak["q_unit"] = "unknown"
+    settings = {
+        "mode": "multi",
+        "period_source": "radial",
+        "layer_count": 1,
+        "stack_count": 12,
+        "reference_period": explicit_reference,
+        "seed": 19,
+    }
+
+    scenes = page_module._build_scenes([physical, unknown], settings, threading.Event())
+
+    assert [scene.length_unit for scene in scenes] == ["nm", "relative"]
+    assert scenes[0].metadata["populations"][0]["period"] == pytest.approx(2. * np.pi / .2)
+    assert scenes[1].metadata["populations"][0]["period"] == pytest.approx(1.)
+    assert scenes[1].metadata["reference_period"] == pytest.approx(1.)
+
+
+def test_same_unit_unknown_q_sequence_keeps_explicit_shared_reference_period():
+    frames = []
+    for frame, q in enumerate((.2, .1)):
+        item = source(q, frame, image=False)
+        item["q_unit"] = "unknown"
+        for peak in item["lobe_radial_peaks"]:
+            peak["q_unit"] = "unknown"
+        frames.append(item)
+
+    scenes = page_module._build_scenes(frames, {
+        "mode": "multi",
+        "period_source": "radial",
+        "layer_count": 1,
+        "stack_count": 12,
+        "reference_period": 7.0,
+        "seed": 19,
+    }, threading.Event())
+
+    assert [scene.length_unit for scene in scenes] == ["relative", "relative"]
+    assert [scene.metadata["populations"][0]["period"] for scene in scenes] == pytest.approx([7.0, 7.0])
+    assert [scene.metadata["reference_period"] for scene in scenes] == pytest.approx([7.0, 7.0])
+
+
+def test_mixed_population_units_are_shown_per_branch(page, qtbot):
+    item = source(.2, 0)
+    item["q_unit"] = "unknown"
+    item["lobe_radial_peaks"][0]["q_unit"] = "nm^-1"
+    item["lobe_radial_peaks"][1]["q_unit"] = "nm^-1"
+    item["lobe_radial_peaks"].extend([
+        {"q_star": .1, "angle": 5. * np.pi / 6., "valid": True, "q_unit": "unknown", "branch_id": 1},
+        {"q_star": .1, "angle": 11. * np.pi / 6., "valid": True, "q_unit": "unknown", "branch_id": 1},
+    ])
+
+    page.set_source(item)
+    ready(qtbot, page)
+
+    assert not page.current_scene.metadata["available"]
+    assert "31.42 nm" in page.period_readout.text()
+    assert "1 relative" in page.period_readout.text()
+
+
+def test_control_clamps_spacing_jitter_and_preserves_hidden_reference_period(page, qtbot):
+    values = dict(page.settings)
+    values.update(thickness_ratio=.25, spacing_jitter_pct=30., reference_period=7.)
+    page.controls.set_settings(values)
+
+    with qtbot.waitSignal(page.controls.settingsChanged, timeout=5000):
+        page.controls.controls["thickness_ratio"].setValue(.9)
+
+    assert page.settings["spacing_jitter_pct"] == pytest.approx(10.)
+    assert page.settings["reference_period"] == pytest.approx(7.)
+
+
 def test_invalidation_cannot_be_bypassed_by_cosmetic_change(page, qtbot):
     page.set_source(source())
     ready(qtbot, page)
@@ -127,6 +266,36 @@ def test_palette_undo_preserves_geometry_and_source(page, qtbot):
     page.undo()
     np.testing.assert_array_equal(page.current_scene.colors, colors)
     assert page.sources[0] is data
+
+
+def test_projected_fft_action_receives_current_scene_and_language(page, qtbot, monkeypatch):
+    page.set_source(source())
+    ready(qtbot, page)
+    assert page.scattering_button.isEnabled()
+    captured = {}
+
+    class Dialog:
+        def __init__(self, scene, *, parent, language):
+            captured.update(scene=scene, parent=parent, language=language)
+
+        def exec(self):
+            captured["executed"] = True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "butterfly_saxs.ui.lamellar_scattering_dialog",
+        SimpleNamespace(LamellarScatteringDialog=Dialog),
+    )
+    page.open_projected_fft()
+
+    assert captured == {
+        "scene": page.current_scene,
+        "parent": page,
+        "language": "en",
+        "executed": True,
+    }
+    page.invalidate()
+    assert not page.scattering_button.isEnabled()
 
 
 def test_failed_frame_is_blank_and_does_not_reuse_image(page, qtbot):
@@ -166,6 +335,53 @@ def test_document_roundtrip_and_context_mismatch(page, qtbot):
     qtbot.wait(250)
     assert page.current_scene is None
     assert not page.export_button.isEnabled()
+
+
+def test_legacy_document_with_current_context_is_stale_but_manual_remains_available(page, qtbot):
+    historical = source(.15, frame=8, image=False)
+    document = {
+        "version": 1,
+        "settings": {"mode": "single", "period_source": "radial", "layer_count": 1, "stack_count": 2},
+        "fresh": True,
+        "sources": [deepcopy(historical)],
+    }
+    observed = np.full((16, 16), 17.)
+
+    page.restore_document(
+        document,
+        context_signature="current input signature",
+        observed=observed,
+        qx=np.zeros((16, 16)),
+        qy=np.zeros((16, 16)),
+    )
+    qtbot.wait(250)
+
+    assert not page._fresh
+    assert page.current_scene is None
+    assert page.sources[0]["source_identity"]["frame"] == 8
+    assert "observed" not in page.sources[0]
+    assert not page.export_button.isEnabled()
+
+    page.update_settings({**page.settings, "period_source": "manual"})
+    ready(qtbot, page)
+    assert page.current_scene.status == "manual"
+    assert not page.current_scene.metadata["source_identity"]
+
+
+def test_legacy_document_remains_viewable_without_current_input_context(page, qtbot):
+    historical = source(.15, frame=8, image=False)
+    document = {
+        "version": 1,
+        "settings": {"mode": "single", "period_source": "radial", "layer_count": 1, "stack_count": 2},
+        "fresh": True,
+        "sources": [deepcopy(historical)],
+    }
+
+    page.restore_document(document)
+    ready(qtbot, page)
+
+    assert page._fresh
+    assert page.current_scene.metadata["source_identity"]["frame"] == 8
 
 
 def test_unit_display_spelling_is_not_a_new_physical_context():

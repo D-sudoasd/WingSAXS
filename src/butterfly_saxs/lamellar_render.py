@@ -16,7 +16,7 @@ import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.font_manager import FontProperties
-from matplotlib.patches import Polygon
+from matplotlib.patches import Patch, Polygon
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from .font_support import font_properties
@@ -271,54 +271,151 @@ def _draw_blank(
 
 
 def _draw_axis_arrow(ax: Any, bounds: np.ndarray, language: str, *, compact: bool = False) -> None:
-    span = bounds[1] - bounds[0]
-    x0 = bounds[0, 0] + 0.08 * span[0]
-    y0 = bounds[0, 1] + 0.08 * span[1]
-    length = (0.10 if compact else 0.16) * span[1]
+    # The page reserves a footer below the specimen viewport. Keep the helper
+    # in that footer so it can never cover the bottom row of packets.
     if str(language).lower().startswith("en"):
         label = "+y · ref" if compact else "+y · reference direction"
     else:
         label = "+y · 参考" if compact else "+y · 参考方向"
     ax.annotate(
+        "",
+        xy=(0.055, -0.16),
+        xytext=(0.055, -0.31),
+        xycoords="axes fraction",
+        textcoords="axes fraction",
+        arrowprops={"arrowstyle": "-|>", "color": _INK, "lw": 1.35},
+        annotation_clip=False,
+        zorder=20,
+    )
+    ax.text(
+        0.075,
+        -0.31,
         label,
-        xy=(x0, y0 + length),
-        xytext=(x0, y0),
-        arrowprops={"arrowstyle": "-|>", "color": _INK, "lw": 1.6},
+        transform=ax.transAxes,
         color=_INK,
         fontsize=8 if compact else 10,
         fontproperties=_font(),
-        ha="center",
-        va="bottom",
+        ha="left",
+        va="center",
+        clip_on=False,
         zorder=20,
     )
 
 
-def _draw_box_projection(ax: Any, vertices: np.ndarray, colors: np.ndarray) -> None:
-    """Draw each real box once as a projected hull plus its visible edges.
+def _convex_hull_2d(points: np.ndarray) -> np.ndarray:
+    """Return the counter-clockwise convex hull of a projected point cloud."""
 
-    The projected polygon is made directly from the actual eight corners.  A
-    monotonic angle sort makes a stable hull without depending on scipy.  Four
-    local ``z`` edges are then overlaid with low opacity to expose slab
-    thickness while retaining the same geometry.
-    """
+    values = np.unique(np.asarray(points, dtype=float).reshape((-1, 2)), axis=0)
+    if len(values) < 3:
+        return values
+    values = values[np.lexsort((values[:, 1], values[:, 0]))]
+    scale = max(float(np.ptp(values[:, 0])), float(np.ptp(values[:, 1])), 1.0)
+    tolerance = 1.0e-12 * scale * scale
+
+    def cross(origin: np.ndarray, first: np.ndarray, second: np.ndarray) -> float:
+        a = first - origin
+        b = second - origin
+        return float(a[0] * b[1] - a[1] * b[0])
+
+    lower: list[np.ndarray] = []
+    for point in values:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= tolerance:
+            lower.pop()
+        lower.append(point)
+    upper: list[np.ndarray] = []
+    for point in values[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= tolerance:
+            upper.pop()
+        upper.append(point)
+    return np.asarray(lower[:-1] + upper[:-1], dtype=float)
+
+
+def _draw_box_projection(ax: Any, vertices: np.ndarray, colors: np.ndarray) -> None:
+    """Draw opaque, outlined plate silhouettes from the actual box corners."""
 
     for corners, color in zip(vertices, colors):
-        xy = corners[:, :2]
-        centre = np.mean(xy, axis=0)
-        order = np.argsort(np.arctan2(xy[:, 1] - centre[1], xy[:, 0] - centre[0]))
-        polygon = xy[order]
-        face = np.asarray(color, dtype=float).copy()
-        face[3] = min(float(face[3]), 0.42)
-        ax.add_patch(Polygon(polygon, closed=True, facecolor=face, edgecolor=color, linewidth=1.1, zorder=4))
-        for start, end in ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)):
-            ax.plot(
-                (xy[start, 0], xy[end, 0]),
-                (xy[start, 1], xy[end, 1]),
-                color=color,
-                linewidth=0.75,
-                alpha=0.75,
-                zorder=5,
+        hull = _convex_hull_2d(np.round(corners[:, :2], decimals=12))
+        if len(hull) < 3:
+            continue
+        face = (*np.clip(np.asarray(color[:3], dtype=float), 0.0, 1.0), 0.97)
+        ax.add_patch(
+            Polygon(
+                hull,
+                closed=True,
+                facecolor=face,
+                edgecolor="#26343c",
+                linewidth=0.52,
+                joinstyle="round",
+                zorder=4,
             )
+        )
+
+
+def _draw_branch_legend(scene: Any, colors: np.ndarray, language: str) -> tuple[list[Any], list[str]]:
+    try:
+        branches = np.asarray(_get(scene, "branch_ids"), dtype=int).reshape(-1)
+    except (TypeError, ValueError):
+        return [], []
+    represented = [branch for branch in (0, 1) if np.any(branches == branch)]
+    if len(represented) < 2 or len(colors) != len(branches):
+        return [], []
+    handles = []
+    labels = []
+    for branch in represented:
+        color = colors[int(np.flatnonzero(branches == branch)[0])]
+        edge = color[:3]
+        handles.append(Patch(facecolor=edge, edgecolor=edge, alpha=0.82))
+        if _status(scene) == "manual":
+            prefix = "方向假设 " if str(language).lower().startswith("zh") else "Assumed direction "
+        else:
+            prefix = "分支 " if str(language).lower().startswith("zh") else "Branch "
+        labels.append(prefix + chr(65 + branch))
+    return handles, labels
+
+
+def _draw_scale_bar(ax: Any, bounds: np.ndarray, scene: Any, language: str) -> None:
+    x_span = float(bounds[1, 0] - bounds[0, 0])
+    y_span = float(bounds[1, 1] - bounds[0, 1])
+    if not np.isfinite(x_span) or not np.isfinite(y_span) or x_span <= 0.0 or y_span <= 0.0:
+        return
+    target = x_span * 0.22
+    exponent = int(np.floor(np.log10(target)))
+    scale = 10.0**exponent
+    length = max(value for value in (5.0, 2.0, 1.0) if value * scale <= target)
+    length *= scale
+    width_fraction = length / x_span
+    x1 = 0.965
+    x0 = x1 - width_fraction
+    y0 = -0.19
+    cap = 0.014
+    color = _INK
+    ax.plot((x0, x1), (y0, y0), transform=ax.transAxes, color="white", linewidth=4.0,
+            solid_capstyle="butt", clip_on=False, zorder=28)
+    ax.plot((x0, x1), (y0, y0), transform=ax.transAxes, color=color, linewidth=1.8,
+            solid_capstyle="butt", clip_on=False, zorder=29)
+    ax.plot((x0, x0), (y0 - cap, y0 + cap), transform=ax.transAxes, color=color,
+            linewidth=1.4, clip_on=False, zorder=29)
+    ax.plot((x1, x1), (y0 - cap, y0 + cap), transform=ax.transAxes, color=color,
+            linewidth=1.4, clip_on=False, zorder=29)
+    number = f"{length:g}"
+    unit = _unit_label(scene)
+    label = f"{number} {unit}" if unit == "nm" else (
+        f"{number} 相对单位" if str(language).lower().startswith("zh") else f"{number} relative units"
+    )
+    ax.text(
+        (x0 + x1) * 0.5,
+        -0.31,
+        label,
+        transform=ax.transAxes,
+        ha="center",
+        va="bottom",
+        color=color,
+        fontsize=7,
+        fontproperties=_font(),
+        bbox={"facecolor": _OFFWHITE, "edgecolor": "none", "alpha": 0.92, "pad": 1.0},
+        clip_on=False,
+        zorder=30,
+    )
 
 
 def render_lamellar_2d(
@@ -348,23 +445,45 @@ def render_lamellar_2d(
         ax.clear()
         fig.patch.set_facecolor(_OFFWHITE)
     font = _font()
-    title = "Lamellar projection" if str(language).lower().startswith("en") else "层状结构投影"
-    _style_axes(ax, title=title if decorate else "", font=font)
-    ax.set_xlabel(f"x ({_unit_label(scene)})", color=_MUTED, fontproperties=font)
-    ax.set_ylabel(f"y ({_unit_label(scene)})", color=_MUTED, fontproperties=font)
+    _style_axes(ax, title="", font=font)
+    legend_handles: list[Any] = []
+    legend_labels: list[str] = []
     if vertices.size and _status(scene) not in {"unavailable", "stale"}:
-        _draw_box_projection(ax, vertices, _colors(scene, len(vertices)))
+        colors = _colors(scene, len(vertices))
+        _draw_box_projection(ax, vertices, colors)
+        legend_handles, legend_labels = _draw_branch_legend(scene, colors, language)
     else:
         _draw_blank(ax, scene, language, bounds=limits, compact=not decorate)
     ax.set_xlim(float(limits[0, 0]), float(limits[1, 0]))
     ax.set_ylim(float(limits[0, 1]), float(limits[1, 1]))
     ax.set_aspect("equal", adjustable="box")
+    if vertices.size and _status(scene) not in {"unavailable", "stale"}:
+        _draw_scale_bar(ax, limits, scene, language)
     _draw_axis_arrow(ax, limits, language, compact=not decorate)
+    ax.set_axis_off()
     if decorate:
         _draw_banner(fig, scene, language)
+    if legend_handles:
+        font.set_size(8)
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="upper right",
+            bbox_to_anchor=(0.99, 0.99),
+            ncol=len(legend_handles),
+            frameon=True,
+            framealpha=0.94,
+            facecolor="white",
+            edgecolor=_GRID,
+            borderpad=0.35,
+            handlelength=1.0,
+            handletextpad=0.45,
+            prop=font,
+        )
     if not supplied_ax and decorate:
-        # Keep enough room for the readable source/status line.
-        fig.subplots_adjust(top=0.88)
+        # Reserve an annotation footer and keep the source legend outside the
+        # geometry panel instead of overlaying the top or bottom layer.
+        fig.subplots_adjust(left=0.02, right=0.98, bottom=0.23, top=0.90)
     return fig
 
 

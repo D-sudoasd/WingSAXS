@@ -80,10 +80,21 @@ def build_lamellar_scene(
     execution_failure = _execution_failure(root)
     stale = source_status == "stale" or bool(_read(root, ("stale",), False))
     assumptions = [
-        "Measured q-angle is used as the schematic lamellar-normal direction after draw-axis display rotation.",
-        "Opposite q directions represent one unoriented normal; original branch identifiers are retained.",
         "Box dimensions are explicit ratios and do not identify a unique three-dimensional structure.",
     ]
+    if resolved.period_source != "manual":
+        assumptions.extend(
+            (
+                "Measured q-angle is used as the schematic lamellar-normal direction after draw-axis display rotation.",
+                "Opposite q directions represent one unoriented normal; original branch identifiers are retained.",
+            )
+        )
+    if resolved.spacing_jitter_pct > 0.0:
+        assumptions.append(
+            "Each interlayer gap varies independently and uniformly within "
+            f"±{resolved.spacing_jitter_pct:g}% of the period; this is a schematic "
+            "assumption, not fitted uncertainty."
+        )
     flags: list[str] = []
     if execution_failure is not None and resolved.period_source != "manual":
         metadata = _metadata_base(
@@ -122,14 +133,26 @@ def build_lamellar_scene(
     if resolved.period_source == "manual":
         period = float(resolved.manual_period)
         angle = float(resolved.manual_angle_deg)
-        branch = 0 if resolved.selected_branch < 0 else int(resolved.selected_branch)
+        if resolved.manual_second_orientation:
+            directions = ((0, angle), (1, float(resolved.manual_second_angle_deg)))
+            if resolved.selected_branch >= 0:
+                directions = (directions[int(resolved.selected_branch)],)
+            assumptions.append(
+                "A second manual lamellar-normal direction is included at the explicitly set angle; the two manual direction groups are allocated as evenly as possible and seed-shuffled for visualization, not fitted populations or measured fractions."
+            )
+        else:
+            branch = 0 if resolved.selected_branch < 0 else int(resolved.selected_branch)
+            directions = ((branch, angle),)
         populations = [
             {
                 "branch_id": branch,
                 "period": period,
-                "angle_deg": angle,
+                "length_unit": resolved.manual_unit,
+                "angle_deg": direction_angle,
                 "status": "manual",
+                "orientation_assumption": "explicit manual direction",
             }
+            for branch, direction_angle in directions
         ]
         parameter_sources.append(
             _period_record(
@@ -143,9 +166,7 @@ def build_lamellar_scene(
         )
         period_unit = resolved.manual_unit
         length_unit = resolved.manual_unit
-        assumptions.append(
-            "Period and angle are explicit manual assumptions supplied by the caller."
-        )
+        assumptions.append("Period and angle are explicit manual assumptions supplied by the caller.")
     elif not raw_peaks:
         parameter_sources.append(
             _period_record(
@@ -271,6 +292,7 @@ def build_lamellar_scene(
                 {
                     "branch_id": int(branch),
                     "period": period,
+                    "length_unit": unit,
                     "angle_deg": angle,
                     "status": "candidate"
                     if period_status == "candidate"
@@ -396,6 +418,9 @@ def build_lamellar_scene(
                 return _empty_scene(resolved, metadata)
             for population in populations:
                 population["period"] = float(ellipse_period)
+                population["length_unit"] = (
+                    "nm" if _q_scale_to_nm(ellipse_unit) is not None else "relative"
+                )
                 population["status"] = "candidate" if candidate_b else "schematic"
             period_unit = (
                 "nm" if _q_scale_to_nm(ellipse_unit) is not None else "relative"
@@ -428,12 +453,43 @@ def build_lamellar_scene(
             flags=(*flags, "selected_branch_unavailable"),
         )
         return _empty_scene(resolved, metadata)
+    selected_units = {
+        str(population.get("length_unit", length_unit))
+        for population in selected
+        if _finite_positive(population.get("period")) is not None
+    }
+    if len(selected_units) > 1:
+        mixed_units = sorted(selected_units)
+        message = (
+            "Selected populations use incompatible length units ("
+            + " and ".join(mixed_units)
+            + "); select one branch before generating a scene."
+        )
+        metadata = _metadata_base(
+            resolved,
+            identity,
+            status="unavailable",
+            available=False,
+            message=message,
+            draw_axis_deg=draw_axis,
+            reference_period=resolved.reference_period or 1.0,
+            assumptions=assumptions,
+            parameter_sources=parameter_sources,
+            populations=populations,
+            q_unit=q_unit,
+            flags=(*flags, "mixed_length_units"),
+        )
+        metadata["length_unit"] = "relative"
+        metadata["mixed_length_units"] = mixed_units
+        return _empty_scene(resolved, metadata)
     if (
         len(selected) < 2
         and resolved.selected_branch < 0
         and resolved.period_source != "manual"
     ):
         flags.append("single_branch_supported")
+    if selected_units:
+        length_unit = next(iter(selected_units))
     periods = [
         float(item["period"])
         for item in selected
@@ -460,6 +516,10 @@ def build_lamellar_scene(
         if resolved.reference_period is not None
         else float(max(periods))
     )
+    # A retained project scale may predate this frame or be a manual
+    # normalization smaller than its current period. Use it for lower-bound
+    # layout only when it is large enough to contain the generated packets.
+    layout_period = max(layout_period, max(periods))
     n_layers = int(resolved.layer_count)
     centres: list[np.ndarray] = []
     sizes: list[np.ndarray] = []
@@ -472,11 +532,27 @@ def build_lamellar_scene(
     packet_width = resolved.width_ratio + (n_layers - 1) * abs(
         resolved.lateral_shift_ratio
     )
-    packet_length = n_layers - 1 + resolved.thickness_ratio
-    spacing = layout_period * (
-        float(np.linalg.norm((packet_width, resolved.depth_ratio, packet_length))) + 1.0
+    max_gap_ratio = 1.0 + float(resolved.spacing_jitter_pct) / 100.0
+    packet_length = (n_layers - 1) * max_gap_ratio + resolved.thickness_ratio
+    packet_diameter = float(
+        np.linalg.norm((packet_width, resolved.depth_ratio, packet_length))
     )
+    packet_gap_ratio = 1.0
+    spacing = layout_period * (packet_diameter + packet_gap_ratio)
     slot_entries: list[tuple[int, int, int]] = []
+    manual_assignment: np.ndarray | None = None
+    if (
+        resolved.period_source == "manual"
+        and resolved.mode == "multi"
+        and resolved.manual_second_orientation
+        and resolved.selected_branch < 0
+        and len(selected) >= 2
+    ):
+        manual_assignment = np.arange(int(resolved.stack_count), dtype=int) % len(selected)
+        assignment_rng = np.random.default_rng(
+            _stable_seed(resolved.seed, 97, int(resolved.stack_count))
+        )
+        assignment_rng.shuffle(manual_assignment)
     if resolved.mode == "single":
         if resolved.stack_count > 0:
             for population_index, population in enumerate(selected):
@@ -490,19 +566,22 @@ def build_lamellar_scene(
                 )
     elif resolved.stack_count > 0:
         has_two = len(selected) >= 2
-        only_branch = int(selected[0]["branch_id"]) if len(selected) == 1 else None
         for slot in range(int(resolved.stack_count)):
-            if has_two:
+            if manual_assignment is not None:
+                population_index = int(manual_assignment[slot])
+            elif has_two:
                 population_index = slot % len(selected)
-            elif only_branch in {0, 1} and resolved.period_source != "manual":
-                if slot % 2 != only_branch:
-                    continue
-                population_index = 0
             else:
+                # Preserve the established even-slot identity when the other
+                # fitted branch is absent in a frame. Manual two-direction
+                # previews still fill every slot through their two explicit
+                # assumptions above.
+                if resolved.period_source != "manual" and slot % 2:
+                    continue
                 population_index = 0
             slot_entries.append((slot, population_index, slot))
         assumptions.append(
-            "Multi-stack slots use a fixed compact grid; missing branch families leave their slots empty."
+            "Mesoscale field repeats only branch families supported by the current source on a jittered grid. Packet centers and equal allocation among supported branches are schematic spatial assumptions, not measured positions or population fractions."
         )
     total_slots = max(1, int(resolved.stack_count))
     grid_columns = max(1, int(np.ceil(np.sqrt(total_slots))))
@@ -521,8 +600,8 @@ def build_lamellar_scene(
         )
         if resolved.mode == "single":
             population_offset = (
-                (float(branch_slot) - 0.5) * spacing
-                if len(selected) > 1 or branch_slot in {0, 1}
+                (float(population_index) - (len(selected) - 1) / 2.0) * spacing
+                if len(selected) > 1
                 else 0.0
             )
             base_center = np.asarray((population_offset, 0.0, 0.0), dtype=float)
@@ -537,7 +616,13 @@ def build_lamellar_scene(
                 ),
                 dtype=float,
             )
-            jitter = 0.12 * layout_period
+            jitter = (
+                0.5
+                * packet_gap_ratio
+                * layout_period
+                * float(resolved.position_jitter_pct)
+                / 100.0
+            )
             base_center[:2] += rng.uniform(-jitter, jitter, size=2)
         display_angle = np.radians(angle + deviation + (90.0 - float(draw_axis)))
         tilt = np.radians(float(resolved.out_of_plane_deg))
@@ -559,11 +644,20 @@ def build_lamellar_scene(
         else:
             depth_basis /= depth_norm
         orientation = np.column_stack((width_basis, depth_basis, normal))
+        if resolved.spacing_jitter_pct > 0.0 and n_layers > 1:
+            jitter_fraction = float(resolved.spacing_jitter_pct) / 100.0
+            gap_ratios = 1.0 + rng.uniform(
+                -jitter_fraction, jitter_fraction, size=n_layers - 1
+            )
+            layer_offsets = np.concatenate((np.zeros(1), np.cumsum(gap_ratios)))
+            layer_offsets -= float(np.mean(layer_offsets))
+        else:
+            layer_offsets = np.arange(n_layers, dtype=float) - (n_layers - 1) / 2.0
         for layer_index in range(n_layers):
             centred_index = float(layer_index) - (n_layers - 1) / 2.0
             centre = (
                 base_center
-                + normal * (centred_index * period)
+                + normal * (float(layer_offsets[layer_index]) * period)
                 + width_basis
                 * (centred_index * float(resolved.lateral_shift_ratio) * period)
             )

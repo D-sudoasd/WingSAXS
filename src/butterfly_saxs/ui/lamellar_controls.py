@@ -19,9 +19,12 @@ TEXT = {
     "cancel": ("取消任务", "Cancel task"),
     "file": ("打开结果 JSON…", "Open result JSON…"),
     "folder": ("打开结果文件夹…", "Open result folder…"),
-    "mode": ("结构尺度", "Structure scale"),
-    "single": ("单堆栈", "Single stack"),
-    "multi": ("多堆栈", "Multiple stacks"),
+    "mode": ("形貌组织", "Morphology organization"),
+    "single": ("单堆栈", "Single lamellar packet"),
+    "multi": ("多堆栈组织", "Mesoscale field"),
+    "presets": ("快速示意预览", "Schematic previews"),
+    "single_preview": ("单堆栈预览", "Preview packet"),
+    "meso_preview": ("多堆栈预览", "Preview field"),
     "period_source": ("周期来源", "Period source"),
     "radial": ("径向峰位", "Radial peak"),
     "ellipse": ("椭圆派生周期", "Ellipse-derived period"),
@@ -34,6 +37,8 @@ TEXT = {
     "layer_count": ("每堆栈层数", "Layers per stack"),
     "stack_count": ("堆栈数量", "Stack count"),
     "spread_deg": ("方向分散 (°)", "Orientation spread (°)"),
+    "spacing_jitter_pct": ("层间距偏差上限 (%)", "Maximum interlayer gap deviation (%)"),
+    "position_jitter_pct": ("堆栈位置抖动（间隙比例 %）", "Packet-position jitter (% of free gap)"),
     "advanced": ("高级假设", "Advanced assumptions"),
     "palette": ("显示配色", "Display palette"),
     "blue_orange": ("蓝橙分支", "Blue / orange"),
@@ -43,12 +48,17 @@ TEXT = {
     "seed": ("随机种子", "Random seed"),
     "manual_period": ("设定周期", "Assumed period"),
     "manual_angle_deg": ("设定法向角度 (°)", "Assumed normal angle (°)"),
+    "manual_second_orientation": ("加入第二方向假设", "Include a second assumed direction"),
+    "manual_second_angle_deg": ("第二法向角度 (°)", "Second assumed normal angle (°)"),
     "manual_unit": ("设定长度单位", "Assumed length unit"),
     "relative": ("相对单位", "Relative units"),
     "reset": ("恢复数据驱动默认值", "Restore data-driven defaults"),
     "undo": ("撤销", "Undo"),
     "redo": ("重做", "Redo"),
-    "assumption_note": ("厚度、宽度、层数与分散程度是示意假设。", "Thickness, width, layer count and spread are schematic assumptions."),
+    "assumption_note": ("此处形貌是条件示意；厚度、宽度、堆栈排列和分散程度不由散射拟合唯一确定。", "This is a conditional schematic; scattering fits do not uniquely determine thickness, width, packet placement or spread."),
+    "spacing_note": ("相邻片层间距围绕周期均匀随机起伏；最小间距不会小于片层厚度。这是形貌示意假设，不代表 q* 的拟合不确定度。", "Adjacent layer gaps vary uniformly around the period; the minimum gap cannot be smaller than layer thickness. This is a morphology assumption, not uncertainty in fitted q*."),
+    "position_jitter_note": ("堆栈中心在网格单元内移动；位移不超过预留间隙，因此示意堆栈不会相互穿插。", "Packet centers move within their grid cells by at most the reserved clearance, so schematic packets do not interpenetrate."),
+    "scattering": ("投影 FFT", "Projected FFT"),
     "saxs": ("SAXS · 观测与拟合", "SAXS · observation and fit"),
     "two_d": ("二维 · 样品面内投影", "2D · in-plane projection"),
     "three_d": ("三维 · 可拖动旋转", "3D · drag to orbit"),
@@ -64,7 +74,7 @@ TEXT = {
     "previous": ("上一帧", "Previous frame"),
     "next": ("下一帧", "Next frame"),
     "sources": ("参数来源与假设", "Parameter sources and assumptions"),
-    "empty": ("尚无可用参数。请先分析一帧、导入结果，或选择手动示意。", "No parameters yet. Analyze a frame, open results, or choose a manual schematic."),
+    "empty": ("尚无拟合参数。可先点击“多堆栈预览”查看可编辑的相对尺度示意，或分析/导入结果。", "No fit parameters yet. Preview an editable relative-scale field, or analyze a frame/open results."),
     "stale": ("数据或分析设置已改变，请重新分析后查看。", "Data or analysis settings changed. Run analysis again."),
     "building": ("正在更新片层…", "Updating lamellae…"),
     "loading": ("正在读取结果…", "Reading results…"),
@@ -94,6 +104,7 @@ if QT_AVAILABLE:
         settingsChanged = QtCore.Signal(object)
         presentationChanged = QtCore.Signal(str)
         resetRequested = QtCore.Signal()
+        presetRequested = QtCore.Signal(str)
 
         def __init__(self, parent: Any = None, *, language: str = "zh_CN") -> None:
             super().__init__(parent)
@@ -104,6 +115,22 @@ if QT_AVAILABLE:
             self.labels: dict[str, Any] = {}
             root = QtWidgets.QVBoxLayout(self)
             root.setContentsMargins(12, 8, 12, 8)
+            self.preset_label = QtWidgets.QLabel()
+            root.addWidget(self.preset_label)
+            preset_row = QtWidgets.QHBoxLayout()
+            self.single_preview_button = QtWidgets.QPushButton()
+            self.single_preview_button.setObjectName("lamellar_preview_single")
+            self.single_preview_button.clicked.connect(
+                lambda: self.presetRequested.emit("single")
+            )
+            self.meso_preview_button = QtWidgets.QPushButton()
+            self.meso_preview_button.setObjectName("lamellar_preview_meso")
+            self.meso_preview_button.clicked.connect(
+                lambda: self.presetRequested.emit("multi")
+            )
+            preset_row.addWidget(self.single_preview_button)
+            preset_row.addWidget(self.meso_preview_button)
+            root.addLayout(preset_row)
             self.form = QtWidgets.QFormLayout()
             self.form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             self.form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -121,6 +148,17 @@ if QT_AVAILABLE:
             self.manual_form = QtWidgets.QFormLayout(self.manual_group)
             self._spin("manual_period", .001, 1000000., .5, form=self.manual_form, decimals=3)
             self._spin("manual_angle_deg", -180., 180., 1., form=self.manual_form)
+            second_direction = QtWidgets.QCheckBox()
+            second_direction.setObjectName("lamellar_manual_second_orientation")
+            second_label = QtWidgets.QLabel(tr("manual_second_orientation", self.language))
+            second_label.setBuddy(second_direction)
+            self.manual_form.addRow(second_label, second_direction)
+            self.controls["manual_second_orientation"] = second_direction
+            self.labels["manual_second_orientation"] = (second_label, "manual_second_orientation")
+            second_direction.toggled.connect(self._changed)
+            self._spin("manual_second_angle_deg", -180., 180., 1., form=self.manual_form)
+            second_direction.toggled.connect(self.controls["manual_second_angle_deg"].setEnabled)
+            self.controls["manual_second_angle_deg"].setEnabled(False)
             self._combo("manual_unit", ("relative", "nm"), form=self.manual_form)
             root.addWidget(self.manual_group)
             self.advanced_toggle = QtWidgets.QToolButton()
@@ -132,6 +170,8 @@ if QT_AVAILABLE:
             advanced_form = QtWidgets.QFormLayout(self.advanced)
             advanced_form.setContentsMargins(0, 0, 0, 0)
             self._spin("depth_ratio", .1, 50., .5, form=advanced_form)
+            self._spin("spacing_jitter_pct", 0., 50., 1., form=advanced_form)
+            self._spin("position_jitter_pct", 0., 100., 5., form=advanced_form)
             self._spin("lateral_shift_ratio", -5., 5., .05, form=advanced_form, decimals=2)
             self._spin("out_of_plane_deg", -89., 89., 1., form=advanced_form)
             self._spin("seed", 0, 2147483647, 1, form=advanced_form, integer=True)
@@ -191,26 +231,45 @@ if QT_AVAILABLE:
             self._loading = True
             try:
                 self._values = dict(values)
+                thickness_ratio = float(values.get("thickness_ratio", 0.25))
+                jitter_limit = min(50.0, max(0.0, 100.0 * (1.0 - thickness_ratio)))
+                self.controls["spacing_jitter_pct"].setRange(0.0, jitter_limit)
                 for key, widget in self.controls.items():
                     if key not in values:
                         continue
                     if isinstance(widget, QtWidgets.QComboBox):
                         widget.setCurrentIndex(max(0, widget.findData(values[key])))
+                    elif isinstance(widget, QtWidgets.QCheckBox):
+                        widget.setChecked(bool(values[key]))
                     else:
                         widget.setValue(values[key])
                 self.manual_group.setVisible(values.get("period_source") == "manual")
+                self.controls["manual_second_angle_deg"].setEnabled(
+                    bool(values.get("manual_second_orientation", False))
+                )
                 self.controls["stack_count"].setEnabled(values.get("mode") == "multi")
+                self._values = self._read_controls()
             finally:
                 self._loading = False
+
+        def _read_controls(self) -> dict[str, Any]:
+            values = dict(self._values)
+            for key, widget in self.controls.items():
+                values[key] = (
+                    widget.currentData()
+                    if isinstance(widget, QtWidgets.QComboBox)
+                    else widget.isChecked()
+                    if isinstance(widget, QtWidgets.QCheckBox)
+                    else widget.value()
+                )
+            return values
 
         def _changed(self, *_: Any) -> None:
             if self._loading:
                 return
-            values = dict(self._values)
-            for key, widget in self.controls.items():
-                values[key] = widget.currentData() if isinstance(widget, QtWidgets.QComboBox) else widget.value()
+            values = self._read_controls()
             self.set_settings(values)
-            self.settingsChanged.emit(values)
+            self.settingsChanged.emit(dict(self._values))
 
         def set_language(self, language: str) -> None:
             self.language = language
@@ -222,7 +281,23 @@ if QT_AVAILABLE:
                 if isinstance(widget, QtWidgets.QComboBox):
                     for i in range(widget.count()):
                         widget.setItemText(i, tr(widget.itemData(i, QtCore.Qt.ItemDataRole.UserRole + 1), language))
+            self.controls["spacing_jitter_pct"].setToolTip(
+                tr("spacing_jitter_pct", language) + "\n" + tr("spacing_note", language)
+            )
+            self.controls["position_jitter_pct"].setToolTip(
+                tr("position_jitter_pct", language) + "\n" + tr("position_jitter_note", language)
+            )
+            self.controls["manual_second_orientation"].setToolTip(
+                tr("manual_second_orientation", language)
+                + "\n"
+                + ("第二方向仅是手动形貌假设，不代表测得分支。" if not language.startswith("en") else "The second direction is a manual morphology assumption, not a measured branch.")
+            )
             self.manual_group.setTitle(tr("manual", language))
+            self.preset_label.setText(tr("presets", language))
+            self.single_preview_button.setText(tr("single_preview", language))
+            self.meso_preview_button.setText(tr("meso_preview", language))
+            self.single_preview_button.setAccessibleName(tr("single_preview", language))
+            self.meso_preview_button.setAccessibleName(tr("meso_preview", language))
             self.advanced_toggle.setText(tr("advanced", language))
             self.note.setText(tr("assumption_note", language))
             self.reset_button.setText(tr("reset", language))

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "butterfly-saxs"
-version = "0.4.3"
-description = "Identify and parameterize butterfly-pattern 2D SAXS: first-order ring L, constrained double ellipses, and in-situ batch review"
+version = "0.5.0"
+description = "2D SAXS measurements, butterfly trajectories, azimuthal analysis, and conditional lamellar simulation"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "MIT"

@@ -11,9 +11,18 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "measure_point": (".local_measurement", "measure_point"),
+    "extract_line_profile": (".local_measurement", "extract_line_profile"),
+    "measure_roi_orientation": (".local_measurement", "measure_roi_orientation"),
+    "measure_azimuthal_profile": (".azimuthal_analysis", "measure_azimuthal_profile"),
+    "fit_azimuthal_peaks": (".azimuthal_analysis", "fit_azimuthal_peaks"),
+    "simulate_projected_density_fft": (".lamellar_scattering", "simulate_projected_density_fft"),
+    "export_lamellar_scattering": (".lamellar_scattering", "export_lamellar_scattering"),
+    "analyze_density2d": (".density2d", "analyze_density2d"),
+    "inspect_legacy_saxs": (".legacy_saxs", "inspect_legacy_saxs"),
     "PublicationStyle": (".publication_models", "PublicationStyle"),
     "PublicationFigureSpec": (".publication_models", "PublicationFigureSpec"),
     "export_publication_figure": (".publication", "export_publication_figure"),
@@ -50,6 +59,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 _ALIASES: dict[str, str] = {"ImageFrame": "LoadedImage", "QMap": "GeometryMaps"}
 
 __all__ = [
+    "measure_point",
+    "extract_line_profile",
+    "measure_roi_orientation",
+    "measure_azimuthal_profile",
+    "fit_azimuthal_peaks",
+    "simulate_projected_density_fft",
+    "export_lamellar_scattering",
+    "analyze_density2d",
+    "inspect_legacy_saxs",
     "PublicationStyle",
     "PublicationFigureSpec",
     "export_publication_figure",

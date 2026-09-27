@@ -1213,6 +1213,7 @@ if QT_AVAILABLE:
             self._qy: Any = None
             self._qmap: Any = None
             self._poni_path: str | None = None
+            self._legacy_geometry: dict[str, Any] | None = None
             self._source_path: str | None = None
             self._frame: int | None = None
             self._dataset: str | None = None
@@ -1295,6 +1296,7 @@ if QT_AVAILABLE:
             self._on_main_page_changed(self.pages.currentIndex())
             self._build_batch_page()
             self._build_evolution_page()
+            self._build_image_measurement_pages()
             self._build_status_bar()
             initial_analysis = dict(analysis_settings or self._analysis_settings)
             if analysis_settings is not None and isinstance(initial_analysis.get("butterfly"), Mapping):
@@ -1332,12 +1334,70 @@ if QT_AVAILABLE:
             if not hasattr(self, "parameters_dock"):
                 return
             page = self.pages.widget(int(index))
-            if page in (getattr(self, "butterfly_page", None), getattr(self, "lamellar_page", None)):
+            if page in (
+                getattr(self, "butterfly_page", None),
+                getattr(self, "lamellar_page", None),
+                getattr(self, "local_measurement_page", None),
+                getattr(self, "azimuthal_page", None),
+                getattr(self, "density2d_page", None),
+            ):
                 self.parameters_dock.hide()
             else:
                 self.parameters_dock.show()
 
         # ----- UI construction -------------------------------------------------
+
+        def _build_image_measurement_pages(self) -> None:
+            from .local_measurement_page import LocalMeasurementPage
+            from .azimuthal_page import AzimuthalPage
+            from .density2d_page import Density2DPage
+
+            self.local_measurement_page = LocalMeasurementPage(self.pages, language=self._language)
+            self.azimuthal_page = AzimuthalPage(self.pages, language=self._language)
+            self.density2d_page = Density2DPage(self.pages, language=self._language)
+            self.pages.addTab(self.local_measurement_page, "局部测量")
+            self.pages.addTab(self.azimuthal_page, "方位角峰分析")
+            self.pages.addTab(self.density2d_page, "低 q 区域分析")
+
+        def _sync_image_measurement_pages(self) -> None:
+            """Supply independent image tools with current coordinates and usable pixels."""
+            if not hasattr(self, "local_measurement_page") or _np is None:
+                return
+            pages = (self.local_measurement_page, self.azimuthal_page, self.density2d_page)
+            if self._observed is None:
+                for page in pages:
+                    page.invalidate()
+                return
+            valid = _np.isfinite(self._observed)
+            detector_valid = _read(self._qmap, ("valid_mask", "valid"), None)
+            if detector_valid is not None:
+                valid &= _np.asarray(detector_valid, dtype=bool)
+            if self._external_mask is not None:
+                valid &= ~_np.asarray(self._external_mask, dtype=bool)
+            qx, qy, q_unit = self._qx, self._qy, self._active_q_unit()
+            if qx is None and qy is None:
+                # Match the service's explicitly uncalibrated pixel-q convention.
+                yy, xx = _np.indices(valid.shape, dtype=float)
+                qx = xx - (valid.shape[1] - 1) / 2.0
+                qy = yy - (valid.shape[0] - 1) / 2.0
+                q_unit = "pixel-q"
+            source = self._source_path or f"in-memory:{id(self._observed):x}"
+            selectors = []
+            if self._frame is not None:
+                selectors.append(f"frame={self._frame}")
+            if self._dataset is not None:
+                selectors.append(f"dataset={self._dataset}")
+            if selectors:
+                source = f"{source or 'in-memory'} [{'; '.join(selectors)}]"
+            for page in pages:
+                try:
+                    page.set_data(
+                        self._observed, qx=qx, qy=qy,
+                        valid_mask=valid, q_unit=q_unit, source=source,
+                    )
+                except ValueError as exc:
+                    # An empty domain disables only the affected optional tool.
+                    page.invalidate(str(exc))
 
         def _build_actions(self) -> None:
             self.project_menu = self.menuBar().addMenu("&Project")
@@ -1350,6 +1410,10 @@ if QT_AVAILABLE:
             self.save_project_action.setObjectName("saveProjectAction")
             self.save_project_action.triggered.connect(self.save_project)
             self.project_menu.addAction(self.save_project_action)
+            self.legacy_saxs_action = QtGui.QAction("SAXSAnalyzer compatibility…", self)
+            self.legacy_saxs_action.setObjectName("legacySaxsAction")
+            self.legacy_saxs_action.triggered.connect(self.open_legacy_saxs)
+            self.project_menu.addAction(self.legacy_saxs_action)
             self.open_image_action = QtGui.QAction("Open image…", self)
             self.open_image_action.setObjectName("openImageAction")
             self.open_image_action.triggered.connect(self.open_image)
@@ -1405,6 +1469,58 @@ if QT_AVAILABLE:
             self.file_toolbar.addAction(self.open_mask_action)
             self.file_toolbar.addAction(self.clear_mask_action)
             self.file_toolbar.addAction(self.export_evidence_action)
+
+        def open_legacy_saxs(self, _checked: bool = False) -> None:
+            from .legacy_saxs_dialog import LegacySaxsDialog
+
+            dialog = LegacySaxsDialog(self, language=self._language)
+            dialog.imageLoaded.connect(self._on_legacy_saxs_image_loaded)
+            dialog.exec()
+
+        def _apply_legacy_geometry(self, record: Mapping[str, Any]) -> None:
+            from ..legacy_saxs import legacy_fusion_geometry_map
+
+            if self._observed is None:
+                raise ValueError("legacy scalar geometry requires a loaded 2-D image")
+            qmap = legacy_fusion_geometry_map(record["parameters"], _np.asarray(self._observed).shape)
+            setter = getattr(self.engine, "set_poni", None)
+            if callable(setter):
+                setter(None)
+            self._poni_path = None
+            self._capture_loaded_input_record("poni", None)
+            self.set_observed_data(
+                self._observed, qmap=qmap,
+                metadata={"legacy_saxs_geometry": dict(record)},
+                _preserve_file_context=True,
+            )
+            self._legacy_geometry = dict(record)
+
+        def _on_legacy_saxs_image_loaded(self, loaded: Any) -> None:
+            snapshot = self._snapshot_project_document()
+            try:
+                inspection = loaded.inspection
+                self._source_path = str(loaded.image.source)
+                self._frame, self._dataset = loaded.image.frame, loaded.image.dataset
+                self._mask_path = self._file_mask = self._external_mask = None
+                self._mask_frame = self._mask_dataset = None
+                self._roi_specs = []
+                self._exclusion_roi = None
+                self._capture_loaded_input_record("mask", None)
+                self.set_observed_data(
+                    loaded.image.data, qmap=loaded.qmap, metadata=loaded.image.metadata,
+                    _preserve_file_context=True,
+                )
+                self._capture_loaded_input_record("source", self._source_path)
+                self._apply_legacy_geometry({
+                    "parameters": dict(inspection.session.geometry_values),
+                    "session_path": str(inspection.path),
+                    "session_sha256": inspection.source_sha256,
+                })
+                self.views.set_roi(None)
+                self.pages.setCurrentWidget(self.local_measurement_page)
+            except Exception as exc:
+                self._restore_project_document(snapshot)
+                QtWidgets.QMessageBox.warning(self, "SAXSAnalyzer", str(exc))
 
         def _build_central_pages(self) -> None:
             self.pages = QtWidgets.QTabWidget(self)
@@ -3390,6 +3506,9 @@ if QT_AVAILABLE:
             ):
                 action.setText(self._tr(key))
             self.export_evidence_action.setToolTip(self._tr("tooltip.export_evidence"))
+            self.legacy_saxs_action.setText(
+                "SAXSAnalyzer compatibility…" if self._language == "en" else "SAXSAnalyzer 会话 / 历史结果…"
+            )
             self.file_toolbar.setWindowTitle(self._tr("toolbar.project"))
 
             for page, key in (
@@ -3403,6 +3522,13 @@ if QT_AVAILABLE:
             if hasattr(self, "butterfly_workbench"):
                 self.butterfly_workbench.set_language(self._language)
             self.lamellar_page.set_language(self._language)
+            for page, zh, en in (
+                (self.local_measurement_page, "局部测量", "Local measurements"),
+                (self.azimuthal_page, "方位角峰分析", "Azimuthal peaks"),
+                (self.density2d_page, "低 q 区域分析", "Low-q analysis"),
+            ):
+                page.set_language(self._language)
+                self.pages.setTabText(self.pages.indexOf(page), en if self._language == "en" else zh)
             self.pages.setTabText(
                 self.pages.indexOf(self.lamellar_page),
                 "Real-space lamellae" if self._language == "en" else "实空间片层",
@@ -4994,6 +5120,7 @@ if QT_AVAILABLE:
                 self._capture_loaded_input_record("source", None)
             mask_cleared_for_shape = self._clear_incompatible_external_mask(data)
             self._observed = data
+            self._legacy_geometry = None
             self._qx, self._qy = qx, qy
             if qmap is not None:
                 self._qmap = qmap
@@ -5043,6 +5170,7 @@ if QT_AVAILABLE:
                     )
                 else:
                     self.butterfly_workbench.set_q_window(None)
+            self._sync_image_measurement_pages()
             if mask_cleared_for_shape:
                 self._set_status(
                     "status.mask_shape_changed",
@@ -5083,6 +5211,8 @@ if QT_AVAILABLE:
                     "status.poni_loaded",
                     name=Path(path).name if isinstance(path, (str, Path)) else self._poni_path,
                 )
+                self._sync_image_measurement_pages()
+                self._legacy_geometry = None
                 return True
             except Exception as exc:
                 self._set_status("status.poni_failed", flags="error", error=exc)
@@ -5253,6 +5383,7 @@ if QT_AVAILABLE:
                 if update_widgets:
                     self._sync_roi_widgets()
                 excluded = int(_np.count_nonzero(self._external_mask))
+                self._sync_image_measurement_pages()
                 self._set_status("status.mask_applied", count=excluded)
                 return True
             except Exception as exc:
@@ -5316,6 +5447,7 @@ if QT_AVAILABLE:
                     valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                     external_mask=None,
                 )
+            self._sync_image_measurement_pages()
             self._set_status("status.mask_cleared")
             return True
 
@@ -5447,6 +5579,7 @@ if QT_AVAILABLE:
                     valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                     external_mask=None,
                 )
+            self._sync_image_measurement_pages()
             self._set_status("status.roi_cleared")
             return True
 
@@ -7191,6 +7324,10 @@ if QT_AVAILABLE:
                 "rois": list(self._roi_specs),
                 "fit_session": self._fit_session_for_project(),
                 "lamellar_view": self.lamellar_page.document(),
+                "legacy_geometry": self._legacy_geometry,
+                "local_measurements": self.local_measurement_page.document(),
+                "azimuthal_view": self.azimuthal_page.document(),
+                "density2d_view": self.density2d_page.document(),
                 "batch": {
                     "mode": self.batch_mode_combo.currentData(),
                     "stage": self.batch_stage_combo.currentData(),
@@ -7276,6 +7413,7 @@ if QT_AVAILABLE:
 
             direct_fields = (
                 "_source_path",
+                "_legacy_geometry",
                 "_frame",
                 "_dataset",
                 "_mask_frame",
@@ -7348,6 +7486,9 @@ if QT_AVAILABLE:
                 self.display_settings
             )
             snapshot["lamellar_view"] = self.lamellar_page.snapshot_state()
+            snapshot["local_measurements"] = self.local_measurement_page.document()
+            snapshot["azimuthal_view"] = self.azimuthal_page.document()
+            snapshot["density2d_view"] = self.density2d_page.document()
             snapshot["ui_batch"] = {
                 "mode": self.batch_mode_combo.currentData(),
                 "stage": self.batch_stage_combo.currentData(),
@@ -7405,6 +7546,7 @@ if QT_AVAILABLE:
                 self.set_batch_frames(batch_state.get("frames", ()))
             direct_fields = (
                 "_source_path",
+                "_legacy_geometry",
                 "_frame",
                 "_dataset",
                 "_mask_frame",
@@ -7535,6 +7677,15 @@ if QT_AVAILABLE:
             self._render_status()
             if "lamellar_view" in snapshot:
                 self.lamellar_page.restore_state(snapshot["lamellar_view"])
+            self._sync_image_measurement_pages()
+
+            for key, page in (
+                ("local_measurements", self.local_measurement_page),
+                ("azimuthal_view", self.azimuthal_page),
+                ("density2d_view", self.density2d_page),
+            ):
+                if key in snapshot:
+                    page.restore_document(snapshot[key])
 
         def _apply_project_document(self, data: Mapping[str, Any], target: Path) -> None:
             """Apply an already parsed/normalized document through the UI seam."""
@@ -7542,6 +7693,8 @@ if QT_AVAILABLE:
             project_base = target.parent
             source = data.get("input", data.get("input_path"))
             poni = data.get("poni", data.get("poni_path"))
+            if isinstance(poni, str) and not poni.strip():
+                poni = None
             mask = data.get("mask", data.get("mask_path"))
             self._invalidate_pending_work(clear_fit=False)
             self._auto_scale_initial = False
@@ -7597,6 +7750,19 @@ if QT_AVAILABLE:
                     _resolve_project_frame(item, project_base) for item in (frames or [])
                 )
             if source:
+                if poni in (None, ""):
+                    # A project without a saved calibration is uncalibrated.
+                    # Do not let the service's active PONI leak across project
+                    # boundaries when restoring an older document.
+                    setter = getattr(self.engine, "set_poni", None)
+                    if callable(setter):
+                        setter(None)
+                    self._poni_path = None
+                    self._legacy_geometry = None
+                    self._qmap = None
+                    self._qx = None
+                    self._qy = None
+                    self._capture_loaded_input_record("poni", None)
                 if not self.open_image(
                     source,
                     frame=selected_frame,
@@ -7620,6 +7786,11 @@ if QT_AVAILABLE:
                     frame=selected_mask_frame,
                     dataset=selected_mask_dataset,
                 )
+            legacy_geometry = data.get("legacy_geometry")
+            if legacy_geometry is not None:
+                if not isinstance(legacy_geometry, Mapping):
+                    raise ValueError("legacy_geometry must be an object")
+                self._apply_legacy_geometry(legacy_geometry)
             if rois and isinstance(rois, Iterable):
                 self._roi_specs = [dict(spec) for spec in rois if isinstance(spec, Mapping)]
                 self._exclusion_roi = self._roi_specs[-1] if self._roi_specs else None
@@ -7652,6 +7823,13 @@ if QT_AVAILABLE:
                 data.get("lamellar_view"), context_signature=self._fit_state_signature(),
                 observed=self._observed, qx=self._qx, qy=self._qy,
             )
+            for key, page in (
+                ("local_measurements", self.local_measurement_page),
+                ("azimuthal_view", self.azimuthal_page),
+                ("density2d_view", self.density2d_page),
+            ):
+                if key in data:
+                    page.restore_document(data[key])
 
         def save_project(self, path: str | Path | bool | None = None) -> bool:
             if isinstance(path, bool):

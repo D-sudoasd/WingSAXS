@@ -95,6 +95,29 @@ def test_radial_scene_uses_physical_period_and_contract_shapes() -> None:
     )
 
 
+def test_different_population_length_units_require_branch_selection() -> None:
+    source = _radial_source(q_unit="unknown")
+    source["lobe_radial_peaks"][0]["q_unit"] = "nm^-1"
+    source["lobe_radial_peaks"][1]["q_unit"] = "nm^-1"
+
+    combined = build_lamellar_scene(source, {"layer_count": 1, "stack_count": 4})
+
+    assert combined.status == "unavailable"
+    assert not combined.metadata["available"]
+    assert "mixed_length_units" in combined.metadata["flags"]
+    assert "select" in combined.message.lower() or "选择" in combined.message
+    assert combined.centers.shape == (0, 3)
+    assert [item["length_unit"] for item in combined.metadata["populations"]] == ["nm", "relative"]
+    assert [item["period"] for item in combined.metadata["populations"]] == pytest.approx([2.0 * np.pi / .2, 1.0])
+
+    physical = build_lamellar_scene(source, {"selected_branch": 0, "layer_count": 1, "stack_count": 4})
+    relative = build_lamellar_scene(source, {"selected_branch": 1, "layer_count": 1, "stack_count": 4})
+    assert physical.metadata["available"] and physical.length_unit == "nm"
+    assert relative.metadata["available"] and relative.length_unit == "relative"
+    assert set(physical.branch_ids) == {0}
+    assert set(relative.branch_ids) == {1}
+
+
 def test_draw_axis_rotation_and_opposite_support_are_explicit() -> None:
     source = _radial_source()
     source["draw_axis_deg"] = 0.0
@@ -258,6 +281,88 @@ def test_manual_mode_is_available_without_source() -> None:
     assert scene.centers.shape == (2, 3)
 
 
+def test_manual_crossed_direction_field_is_explicit_and_fills_requested_slots() -> None:
+    scene = build_lamellar_scene(
+        {},
+        {
+            "period_source": "manual",
+            "mode": "multi",
+            "manual_period": 1.0,
+            "manual_angle_deg": 30.0,
+            "manual_second_orientation": True,
+            "manual_second_angle_deg": 120.0,
+            "layer_count": 1,
+            "stack_count": 12,
+            "position_jitter_pct": 70.0,
+            "seed": 4,
+        },
+    )
+
+    assert len(scene.centers) == 12
+    assert set(scene.stack_ids.tolist()) == set(range(12))
+    assert np.bincount(scene.branch_ids, minlength=2).tolist() == [6, 6]
+    assert not np.array_equal(scene.branch_ids, np.arange(12) % 2)
+    assert [item["angle_deg"] for item in scene.metadata["populations"]] == [30., 120.]
+    assert any("not fitted populations" in item for item in scene.metadata["assumptions"])
+
+    selected_b = build_lamellar_scene(
+        {},
+        {
+            "period_source": "manual",
+            "mode": "multi",
+            "manual_second_orientation": True,
+            "manual_second_angle_deg": 120.0,
+            "selected_branch": 1,
+            "layer_count": 1,
+            "stack_count": 12,
+        },
+    )
+    assert len(selected_b.centers) == 12
+    assert set(selected_b.branch_ids.tolist()) == {1}
+    assert selected_b.metadata["populations"][0]["angle_deg"] == pytest.approx(120.)
+
+    single_direction = build_lamellar_scene(
+        {},
+        {
+            "period_source": "manual",
+            "mode": "multi",
+            "manual_second_orientation": False,
+            "layer_count": 1,
+            "stack_count": 12,
+        },
+    )
+    assert set(single_direction.stack_ids.tolist()) == set(range(12))
+
+
+def test_manual_position_grid_uses_largest_period_when_reference_is_smaller() -> None:
+    scene = build_lamellar_scene(
+        {},
+        {
+            "period_source": "manual",
+            "mode": "multi",
+            "manual_period": 10.0,
+            "reference_period": 1.0,
+            "manual_second_orientation": True,
+            "layer_count": 1,
+            "stack_count": 12,
+            "width_ratio": 3.0,
+            "depth_ratio": 1.0,
+            "thickness_ratio": 0.25,
+            "position_jitter_pct": 70.0,
+            "seed": 13,
+        },
+    )
+    centres = scene.centers[::1]  # one layer per packet in this fixture
+    distances = np.linalg.norm(centres[:, None, :2] - centres[None, :, :2], axis=2)
+    distances += np.eye(len(centres)) * 1.e9
+    enclosing_diameter = np.linalg.norm((30.0, 10.0, 2.5))
+
+    assert scene.metadata["reference_period"] == pytest.approx(10.0)
+    assert len(centres) == 12
+    assert float(np.min(distances)) >= enclosing_diameter - 1.e-8
+    assert LamellarSettings().position_jitter_pct == pytest.approx(24.0)
+
+
 @pytest.mark.parametrize("status", ["estimate", "candidate"])
 def test_ellipse_scene_preserves_parameter_evidence_over_raw_solver_alias(status):
     source = _radial_source()
@@ -326,6 +431,51 @@ def test_scene_is_deterministic_without_mutating_source() -> None:
     assert source == before
 
 
+def test_interlayer_spacing_jitter_is_bounded_reproducible_and_explicitly_assumed() -> None:
+    source = _radial_source()
+    settings = {
+        "period_source": "manual",
+        "manual_period": 2.0,
+        "manual_angle_deg": 30.0,
+        "layer_count": 6,
+        "stack_count": 1,
+        "spacing_jitter_pct": 35.0,
+        "seed": 23,
+    }
+    first = build_lamellar_scene(source, settings)
+    repeated = build_lamellar_scene(source, settings)
+    np.testing.assert_array_equal(first.centers, repeated.centers)
+
+    normal = first.orientations[0, :, 2]
+    projected = first.centers @ normal
+    gaps = np.diff(projected)
+    assert np.all(gaps >= 2.0 * 0.65 - 1e-12)
+    assert np.all(gaps <= 2.0 * 1.35 + 1e-12)
+    assert np.ptp(gaps) > 1e-6
+    assert any("not fitted uncertainty" in item for item in first.assumptions)
+
+
+def test_interlayer_spacing_jitter_validation_and_zero_preserves_regular_stack() -> None:
+    regular = build_lamellar_scene(
+        {},
+        {
+            "period_source": "manual",
+            "manual_period": 3.0,
+            "layer_count": 5,
+            "stack_count": 1,
+            "spacing_jitter_pct": 0.0,
+        },
+    )
+    normal = regular.orientations[0, :, 2]
+    gaps = np.diff(regular.centers @ normal)
+    np.testing.assert_allclose(gaps, np.full(4, 3.0))
+
+    with pytest.raises(ValueError, match="spacing_jitter_pct"):
+        LamellarSettings(spacing_jitter_pct=50.1)
+    with pytest.raises(ValueError, match="minimum layer gap"):
+        LamellarSettings(thickness_ratio=0.9, spacing_jitter_pct=10.1)
+
+
 def test_multi_stack_count_is_total_and_fixed_slots_survive_missing_branch() -> None:
     both = build_lamellar_scene(
         _radial_source(),
@@ -333,7 +483,7 @@ def test_multi_stack_count_is_total_and_fixed_slots_survive_missing_branch() -> 
             "mode": "multi",
             "layer_count": 1,
             "stack_count": 12,
-            "reference_period": 10.0,
+            "reference_period": 100.0,
             "seed": 7,
         },
     )
@@ -353,7 +503,7 @@ def test_multi_stack_count_is_total_and_fixed_slots_survive_missing_branch() -> 
             "mode": "multi",
             "layer_count": 1,
             "stack_count": 12,
-            "reference_period": 10.0,
+            "reference_period": 100.0,
             "seed": 7,
         },
     )

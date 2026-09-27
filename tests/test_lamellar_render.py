@@ -8,6 +8,7 @@ from matplotlib.figure import Figure
 
 from butterfly_saxs.lamellar_render import (
     _camera_orientation,
+    _convex_hull_2d,
     render_lamellar_2d,
     render_lamellar_3d,
     render_lamellar_combined,
@@ -50,12 +51,30 @@ def test_2d_uses_actual_vertices_and_physical_unit_labels() -> None:
     scene = _scene()
     figure = render_lamellar_2d(scene)
     axis = figure.axes[0]
+    figure.canvas.draw()
 
     assert len(axis.patches) == len(scene.vertices)
     assert axis.get_aspect() == 1.0
-    assert "nm" in axis.get_xlabel()
+    assert not axis.axison
     assert "+y" in "\n".join(text.get_text() for text in axis.texts)
+    assert any(" nm" in text.get_text() for text in axis.texts)
+    assert len(figure.legends) == 1
+    assert [item.get_text() for item in figure.legends[0].get_texts()] == ["分支 A", "分支 B"]
+    reference_label = next(text for text in axis.texts if "+y" in text.get_text())
+    assert reference_label.get_window_extent().y1 < axis.bbox.y0
+    scale_label = next(text for text in axis.texts if " nm" in text.get_text())
+    assert scale_label.get_window_extent().y1 < axis.bbox.y0
+    assert figure.legends[0].get_window_extent().y0 > axis.bbox.y1
     assert "参数驱动示意" in "\n".join(text.get_text() for text in figure.texts)
+
+
+def test_2d_scale_bar_labels_relative_geometry_without_physical_units() -> None:
+    scene = _scene(length_unit="relative")
+    axis = render_lamellar_2d(scene, language="en").axes[0]
+
+    labels = [text.get_text() for text in axis.texts]
+    assert any("relative units" in label for label in labels)
+    assert not any(" nm" in label for label in labels)
 
 
 def test_3d_and_combined_views_keep_source_status_visible() -> None:
@@ -128,12 +147,29 @@ def test_stale_scene_is_an_explicit_blank_reason() -> None:
 def test_embedded_2d_mode_omits_standalone_figure_caption() -> None:
     scene = _scene()
     figure = Figure(figsize=(4.0, 3.0))
+    figure.subplots_adjust(left=0.02, right=0.98, bottom=0.23, top=0.90)
     axis = figure.add_subplot(111)
     render_lamellar_2d(scene, ax=axis, decorate=False)
 
     assert figure.texts == []
     assert axis.get_title() == ""
     assert "+y" in "\n".join(text.get_text() for text in axis.texts)
+
+
+def test_projected_plate_outline_uses_the_true_convex_hull() -> None:
+    points = np.asarray(
+        ((0., 0.), (2., 0.), (2., 2.), (0., 2.), (1., .4), (1., 1.), (0., 0.))
+    )
+    hull = _convex_hull_2d(points)
+
+    assert len(hull) == 4
+    assert set(map(tuple, hull)) == {(0., 0.), (2., 0.), (2., 2.), (0., 2.)}
+    twice_area = sum(
+        hull[index, 0] * hull[(index + 1) % len(hull), 1]
+        - hull[(index + 1) % len(hull), 0] * hull[index, 1]
+        for index in range(len(hull))
+    )
+    assert twice_area > 0.
 
 
 def test_combined_q_map_masks_and_crops_to_display_window_without_mutating_source() -> None:
