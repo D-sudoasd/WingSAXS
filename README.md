@@ -148,6 +148,7 @@ Agents (and any non-interactive operator) should start with `bsaxs describe` or 
 | Architecture | [docs/architecture_zh.md](docs/architecture_zh.md) |
 | Lamellar studio / publication artboards | [docs/lamellar_workbench_zh.md](docs/lamellar_workbench_zh.md), [docs/publication_figures_zh.md](docs/publication_figures_zh.md) |
 | P3 / P4 evidence | [docs/validation/benchmark_protocol.md](docs/validation/benchmark_protocol.md) |
+| JAC manuscript and quantitative validation | [docs/jac/README.md](docs/jac/README.md) |
 | 2D capability acceptance and remaining work | [docs/validation/2d_capability_acceptance_zh.md](docs/validation/2d_capability_acceptance_zh.md) |
 | Independent lamellar sequence and noise controls | [docs/validation/lamellar_sequence_zh.md](docs/validation/lamellar_sequence_zh.md) |
 
