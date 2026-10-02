@@ -22,6 +22,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
 from .benchmark_t1 import DEFAULT_CASE_NAMES as T1_DEFAULT_CASE_NAMES
+from .csv_utils import read_csv_rows
 from .observables import ellipse_radius
 from .pipeline import analyze_frame
 
@@ -766,7 +767,7 @@ def _run_t2(
 
 def _load_r0_rows(manifest_path: Path) -> list[dict[str, str]]:
     with manifest_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        rows = [dict(row) for row in csv.DictReader(handle)]
+        rows = read_csv_rows(handle)
     expected = [f"blind_{index:03d}" for index in range(1, 9)]
     if [row.get("blind_id") for row in rows] != expected:
         raise ValueError("R0 P4 manifest must contain blind_001 through blind_008 in order")

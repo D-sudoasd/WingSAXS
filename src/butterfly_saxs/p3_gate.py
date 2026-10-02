@@ -32,6 +32,7 @@ from .benchmark_t2 import GENERATOR_HASH as T2_GENERATOR_HASH
 from .benchmark_t2 import GENERATOR_VERSION as T2_GENERATOR_VERSION
 from .benchmark_t2 import T2_Q_UNIT
 from .benchmark_t2 import generate_case as generate_t2_case
+from .csv_utils import read_csv_rows
 
 
 P3_GATE_SCHEMA_VERSION = "lamellarsaxs2d.p3_gate.v3"
@@ -681,7 +682,7 @@ def _annotation_csv_evidence_complete(
             if not path.is_absolute():
                 path = status_path.parent / path
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                rows_by_key[key] = list(csv.DictReader(handle))
+                rows_by_key[key] = read_csv_rows(handle)
     except (OSError, UnicodeError, csv.Error):
         return False
 
@@ -983,7 +984,7 @@ def _pilot_source_complete(
         if source.get("consensus_sha256") != _sha256_file(consensus_path):
             return False
         with consensus_path.open("r", encoding="utf-8-sig", newline="") as handle:
-            consensus_rows = list(csv.DictReader(handle))
+            consensus_rows = read_csv_rows(handle)
     except (OSError, UnicodeError, ValueError, csv.Error):
         return False
     frame_results = source.get("frame_results")

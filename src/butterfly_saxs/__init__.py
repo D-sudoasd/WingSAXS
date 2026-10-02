@@ -11,9 +11,10 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "build_analysis_report": (".report", "build_analysis_report"),
     "measure_point": (".local_measurement", "measure_point"),
     "extract_line_profile": (".local_measurement", "extract_line_profile"),
     "measure_roi_orientation": (".local_measurement", "measure_roi_orientation"),
@@ -59,6 +60,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 _ALIASES: dict[str, str] = {"ImageFrame": "LoadedImage", "QMap": "GeometryMaps"}
 
 __all__ = [
+    "build_analysis_report",
     "measure_point",
     "extract_line_profile",
     "measure_roi_orientation",

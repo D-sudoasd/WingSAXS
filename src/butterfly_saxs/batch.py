@@ -9,7 +9,6 @@ orchestration with a small fake analyser.
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import inspect
 import json
@@ -25,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from .cancellation import AnalysisCancelled
+from .csv_utils import read_csv_rows
 from .settings import strict_int
 from .path_utils import IMAGE_SUFFIXES, filter_supported_image_paths
 from .serialization import json_safe as _canonical_json_safe
@@ -666,7 +666,7 @@ def _manifest_rows(manifest: Any) -> list[Any]:
         path = Path(manifest)
         if path.suffix.casefold() == ".csv":
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                loaded_manifest: Any = list(csv.DictReader(handle))
+                loaded_manifest: Any = read_csv_rows(handle)
         else:
             with path.open("r", encoding="utf-8-sig") as handle:
                 loaded_manifest = json.load(handle)

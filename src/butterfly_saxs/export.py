@@ -58,6 +58,21 @@ def _artifact_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _verify_zip_members(archive: zipfile.ZipFile, members: Iterable[str]) -> None:
+    """Read each declared member through EOF so ZIP CRC and size are checked."""
+
+    for member in members:
+        try:
+            with archive.open(member, "r") as handle:
+                while handle.read(1024 * 1024):
+                    pass
+        except Exception as exc:
+            raise ValueError(
+                f"previous streamed NPZ member {member!r} failed integrity validation; "
+                "re-export the bundle before resuming"
+            ) from exc
+
+
 def _publish_staged_bundle(
     stage: Path,
     targets: Mapping[str, Path],
@@ -1076,34 +1091,259 @@ def _fit_audit(value: Any) -> dict[str, Any]:
     return result
 
 
-def _walk_arrays(value: Any, prefix: str, output: dict[str, Any]) -> None:
+def _walk_arrays(
+    value: Any,
+    prefix: str,
+    output: dict[str, Any],
+    _active: set[int] | None = None,
+) -> None:
+    """Collect arrays without descending into scalar metadata or cycles."""
+
     tolist = getattr(value, "tolist", None)
     shape = getattr(value, "shape", None)
     dtype = getattr(value, "dtype", None)
     if callable(tolist) and shape is not None and dtype is not None:
         output[prefix] = value
         return
+    if value is None or isinstance(
+        value, (str, bytes, int, float, complex, bool, Enum, np.generic, Path)
+    ):
+        return
+    if _active is None:
+        _active = set()
+    object_id = id(value)
+    if object_id in _active:
+        return
+    _active.add(object_id)
     if isinstance(value, Mapping):
-        for key, item in value.items():
-            _walk_arrays(item, f"{prefix}__{_safe_key(key)}", output)
+        try:
+            for key, item in value.items():
+                _walk_arrays(item, f"{prefix}__{_safe_key(key)}", output, _active)
+        finally:
+            _active.remove(object_id)
         return
     if is_dataclass(value):
-        for field in fields(value):
-            _walk_arrays(getattr(value, field.name), f"{prefix}__{_safe_key(field.name)}", output)
+        try:
+            for field in fields(value):
+                _walk_arrays(
+                    getattr(value, field.name),
+                    f"{prefix}__{_safe_key(field.name)}",
+                    output,
+                    _active,
+                )
+        finally:
+            _active.remove(object_id)
         return
     if isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _walk_arrays(item, f"{prefix}__{index}", output)
+        try:
+            for index, item in enumerate(value):
+                _walk_arrays(item, f"{prefix}__{index}", output, _active)
+        finally:
+            _active.remove(object_id)
         return
     if hasattr(value, "__dict__"):
-        for key, item in vars(value).items():
-            if not str(key).startswith("_"):
-                _walk_arrays(item, f"{prefix}__{_safe_key(key)}", output)
+        try:
+            for key, item in vars(value).items():
+                if not str(key).startswith("_"):
+                    _walk_arrays(item, f"{prefix}__{_safe_key(key)}", output, _active)
+        finally:
+            _active.remove(object_id)
+        return
+    _active.remove(object_id)
 
 
 def _safe_key(value: Any) -> str:
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
     return text or "value"
+
+
+def _frame_detail_safe(
+    value: Any,
+    *,
+    _active: dict[int, str] | None = None,
+    _path: str = "$",
+) -> Any:
+    """Make a compact, cycle-safe JSON view while leaving arrays in NPZ."""
+
+    if isinstance(value, Enum):
+        return {
+            "enum_type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "name": value.name,
+            "value": _frame_detail_safe(value.value, _active=_active, _path=f"{_path}.value"),
+        }
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return _checkpoint_safe(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        try:
+            return _frame_detail_safe(value.item(), _active=_active, _path=_path)
+        except (TypeError, ValueError):
+            return _checkpoint_safe(value)
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if shape is not None and dtype is not None:
+        return _checkpoint_safe(value)
+
+    if _active is None:
+        _active = {}
+    object_id = id(value)
+    if object_id in _active:
+        return {"$ref": _active[object_id]}
+
+    if isinstance(value, Mapping):
+        _active[object_id] = _path
+        try:
+            return {
+                str(key): _frame_detail_safe(
+                    item, _active=_active, _path=f"{_path}.{_safe_key(key)}"
+                )
+                for key, item in value.items()
+            }
+        finally:
+            _active.pop(object_id, None)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        _active[object_id] = _path
+        try:
+            return [
+                _frame_detail_safe(item, _active=_active, _path=f"{_path}[{index}]")
+                for index, item in enumerate(value)
+            ]
+        finally:
+            _active.pop(object_id, None)
+    if is_dataclass(value):
+        _active[object_id] = _path
+        try:
+            converted = {
+                item.name: _frame_detail_safe(
+                    getattr(value, item.name),
+                    _active=_active,
+                    _path=f"{_path}.{item.name}",
+                )
+                for item in fields(value)
+            }
+            parameters = _value(value, "parameters", default=_MISSING)
+            if parameters is not _MISSING and "parameters" not in converted:
+                converted["parameters"] = _frame_detail_safe(
+                    parameters, _active=_active, _path=f"{_path}.parameters"
+                )
+            return converted
+        finally:
+            _active.pop(object_id, None)
+
+    # Honor compact public mapping APIs before examining public attributes.
+    for method_name in ("to_mapping", "to_dict", "as_dict"):
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            if method_name == "to_mapping":
+                converted = method(include_arrays=False)
+            else:
+                converted = method(include_specs=True)
+        except TypeError:
+            try:
+                converted = method()
+            except Exception:  # pragma: no cover - compatibility fallback
+                continue
+        except Exception:  # pragma: no cover - compatibility fallback
+            continue
+        if converted is value:
+            continue
+        if isinstance(converted, Mapping):
+            _active[object_id] = _path
+            try:
+                merged = dict(converted)
+                parameters = _value(value, "parameters", "params", default=_MISSING)
+                if parameters is not _MISSING and "parameters" not in merged:
+                    merged["parameters"] = parameters
+                # Compact mappings may omit array attributes that are still
+                # retained losslessly in the NPZ archive.
+                for name in (
+                    "image", "qmap", "valid_mask", "model", "residual",
+                    "model_image", "residual_image", "full2d",
+                ):
+                    original = _value(value, name, default=_MISSING)
+                    if original is not _MISSING:
+                        merged[name] = original
+                return _frame_detail_safe(merged, _active=_active, _path=_path)
+            finally:
+                _active.pop(object_id, None)
+
+    attributes = getattr(value, "__dict__", None)
+    if isinstance(attributes, Mapping):
+        _active[object_id] = _path
+        try:
+            return _frame_detail_safe(
+                {
+                    key: item
+                    for key, item in attributes.items()
+                    if not str(key).startswith("_")
+                },
+                _active=_active,
+                _path=_path,
+            )
+        finally:
+            _active.pop(object_id, None)
+    return _checkpoint_safe(value)
+
+
+def _frame_q_unit(value: Any) -> tuple[Any, str | None]:
+    """Return an explicit q unit and the result field that supplied it."""
+
+    for context_name, context in (
+        ("result", value),
+        ("qmap", _value(value, "qmap", default=None)),
+        ("qmap.metadata", _value(_value(value, "qmap", default=None), "metadata", default=None)),
+        ("metadata", _value(value, "metadata", default=None)),
+        ("analysis_domain", _value(value, "analysis_domain", default=None)),
+    ):
+        candidate = _value(context, "q_unit", "unit", default=_MISSING)
+        if candidate is not _MISSING and candidate is not None:
+            return _frame_detail_safe(candidate), context_name
+    return None, None
+
+
+def _frame_detail_record(
+    item: FrameFitResult,
+    index: int,
+    *,
+    array_names: Sequence[str] = (),
+) -> dict[str, Any]:
+    result = item.result
+    q_unit, q_unit_source = _frame_q_unit(result)
+    qmap = _value(result, "qmap", default=None)
+    qmap_metadata = _value(qmap, "metadata", default=None)
+    domain = _value(result, "analysis_domain", default=None)
+    if domain is None:
+        domain = _value(result, "domain_summary", "analysis_domain_summary", default=None)
+    summarize_domain = getattr(domain, "to_summary", None)
+    if callable(summarize_domain):
+        try:
+            domain = summarize_domain()
+        except Exception:  # pragma: no cover - optional domain summary
+            pass
+    analysis = _value(result, "analysis", "analysis_settings", "settings", default=None)
+    record = {
+        **_frame_base(item, index),
+        "frame_order": _frame_detail_safe(item.frame.order),
+        "frame_source": _frame_detail_safe(item.frame.source),
+        "frame_number": item.frame.frame,
+        "frame_dataset": _frame_detail_safe(item.frame.dataset),
+        "frame_metadata": _frame_detail_safe(item.frame.metadata),
+        "traceback": _frame_detail_safe(item.traceback),
+        "array_prefix": f"frame_{index:04d}",
+        "array_names": list(array_names),
+        "q_unit": q_unit,
+        "q_unit_source": q_unit_source,
+        "qmap_metadata": _frame_detail_safe(qmap_metadata),
+        "analysis_settings": _frame_detail_safe(analysis),
+        "analysis_domain": _frame_detail_safe(domain),
+        "result": _frame_detail_safe(result),
+    }
+    return _json_safe(record)
 
 
 def _contains_omitted_array(value: Any, _visited: set[int] | None = None) -> bool:
@@ -1193,87 +1433,53 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
+    from .visualization import _parameter_evolution_label, plot_parameter_evolution
 
-    series: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
-    for index, item in enumerate(results):
-        x_value = item.frame.time
-        try:
-            x = float(x_value) if x_value is not None else float(index)
-        except (TypeError, ValueError):
-            x = float(index)
-        if not math.isfinite(x):
-            x = float(index)
-        for parameter in _parameters(item.result):
+    # One quantity/unit per panel avoids assigning generic length/intensity
+    # units to ratios, angles or unlike quantities. Keep every frame, including
+    # missing values, so the visual sequence agrees with the CSV frame index.
+    parameter_rows = [_parameters(item.result) for item in results]
+    keys = list(dict.fromkeys(
+        (parameter["parameter"], str(parameter.get("unit") or "").strip())
+        for parameters in parameter_rows for parameter in parameters
+    ))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not keys:
+        fig, axis = plt.subplots(figsize=(9, 5), constrained_layout=True)
+        axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
+        axis.set_axis_off()
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        return path
+    aliases = {key: f"quantity_{index}" for index, key in enumerate(keys)}
+    labels, units = {}, {}
+    for (name, unit), alias in aliases.items():
+        explicit_units = {name: unit} if unit else None
+        rendered = _parameter_evolution_label(name, parameter_units=explicit_units)
+        labels[alias], units[alias] = rendered.rsplit(" (", 1)
+        units[alias] = units[alias].removesuffix(")")
+    rows = []
+    has_time = any(item.frame.time is not None for item in results)
+    for index, (item, parameters) in enumerate(zip(results, parameter_rows)):
+        row = {"frame_index": index, "time": item.frame.time, "status": item.status}
+        for parameter in parameters:
+            key = (parameter["parameter"], str(parameter.get("unit") or "").strip())
+            alias = aliases[key]
             value = parameter.get("value")
             if value in (None, ""):
                 value = parameter.get("candidate_value")
-            try:
-                y = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(y):
-                unit = parameter.get("unit")
-                unit_key = str(unit).strip() if unit not in (None, "") else None
-                series.setdefault((parameter["parameter"], unit_key), []).append(
-                    {
-                        "frame_index": index,
-                        "x": x,
-                        "y": y,
-                        "publication_status": parameter.get("publication_status", "not_assessed"),
-                    }
-                )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    groups: dict[str, list[tuple[str, str | None]]] = {}
-    for key in series:
-        name, unit = key
-        # Parameters without a declared unit are kept on separate panels: a
-        # missing unit is not evidence that two quantities are commensurate.
-        group = unit if unit is not None else f"__unknown__:{name}"
-        groups.setdefault(group, []).append(key)
-    panel_count = max(1, len(groups))
-    fig, axes = plt.subplots(
-        nrows=panel_count,
-        ncols=1,
-        figsize=(9, max(5, 3.2 * panel_count)),
-        squeeze=False,
-        constrained_layout=True,
+            row[alias] = value
+            row[f"{alias}_stderr"] = parameter.get("stderr")
+            state = item.status
+            if parameter.get("publication_status") != "available":
+                state = "candidate" if state == "ok" else f"{state}; candidate"
+            row[f"{alias}_status"] = state
+        rows.append(row)
+    # FrameRef.time has no declared universal time unit; never assume seconds.
+    fig = plot_parameter_evolution(
+        rows, parameters=list(aliases.values()), x_key="time" if has_time else "frame_index",
+        parameter_labels=labels, parameter_units=units, output=path, dpi=160,
     )
-    axes_flat = list(axes[:, 0])
-    if series:
-        x_label = "time" if any(item.frame.time is not None for item in results) else "frame"
-        for axis, (group, keys) in zip(axes_flat, groups.items()):
-            for name, unit in keys:
-                points = series[(name, unit)]
-                points.sort(key=lambda point: point["frame_index"])
-                color = axis._get_lines.get_next_color()
-                axis.plot([], [], color=color, linestyle="None", marker="o", label=name)
-                assessed = [point for point in points if point["publication_status"] == "available"]
-                candidates = [point for point in points if point["publication_status"] != "available"]
-                if assessed:
-                    axis.scatter(
-                        [point["x"] for point in assessed],
-                        [point["y"] for point in assessed],
-                        marker="o",
-                        color=color,
-                    )
-                if candidates:
-                    axis.scatter(
-                        [point["x"] for point in candidates],
-                        [point["y"] for point in candidates],
-                        marker="x",
-                        color=color,
-                        label=f"{name} candidate only",
-                    )
-            unit_label = group if not group.startswith("__unknown__:") else "unit unspecified"
-            axis.set_ylabel(f"parameter value ({unit_label})")
-            axis.legend(loc="best", fontsize="small")
-            axis.set_xlabel(x_label)
-            axis.grid(True, alpha=0.25)
-    else:
-        axis = axes_flat[0]
-        axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
-        axis.set_axis_off()
-    fig.savefig(path, dpi=160)
     plt.close(fig)
     return path
 
@@ -1281,10 +1487,9 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
 class StreamingBatchExporter:
     """Write a batch bundle while retaining at most one detector frame.
 
-    The regular :func:`export_batch` API remains unchanged for notebooks and
-    small jobs.  This writer is used by the CLI ``--stream`` path: each frame
-    is converted to compact rows and its arrays are appended directly to a
-    temporary NPZ zip member before the in-memory result is released.
+    This writer is used by the CLI ``--stream`` path: each frame is converted
+    to compact rows and frame details while its arrays are appended directly
+    to a temporary NPZ zip member before the in-memory result is released.
     """
 
     _FRAME_COLUMNS = [
@@ -1351,6 +1556,7 @@ class StreamingBatchExporter:
             "lobe_measurements": self.output / f"{self.prefix}lobe_measurements.csv",
             "ellipse_fit": self.output / f"{self.prefix}ellipse_fit.json",
             "ellipse_fit_jsonl": self.output / f"{self.prefix}ellipse_fit.jsonl",
+            "frame_details": self.output / f"{self.prefix}frame_details.jsonl",
             "manifest": self.output / f"{self.prefix}manifest.json",
             "provenance": self.output / f"{self.prefix}provenance.json",
             "npz": self.output / f"{self.prefix}results.npz",
@@ -1365,6 +1571,7 @@ class StreamingBatchExporter:
         self._stage = Path(tempfile.mkdtemp(prefix=".stream-", dir=self.output))
         self._writers: dict[str, Any] = {}
         self._handles: dict[str, Any] = {}
+        self._details_handle: Any = None
         self._ellipse_rows: list[dict[str, Any]] = []
         self._compact_results: list[FrameFitResult] = []
         self._missing_frames: list[int] = []
@@ -1413,6 +1620,11 @@ class StreamingBatchExporter:
                         "previous streamed NPZ is missing declared arrays: "
                         + ", ".join(str(item) for item in missing_names[:5])
                     )
+                declared_members = [
+                    str(name) if str(name) in old_names else f"{name}.npy"
+                    for name in parsed.get("arrays", ())
+                ]
+                _verify_zip_members(self._old_npz, declared_members)
                 self._old_npz_metadata = dict(parsed)
             except Exception:
                 if self._old_npz is not None:
@@ -1435,6 +1647,9 @@ class StreamingBatchExporter:
                 writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
                 writer.writeheader()
                 self._writers[key] = writer
+            self._details_handle = (
+                self._stage / self._targets["frame_details"].name
+            ).open("w", encoding="utf-8", newline="\n")
             npz_path = self._stage / self._targets["npz"].name
             self._npz = zipfile.ZipFile(npz_path, "w", compression=zipfile.ZIP_DEFLATED)
         except Exception:
@@ -1482,12 +1697,34 @@ class StreamingBatchExporter:
                 "peak_landmarks": _json_safe(_value(_value(item.result, "butterfly", default={}), "peak_landmarks", default={})),
             }
         )
+        array_prefix = f"frame_{index:04d}"
         arrays: dict[str, Any] = {}
-        _walk_arrays(item.result, f"frame_{index:04d}", arrays)
+        _walk_arrays(item.result, array_prefix, arrays)
         for name, value in arrays.items():
             with self._npz.open(name + ".npy", "w") as handle:
                 np.lib.format.write_array(handle, np.asarray(value), allow_pickle=False)
             self._array_names.append(name)
+        frame_array_names = list(arrays)
+        if item.resumed and self._old_npz is not None:
+            prefix = f"{array_prefix}__"
+            frame_array_names = sorted(
+                set(frame_array_names)
+                | {
+                    name[:-4]
+                    for name in self._old_npz.namelist()
+                    if name.startswith(prefix) and name.endswith(".npy")
+                }
+            )
+        detail = _frame_detail_record(
+            item,
+            index,
+            array_names=frame_array_names,
+        )
+        self._details_handle.write(
+            json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            + "\n"
+        )
+        self._details_handle.flush()
         if item.result is None or _contains_omitted_array(item.result):
             # A resumed successful frame is represented by a compact
             # checkpoint mapping.  Its original detector arrays are preserved
@@ -1504,7 +1741,7 @@ class StreamingBatchExporter:
             self._touched_frames.add(index)
         compact = FrameFitResult(
             frame=item.frame,
-            result=_checkpoint_safe(item.result),
+            result=_frame_detail_safe(item.result),
             status=item.status,
             error=item.error,
             diagnostic=item.diagnostic,
@@ -1533,6 +1770,9 @@ class StreamingBatchExporter:
                 self._npz.close()
                 for handle in self._handles.values():
                     handle.close()
+                if self._details_handle is not None:
+                    self._details_handle.close()
+                    self._details_handle = None
                 shutil.rmtree(self._stage, ignore_errors=True)
                 if self._old_npz is not None:
                     self._old_npz.close()
@@ -1589,7 +1829,7 @@ class StreamingBatchExporter:
                     for name in old_names:
                         if name == "__metadata__.npy":
                             continue
-                        match = re.match(r"frame_(\d{4})__", name)
+                        match = re.match(r"frame_(\d+)__", name)
                         if match and int(match.group(1)) in self._touched_frames:
                             continue
                         with self._old_npz.open(name, "r") as source_handle:
@@ -1626,6 +1866,9 @@ class StreamingBatchExporter:
                 self._old_npz = None
             for handle in self._handles.values():
                 handle.close()
+            if self._details_handle is not None:
+                self._details_handle.close()
+                self._details_handle = None
             staged_ellipse = self._stage / self._targets["ellipse_fit"].name
             staged_jsonl = self._stage / self._targets["ellipse_fit_jsonl"].name
             staged_ellipse.write_text(
@@ -1704,6 +1947,12 @@ class StreamingBatchExporter:
         for handle in getattr(self, "_handles", {}).values():
             try:
                 handle.close()
+            except Exception:
+                pass
+        details_handle = getattr(self, "_details_handle", None)
+        if details_handle is not None:
+            try:
+                details_handle.close()
             except Exception:
                 pass
         stage = getattr(self, "_stage", None)
@@ -1821,7 +2070,7 @@ def export_batch(
 
     The returned mapping uses stable logical keys (``frame_summary``,
     ``parameters_long``, ``ridge_points``, ``ellipse_fit``, ``npz``, and
-    ``evolution_png``) and points to the actual files.
+    ``evolution_png`` and ``frame_details``) and points to the actual files.
 
     Existing targets are rejected before any export is written unless
     ``force=True`` is explicitly supplied.
@@ -1840,6 +2089,7 @@ def export_batch(
     lobe_measurements_target = output / f"{stem}lobe_measurements.csv"
     ellipse_fit_target = output / f"{stem}ellipse_fit.json"
     ellipse_jsonl_target = output / f"{stem}ellipse_fit.jsonl"
+    frame_details_target = output / f"{stem}frame_details.jsonl"
     manifest_target = output / f"{stem}manifest.json"
     provenance_target = output / f"{stem}provenance.json"
     npz_target = output / f"{stem}results.npz"
@@ -1851,6 +2101,7 @@ def export_batch(
         lobe_measurements_target,
         ellipse_fit_target,
         ellipse_jsonl_target,
+        frame_details_target,
         manifest_target,
         provenance_target,
         npz_target,
@@ -1870,6 +2121,7 @@ def export_batch(
     lobe_measurements = stage / lobe_measurements_target.name
     ellipse_fit = stage / ellipse_fit_target.name
     ellipse_jsonl = stage / ellipse_jsonl_target.name
+    frame_details = stage / frame_details_target.name
     manifest_path = stage / manifest_target.name
     provenance_path = stage / provenance_target.name
     npz_path = stage / npz_target.name
@@ -1989,6 +2241,16 @@ def export_batch(
         for row in ellipse_rows:
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
+    with frame_details.open("w", encoding="utf-8", newline="\n") as handle:
+        for index, item in enumerate(results):
+            arrays: dict[str, Any] = {}
+            _walk_arrays(item.result, f"frame_{index:04d}", arrays)
+            detail = _frame_detail_record(item, index, array_names=list(arrays))
+            handle.write(
+                json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+                + "\n"
+            )
+
     if isinstance(batch, BatchRunResult):
         batch_manifest = batch.manifest
         input_hash = batch.input_hash
@@ -2033,6 +2295,7 @@ def export_batch(
             "lobe_measurements": lobe_measurements_target,
             "ellipse_fit": ellipse_fit_target,
             "ellipse_fit_jsonl": ellipse_jsonl_target,
+            "frame_details": frame_details_target,
             "manifest": manifest_target,
             "provenance": provenance_target,
             "npz": npz_target,

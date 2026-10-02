@@ -224,8 +224,9 @@ def load_image(
         array, metadata, selected_frame = _read_fabio(source, frame=frame)
         selected_dataset = None
     elif kind == "tiff":
-        array, metadata, selected_frame = _read_tiff(source, frame=frame)
-        selected_dataset = None
+        array, metadata, selected_frame, selected_dataset = _read_tiff(
+            source, frame=frame, dataset=dataset
+        )
     elif kind == "raster":
         if dataset is not None or frame is not None:
             raise DataIOError("frame/dataset selectors are not applicable to a raster image")
@@ -519,8 +520,8 @@ def _read_npz(
 
 
 def _read_tiff(
-    source: Path, *, frame: int | None
-) -> tuple[np.ndarray, dict[str, Any], int | None]:
+    source: Path, *, frame: int | None, dataset: str | None
+) -> tuple[np.ndarray, dict[str, Any], int | None, str | None]:
     try:
         import tifffile
 
@@ -529,16 +530,58 @@ def _read_tiff(
             series_axes = [getattr(s, "axes", None) for s in tif.series]
             imagej_metadata = tif.imagej_metadata
             ome_metadata = tif.ome_metadata
+            series_count = len(tif.series)
+            if not series_count:
+                raise DataShapeError(f"TIFF source {source} contains no image series")
+            if dataset is None:
+                if series_count > 1:
+                    available = ", ".join(
+                        f"series:{index} (shape={tuple(series.shape)!r}, axes={series.axes!r})"
+                        for index, series in enumerate(tif.series)
+                    )
+                    raise DatasetSelectionError(
+                        f"TIFF source {source} has multiple image series; select "
+                        f"dataset='series:<index>'; available: {available}"
+                    )
+                series_index = 0
+                selected_dataset = None
+            else:
+                selector = dataset.strip()
+                prefix, separator, index_text = selector.partition(":")
+                if (
+                    not separator
+                    or prefix.casefold() != "series"
+                    or not index_text.isascii()
+                    or not index_text.isdigit()
+                ):
+                    raise DatasetSelectionError(
+                        "TIFF dataset must use the form 'series:<zero-based index>'"
+                    )
+                series_index = int(index_text)
+                if series_index >= series_count:
+                    raise DatasetSelectionError(
+                        f"TIFF series index {series_index} is outside {source}; "
+                        f"available indexes: 0 through {series_count - 1}"
+                    )
+                selected_dataset = f"series:{series_index}"
+            selected_series = tif.series[series_index]
             tags: dict[str, Any] = {}
-            if pages:
-                for key, tag in tif.pages[0].tags.items():
+            if selected_series.pages:
+                for key, tag in selected_series.pages[0].tags.items():
                     try:
                         tags[str(key)] = tag.value
                     except Exception:
                         # A malformed vendor tag must not prevent intensity data
                         # from being read; the tag itself is simply omitted.
                         continue
-            array = tif.asarray()
+            array = selected_series.asarray()
+            selected_series_metadata = {
+                "index": series_index,
+                "shape": list(selected_series.shape),
+                "axes": getattr(selected_series, "axes", None),
+            }
+    except (DatasetSelectionError, FrameSelectionError, DataShapeError):
+        raise
     except ImportError as exc:  # pragma: no cover - dependency is declared
         raise DataIOError("TIFF support requires tifffile") from exc
     except (OSError, ValueError, RuntimeError) as exc:
@@ -547,6 +590,7 @@ def _read_tiff(
         "format": "tiff",
         "page_count": pages,
         "series_axes": series_axes,
+        "selected_series": selected_series_metadata,
         "imagej_metadata": imagej_metadata,
         "ome_metadata": ome_metadata,
         "tags": tags,
@@ -554,7 +598,7 @@ def _read_tiff(
     selected, selected_frame = _select_frame(
         array, frame=frame, source=source, source_kind="TIFF"
     )
-    return selected, metadata, selected_frame
+    return selected, metadata, selected_frame, selected_dataset
 
 
 def _close_fabio(handle: Any) -> None:

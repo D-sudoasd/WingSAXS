@@ -1213,6 +1213,9 @@ class ButterflyAnalysisService:
                 self._loaded.data.shape,
                 candidate,
                 valid_mask=self._loaded.valid_mask,
+                calibration_identity=(
+                    str(poni) if isinstance(poni, (str, Path)) else "in-memory"
+                ),
             )
         self._poni = candidate
         self.poni_path = str(poni) if isinstance(poni, (str, Path)) else "in-memory"
@@ -1225,10 +1228,13 @@ class ButterflyAnalysisService:
         poni: Any,
         *,
         valid_mask: Any = None,
+        calibration_identity: str | None = None,
     ) -> Any:
         """Return cached q/chi arrays with an optional frame-local mask."""
 
-        identity = str(self.poni_path or "")
+        identity = str(
+            self.poni_path if calibration_identity is None else calibration_identity
+        )
         key = (
             tuple(int(item) for item in shape),
             identity if identity and identity.casefold() not in {"in-memory", "in_memory"} else id(poni),
@@ -1301,7 +1307,6 @@ class ButterflyAnalysisService:
             candidate_poni_path = (
                 str(poni) if isinstance(poni, (str, Path)) else "in-memory"
             )
-            self.poni_path = candidate_poni_path
         loaded = read_image(
             path,
             frame=frame,
@@ -1315,6 +1320,7 @@ class ButterflyAnalysisService:
                 loaded.data.shape,
                 candidate_poni,
                 valid_mask=loaded.valid_mask,
+                calibration_identity=candidate_poni_path,
             )
         else:
             qmap = self._fallback_qmap(loaded.data.shape, valid_mask=loaded.valid_mask)

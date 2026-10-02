@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml"><img src="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/WingSAXS-0.6.0-blue" alt="WingSAXS 0.6.0">
   <img src="https://img.shields.io/badge/Python-3.11--3.13-blue" alt="Python 3.11 to 3.13">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
@@ -47,6 +48,7 @@ Synthetic demonstration (pixel-q): the empirical double ellipse is overlaid on a
 - **Independent radial diagnostics**: `radial_sector` measures fixed-χ `I(q)` profiles for a separate check. Its `q*` values are not the default butterfly trajectory or the primary ellipse input. See the [radial-sector guide](docs/sector_peaks_zh.md).
 - **Estimates with confidence**: the default `standard` fit follows the measured trajectories. Optional `flat_ellipse` / `very_flat_ellipse` presets supply explicit bounds. Finite boundary or extrapolated solutions remain inspectable candidates, with their support and limitations alongside the values.
 - **Batch review**: independent or warm-start fitting, cancel/progress, checkpoints, streaming CSV/JSON/NPZ. Limited results remain warning frames in the sequence; missing measurements remain gaps. Resolved geometry can initialize the next frame, which is refitted to its own data.
+- **Reusable analysis reports**: `bsaxs report results/batch` derives per-frame and sequence figures plus long measurement tables from existing native batch exports without refitting, including stored normal profiles and fit-support figures when those records exist. Add `--report --package` to a batch run to generate the report and browsable ZIP in the same run; multiple samples can be reported from one parent directory. See the [analysis report guide](docs/analysis_report_zh.md).
 - **Workbench**: Identify trajectories → Evaluate; bilingual UI; first-order ring overlay instead of a capped tilted ellipse; lamellar studio and 0.4 publication artboards are schematics, not a unique inversion ([studio](docs/lamellar_workbench_zh.md), [figures](docs/publication_figures_zh.md)).
 - **Optional `full2d`**: empirical whole-pixel intensity refinement. It is a different model from the butterfly geometry measurement.
 - **Measurement and fit figures**: export fixed-size SVG/PDF and high-resolution TIFF/PNG with source arrays, curve/profile CSVs, and checksums. Inspect measured data, candidate ellipses, overlays, and actual `full2d` predictions without promoting a candidate to a scientifically accepted result. See the [figure export guide](docs/butterfly_figures_zh.md).
@@ -61,7 +63,7 @@ Python **3.11–3.13** (3.14+ is outside the support contract). Core analysis do
 ```powershell
 git clone https://github.com/D-sudoasd/WingSAXS.git
 cd WingSAXS
-python -m venv .venv-project
+py -3.13 -m venv .venv-project
 .\.venv-project\Scripts\python.exe -m pip install --upgrade pip
 .\.venv-project\Scripts\python.exe -m pip install `
   -c constraints\validation-py311-313.txt -e ".[all]"
@@ -82,7 +84,7 @@ Core-only: `python -m pip install -e .` then `bsaxs-doctor` without `--require-u
 
 For Chinese figure text on Debian/Ubuntu, install a CJK font: `sudo apt-get install fonts-noto-cjk`. The renderer selects an installed CJK font; CI installs Noto CJK so missing-glyph checks run on Linux as well as Windows.
 
-On Windows, after the doctor is green, double-click `启动_WingSAXS.cmd` or run `.\启动_WingSAXS.cmd --check`. The launcher uses `.venv-project` / `.venv` / `venv` first and writes start-up failures to a per-user `WingSAXS/launcher.log`. Details: [first-run guide](docs/first_run_zh.md).
+On Windows, the supported project-local environment is `.venv-project`; the launcher checks it first, matching the environment used by the documented CLI commands. After the doctor is green, double-click `启动_WingSAXS.cmd` or run `.\启动_WingSAXS.cmd --check`. Details: [first-run guide](docs/first_run_zh.md).
 
 ## Quick start
 
@@ -112,6 +114,8 @@ bsaxs batch "data/frame_*.edf" --poni geometry/detector.poni --mask masks/detect
   -o results/batch --checkpoint results/checkpoint.json
 ```
 
+For a reusable data and figure package, add `--stream --report --package` to the batch command. The report is derived from the saved native arrays and fit records; an existing batch can also be reported with `bsaxs report results/batch` without repeating the fit. See the [analysis report guide](docs/analysis_report_zh.md).
+
 Read-only package check before fitting real data:
 
 ```bash
@@ -120,6 +124,9 @@ bsaxs preflight data/package --manifest manifest.csv \
 ```
 
 For an unattended package run, use `bsaxs batch "data/package/images/*.edf" --unattended data/package --manifest data/package/manifest.csv --poni data/package/geometry.poni --mask data/package/mask.npy -o results/unattended_001`. This performs preflight before fitting, writes a checkpoint and streams batch evidence. A red preflight blocks fitting; warnings or failed frames return a nonzero exit status. Keep the output outside the raw package and use `--resume` with the same inputs and settings after interruption.
+
+Finish existing batch exports without fitting or drawing again: `bsaxs package results/all_samples` creates a browsable sample/data/figure index and ZIP. Use `--resume` to finish an interrupted delivery or reuse an unchanged archive, `--no-archive` for navigation only, or add `--package` to a new `bsaxs batch` run to continue through delivery automatically. Original warnings and missing outputs stay visible. [Batch delivery guide](docs/batch_delivery_zh.md)
+
 
 `bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_WingSAXS.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
 
@@ -140,6 +147,7 @@ Agents (and any non-interactive operator) should start with `bsaxs describe` or 
 | First launch and recommended UI order | [docs/first_run_zh.md](docs/first_run_zh.md) |
 | Agent / automation CLI contract | [AGENTS.md](AGENTS.md) |
 | CLI, TOML, batch, masks, exports | [docs/user_guide_zh.md](docs/user_guide_zh.md) |
+| Batch statistics, sequence figures, and reusable data/figure package | [docs/analysis_report_zh.md](docs/analysis_report_zh.md) |
 | Butterfly arcs and publication rules | [docs/butterfly_arcs_zh.md](docs/butterfly_arcs_zh.md) |
 | Fixed-q annular butterfly trajectories | [docs/annular_trajectories_zh.md](docs/annular_trajectories_zh.md) |
 | Fixed-χ radial sector peaks | [docs/sector_peaks_zh.md](docs/sector_peaks_zh.md) |
@@ -204,10 +212,11 @@ bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/det
 bsaxs batch "data/frame_*.edf" --poni geometry/detector.poni --mask masks/detector.npy \
   --ridge-method butterfly_curvature --ellipse-preset standard \
   --butterfly-stage evaluate --mode independent -o results/batch
+bsaxs report results/batch
 bsaxs-gui data/frame_0001.edf --poni geometry/detector.poni
 ```
 
-`--full2d` 才是可选的整幅经验强度精修，与蝴蝶几何测量不是同一条路径。批处理表用「警告 · 仅环 / 椭圆」区分发表状态；环 L 与 Ln 候选分列。
+`bsaxs report` 从已有批次数组与拟合记录生成逐帧/序列统计、CSV 长表和图表，不重跑拟合；已保存法向 profile 和拟合支持诊断时，也会生成相应逐帧图。批处理可添加 `--stream --report --package` 一次完成分析、图表和 ZIP 交付。详见[批次分析报告与数据、图表包](docs/analysis_report_zh.md)。`--full2d` 才是可选的整幅经验强度精修，与蝴蝶几何测量不是同一条路径。批处理表用「警告 · 仅环 / 椭圆」区分发表状态；环 L 与 Ln 候选分列。
 
 公开展示名是 `WingSAXS`；安装包仍为 `butterfly-saxs`，导入仍为 `butterfly_saxs`，主命令仍为 `bsaxs`。
 

@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from .batch import FrameRef, build_frame_refs
-from .csv_utils import safe_csv_cell
+from .csv_utils import read_csv_rows, safe_csv_cell
 from .io import load_image
 from .path_contract import PathContractError, display_path, resolve_authorized_path
 
@@ -232,12 +232,12 @@ def _read_manifest_file(path: Path) -> Any:
     try:
         suffix = path.suffix.casefold()
         if suffix == ".csv":
-            return list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
+            return read_csv_rows(io.StringIO(raw.decode("utf-8-sig"), newline=""))
         if suffix == ".json":
             return json.loads(raw.decode("utf-8-sig"))
         if suffix == ".toml":
             return tomllib.loads(raw.decode("utf-8-sig"))
-    except (UnicodeError, json.JSONDecodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError, ValueError, tomllib.TOMLDecodeError, csv.Error) as exc:
         raise AnnotationPackError(f"无法解析 manifest：{path}: {exc}") from exc
     raise AnnotationPackError("manifest 必须是 CSV、JSON 或 TOML 文件")
 
