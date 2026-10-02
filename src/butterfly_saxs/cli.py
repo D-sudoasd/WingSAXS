@@ -61,6 +61,54 @@ def _shape(value: str) -> tuple[int, int]:
     return result  # type: ignore[return-value]
 
 
+def _integer_at_least(minimum: int, label: str):
+    def parse(value: str) -> int:
+        try:
+            result = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{label} 必须是整数") from exc
+        if result < minimum:
+            raise argparse.ArgumentTypeError(f"{label} 必须至少为 {minimum}")
+        return result
+
+    return parse
+
+
+_REPORT_FORMATS = ("png", "svg", "pdf", "tiff")
+_REPORT_DEFAULT_FORMATS = ("png", "svg", "pdf")
+_REPORT_BIN_COUNT = _integer_at_least(2, "report bin 数")
+_REPORT_DPI = _integer_at_least(1, "report dpi")
+_REPORT_MAX_GRID_CELLS = 1_000_000
+
+
+def _validate_report_options(radial_bins: int, angular_bins: int) -> None:
+    if radial_bins * angular_bins > _REPORT_MAX_GRID_CELLS:
+        raise ValueError(
+            "report radial_bins * angular_bins must not exceed "
+            f"{_REPORT_MAX_GRID_CELLS}"
+        )
+
+
+def _report_resume_command(
+    output_dir: str | Path,
+    *,
+    radial_bins: int,
+    angular_bins: int,
+    formats: Sequence[str],
+    dpi: int,
+) -> list[str]:
+    command = ["bsaxs", "report", os.fspath(output_dir), "--resume"]
+    if radial_bins != 128:
+        command.extend(("--radial-bins", str(radial_bins)))
+    if angular_bins != 72:
+        command.extend(("--angular-bins", str(angular_bins)))
+    if tuple(formats) != _REPORT_DEFAULT_FORMATS:
+        command.extend(("--formats", *(str(value) for value in formats)))
+    if dpi != 180:
+        command.extend(("--dpi", str(dpi)))
+    return command
+
+
 def _config(value: str | None) -> ProjectConfig | None:
     if not value:
         return None
@@ -348,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("-c", "--config", help="TOML 项目配置")
     inspect_parser.add_argument("--poni", help="PONI 几何文件")
     inspect_parser.add_argument("--frame", type=int, help="多帧文件中的零基帧索引")
-    inspect_parser.add_argument("--dataset", help="HDF5/NPZ 数据集或键")
+    inspect_parser.add_argument("--dataset", help="HDF5/NPZ 数据集或 TIFF series:N")
     inspect_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
     inspect_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     inspect_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
@@ -362,7 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("-c", "--config", help="TOML 项目配置")
     analyze_parser.add_argument("--poni", help="PONI 几何文件")
     analyze_parser.add_argument("--frame", type=int, help="多帧文件中的零基帧索引")
-    analyze_parser.add_argument("--dataset", help="HDF5/NPZ 数据集或键")
+    analyze_parser.add_argument("--dataset", help="HDF5/NPZ 数据集或 TIFF series:N")
     analyze_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
     analyze_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     analyze_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
@@ -385,6 +433,20 @@ def build_parser() -> argparse.ArgumentParser:
     package_parser.add_argument("--force", action="store_true", help="重建已生成的交付索引和 ZIP")
     package_parser.add_argument("--no-archive", "--no-archives", action="store_true", help="只建立导航；明确跳过 ZIP")
 
+    report_parser = sub.add_parser("report", help="从已有批次 NPZ 导出统计和图表，不重新拟合")
+    report_parser.add_argument("output_dir", help="单批次输出目录或包含多个样品输出的父目录")
+    report_parser.add_argument("--resume", action="store_true", help="续做报告；复用设置和输入未改变的输出")
+    report_parser.add_argument("--force", action="store_true", help="重建已有报告")
+    report_parser.add_argument("--radial-bins", type=_REPORT_BIN_COUNT, default=128,
+                                help="径向汇总箱数（默认 128，至少 2）")
+    report_parser.add_argument("--angular-bins", type=_REPORT_BIN_COUNT, default=72,
+                                help="角向汇总箱数（默认 72，至少 2）")
+    report_parser.add_argument("--formats", nargs="+", choices=_REPORT_FORMATS,
+                                default=_REPORT_DEFAULT_FORMATS,
+                                help="图表格式（可选 png、svg、pdf、tiff；默认 png svg pdf）")
+    report_parser.add_argument("--dpi", type=_REPORT_DPI, default=180,
+                                help="栅格图分辨率（默认 180）")
+
     delivery_check = sub.add_parser("verify-delivery", help="只读核对所选结项回执的当前文件绑定，不改写历史或科学状态")
     delivery_check.add_argument("receipt", help="包含顶层 bindings 列表的现有结项 JSON")
     delivery_check.add_argument("--root", help="绑定相对路径的输出根目录；默认回执所在目录")
@@ -394,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("-c", "--config", help="TOML 项目配置（可提供 inputs.files）")
     batch_parser.add_argument("--poni", help="PONI 几何文件")
     batch_parser.add_argument("--frame", type=int, help="多帧文件中的零基帧索引")
-    batch_parser.add_argument("--dataset", help="HDF5/NPZ 数据集或键")
+    batch_parser.add_argument("--dataset", help="HDF5/NPZ 数据集或 TIFF series:N")
     batch_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
     batch_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     batch_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
@@ -405,6 +467,16 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--manifest", help="JSON/CSV 帧清单（含 time/frame_id 等元数据）")
     batch_parser.add_argument("--checkpoint", help="批量检查点 JSON 路径")
     batch_parser.add_argument("--package", action="store_true", help="导出后继续生成可浏览导航和交付 ZIP；交付失败可单独续做")
+    batch_parser.add_argument("--report", action="store_true", help="数据导出后从 NPZ 生成统计和图表报告")
+    batch_parser.add_argument("--report-radial-bins", type=_REPORT_BIN_COUNT, default=128,
+                               help="--report 的径向汇总箱数（默认 128，至少 2）")
+    batch_parser.add_argument("--report-angular-bins", type=_REPORT_BIN_COUNT, default=72,
+                               help="--report 的角向汇总箱数（默认 72，至少 2）")
+    batch_parser.add_argument("--report-formats", nargs="+", choices=_REPORT_FORMATS,
+                               default=_REPORT_DEFAULT_FORMATS,
+                               help="--report 的图表格式（默认 png svg pdf）")
+    batch_parser.add_argument("--report-dpi", type=_REPORT_DPI, default=180,
+                               help="--report 的栅格图分辨率（默认 180）")
     batch_parser.add_argument("--resume", action="store_true", help="从已有检查点恢复")
     batch_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
     batch_parser.add_argument(
@@ -463,9 +535,9 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--context", help="project_context.yaml/yml")
     preflight_parser.add_argument("--image-glob", help="未使用清单时的图像通配符")
     preflight_parser.add_argument("--frame", type=int, help="图像多帧选择器")
-    preflight_parser.add_argument("--dataset", help="图像 HDF5/NPZ 数据集或键")
+    preflight_parser.add_argument("--dataset", help="图像 HDF5/NPZ 数据集或 TIFF series:N")
     preflight_parser.add_argument("--mask-frame", type=int, help="掩膜多帧选择器")
-    preflight_parser.add_argument("--mask-dataset", help="掩膜 HDF5/NPZ 数据集或键")
+    preflight_parser.add_argument("--mask-dataset", help="掩膜 HDF5/NPZ 数据集或 TIFF series:N")
     preflight_parser.add_argument(
         "--q-window", type=float, nargs=2, metavar=("Q_MIN", "Q_MAX")
     )
@@ -664,7 +736,50 @@ def _handle_analyze(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _build_analysis_report(
+    output_dir: str | Path,
+    *,
+    resume: bool = False,
+    force: bool = False,
+    radial_bins: int = 128,
+    angular_bins: int = 72,
+    formats: Sequence[str] = ("png", "svg", "pdf"),
+    dpi: int = 180,
+) -> Mapping[str, Any]:
+    """Load the optional report pipeline only when a report is requested."""
+
+    from .report import build_analysis_report
+
+    return build_analysis_report(
+        output_dir,
+        resume=resume,
+        force=force,
+        radial_bins=radial_bins,
+        angular_bins=angular_bins,
+        formats=tuple(formats),
+        dpi=dpi,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
+    )
+
+
+def _handle_report(args: argparse.Namespace) -> int:
+    _validate_report_options(args.radial_bins, args.angular_bins)
+    result = _build_analysis_report(
+        args.output_dir,
+        resume=args.resume,
+        force=args.force,
+        radial_bins=args.radial_bins,
+        angular_bins=args.angular_bins,
+        formats=args.formats,
+        dpi=args.dpi,
+    )
+    _print_json(result)
+    return int(result.get("exit_code", 0))
+
+
 def _handle_batch(args: argparse.Namespace) -> int:
+    if args.report:
+        _validate_report_options(args.report_radial_bins, args.report_angular_bins)
     from . import batch as batch_module
     from . import export as export_module
 
@@ -1100,6 +1215,52 @@ def _handle_batch(args: argparse.Namespace) -> int:
                            if (reason := _quality_warning_reason(frame.result)) is not None), None)
     exit_code = 1 if (run.failures or run.cancelled or warning_reason or report["n_warning"] or
                       (preflight_summary is not None and preflight_summary["status_color"] != "green")) else 0
+    if args.report:
+        report_resume = bool(resume)
+        next_command = _report_resume_command(
+            output_dir,
+            radial_bins=args.report_radial_bins,
+            angular_bins=args.report_angular_bins,
+            formats=args.report_formats,
+            dpi=args.report_dpi,
+        )
+        try:
+            report_result = _build_analysis_report(
+                output_dir,
+                resume=report_resume,
+                force=bool(args.force),
+                radial_bins=args.report_radial_bins,
+                angular_bins=args.report_angular_bins,
+                formats=args.report_formats,
+                dpi=args.report_dpi,
+            )
+            status = report_result.get("status", report_result.get("operation_status", "completed"))
+            report_summary = {
+                "status": status,
+                "counts": report_result.get("counts", {}),
+                "outputs": report_result.get("outputs", {}),
+            }
+            report_exit_code = int(report_result.get("exit_code", 0))
+            if report_exit_code != 0:
+                report_summary["next_command"] = next_command
+                exit_code = 1
+            report["analysis_report"] = report_summary
+        except Exception as exc:
+            # Keep the completed analysis exports; report generation can be
+            # retried directly without fitting the frames again.
+            report["analysis_report"] = {
+                "status": "incomplete",
+                "counts": {},
+                "outputs": {},
+                "error": str(exc),
+                "next_command": next_command,
+            }
+            print(
+                f"Analysis exports saved; report incomplete: {exc}. "
+                "Use the reported report command to continue without refitting.",
+                file=sys.stderr,
+            )
+            exit_code = 1
     if args.package:
         from .delivery import package_batch
 
@@ -1419,6 +1580,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _print_json(report)
             return report["exit_code"]
+        if command == "report":
+            return _handle_report(args)
         if command == "verify-delivery":
             from .delivery_bindings import verify_delivery_bindings
 

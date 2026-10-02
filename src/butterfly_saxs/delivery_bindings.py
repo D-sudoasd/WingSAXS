@@ -26,6 +26,18 @@ def _snapshot(value: os.stat_result) -> tuple[int, ...]:
             value.st_mtime_ns, value.st_ctime_ns)
 
 
+def _matches_open_file(path_snapshot: tuple[int, ...], handle_snapshot: tuple[int, ...]) -> bool:
+    # Windows Python can expose creation time through stat/lstat and change
+    # time through fstat. Path stat also adds synthetic execute bits for
+    # .exe/.bat/.cmd/.com, while fstat cannot inspect the filename. Compare the
+    # shared identity/content metadata across APIs, then retain each API's full
+    # snapshot (including ctime and all mode bits) for before/after checks.
+    mode_mask = ~0o111 if os.name == "nt" else -1
+    return (path_snapshot[:2] == handle_snapshot[:2]
+            and (path_snapshot[2] & mode_mask) == (handle_snapshot[2] & mode_mask)
+            and path_snapshot[3:-1] == handle_snapshot[3:-1])
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -47,12 +59,13 @@ def _hash_file(root: Path, path: Path) -> tuple[str, int, tuple[int, ...]]:
         raise _NotRegularFile("expected a regular file")
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        if (_snapshot(os.fstat(handle.fileno())) != before
+        opened = _snapshot(os.fstat(handle.fileno()))
+        if (not _matches_open_file(before, opened)
                 or local_path_problem(root, path) or _snapshot(path.lstat()) != before):
             raise _ChangedDuringRead("file changed before reading")
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
-        if _snapshot(os.fstat(handle.fileno())) != before:
+        if _snapshot(os.fstat(handle.fileno())) != opened:
             raise _ChangedDuringRead("file changed during reading")
     if local_path_problem(root, path) or _snapshot(path.stat()) != before:
         raise _ChangedDuringRead("file changed during reading")
@@ -79,14 +92,16 @@ def verify_delivery_bindings(receipt: Path, *, root: Path | None = None) -> dict
     if not stat.S_ISREG(receipt_snapshot[2]):
         raise ValueError("Receipt must be a regular JSON file.")
     with receipt.open("r", encoding="utf-8-sig") as handle:
-        if _snapshot(os.fstat(handle.fileno())) != receipt_snapshot:
+        opened = _snapshot(os.fstat(handle.fileno()))
+        if (not _matches_open_file(receipt_snapshot, opened)
+                or receipt.is_symlink() or _snapshot(receipt.stat()) != receipt_snapshot):
             raise ValueError("Receipt changed before reading; retry after its writer finishes.")
         try:
             document = json.load(handle, object_pairs_hook=_unique_object,
                                  parse_constant=_invalid_constant)
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"Cannot read delivery receipt as JSON: {exc}") from exc
-        if _snapshot(os.fstat(handle.fileno())) != receipt_snapshot:
+        if _snapshot(os.fstat(handle.fileno())) != opened:
             raise ValueError("Receipt changed during reading; retry after its writer finishes.")
     if not isinstance(document, Mapping):
         raise ValueError("Delivery receipt must be a JSON object with a top-level bindings list.")

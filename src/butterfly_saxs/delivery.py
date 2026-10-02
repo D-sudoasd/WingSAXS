@@ -28,6 +28,7 @@ _ARTIFACTS = {
     "lobe_measurements": "lobe_measurements.csv",
     "fit_details": "ellipse_fit.json",
     "fit_records": "ellipse_fit.jsonl",
+    "frame_details": "frame_details.jsonl",
     "manifest": "manifest.json",
     "provenance": "provenance.json",
     "arrays": "results.npz",
@@ -38,6 +39,12 @@ _INDEX = "delivery_index.html"
 _SUMMARY = "delivery_summary.json"
 _ARCHIVE = "delivery.zip"
 _CONTENTS_KEYS = ("schema_version", "status", "counts", "samples", "files", "dependencies")
+_COLLECTION_ARTIFACTS = {
+    "analysis_reports": "analysis_reports.html",
+    "analysis_report_summary": "analysis_report_summary.json",
+    "collection_parameters": "collection_parameters.csv",
+    "collection_measurements": "collection_measurements.csv",
+}
 
 
 def _digest(path: Path) -> str:
@@ -123,6 +130,8 @@ def _export_inventory(root: Path) -> tuple[list[Path], set[str]]:
     summaries = sorted(path for path in root.rglob("*frame_summary.csv")
                        if not any(part.startswith(".") for part in path.relative_to(root).parts))
     files: set[str] = set()
+    files.update(name for name in _COLLECTION_ARTIFACTS.values()
+                 if (root / name).is_file())
     for summary in summaries:
         prefix = summary.name.removesuffix("frame_summary.csv")
         folder = summary.parent
@@ -141,6 +150,10 @@ def _link(path: str, label: str) -> str:
 
 def _render(report: Mapping[str, Any]) -> str:
     sections = []
+    collection_links = " · ".join(_link(path, role.replace("_", " "))
+                                   for role, path in report.get("collection_artifacts", {}).items())
+    if collection_links:
+        sections.append(f'<section><h2>All samples</h2><p>{collection_links}</p></section>')
     navigation = []
     dependency_issues = report.get("dependencies", {}).get("issues", [])
     dependency_notice = ""
@@ -279,6 +292,8 @@ def package_batch(
                        if path.is_file() and not any(part.startswith(".") for part in path.relative_to(figure_dir).parts)]
         samples.append({"sample": sample_name, "frames": frames, "artifacts": artifacts,
                         "figures": figures, "missing": sorted(_REQUIRED - artifacts.keys())})
+    collection_artifacts = {role: record(root / name) for role, name in _COLLECTION_ARTIFACTS.items()
+                            if (root / name).is_file()}
     dependencies = collect_html_dependencies(
         root, tuple(files), record, provided_files=(_INDEX,),
         reserved_files=(_SUMMARY, _ARCHIVE, "delivery_contents.json"),
@@ -297,6 +312,7 @@ def package_batch(
         "counts": {"samples": len(samples), "frames": sum(statuses.values()), "frame_statuses": dict(statuses),
                    "quality_warning_frames": quality_warnings, "missing_artifacts": missing},
         "samples": samples, "files": files, "dependencies": dependencies,
+        "collection_artifacts": collection_artifacts,
     }
     index_text = _render(report)
     index_digest = hashlib.sha256(index_text.encode("utf-8")).hexdigest()

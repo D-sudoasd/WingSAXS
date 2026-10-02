@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -191,20 +192,27 @@ def test_streaming_read_detects_mutation_even_when_read_bytes_match_expected(tmp
     path = tmp_path / "data.zip"
     path.write_bytes(b"original" * 200_000)
     receipt = _receipt(tmp_path, [path.name])
+    expected_digest = _digest(path)
     original_sha256 = hashlib.sha256
     changed = False
+    digests = []
 
     class MutatingHasher:
         def __init__(self):
             self.digest = original_sha256()
+            digests.append(self.digest)
 
         def update(self, block):
             nonlocal changed
             self.digest.update(block)
             if not changed:
-                replacement = tmp_path / "replacement"
-                replacement.write_bytes(b"new bytes")
-                replacement.replace(path)
+                # Windows does not permit replacing an open file. Modify only
+                # the already-hashed prefix, preserving the size and unread
+                # bytes so the digest can still equal the original binding.
+                with path.open("r+b") as writer:
+                    writer.write(b"revised!")
+                stamp = path.stat()
+                os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000_000))
                 changed = True
 
         def hexdigest(self):
@@ -214,6 +222,143 @@ def test_streaming_read_detects_mutation_even_when_read_bytes_match_expected(tmp
     result = verify_delivery_bindings(receipt)
     assert result["exit_code"] == 1
     assert result["checks"][0]["status"] == "changed_during_read"
+    assert changed
+    assert digests[0].hexdigest() == expected_digest
+
+
+def _stat_with(value, **overrides):
+    fields = {name: getattr(value, name) for name in (
+        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")}
+    return SimpleNamespace(**(fields | overrides))
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_path_and_handle_ctime_can_differ_without_a_concurrent_change(tmp_path, monkeypatch, stale):
+    path = tmp_path / "file"
+    path.write_bytes(b"original")
+    receipt = _receipt(tmp_path, [path.name])
+    if stale:
+        path.write_bytes(b"modified")
+    before = _tree(tmp_path)
+    original_fstat = os.fstat
+
+    def different_ctime(fd):
+        value = original_fstat(fd)
+        # CPython on Windows can expose creation time via stat/lstat and
+        # metadata-change time via fstat for the very same stable file.
+        return _stat_with(value, st_ctime_ns=value.st_ctime_ns + 1_000_000_000)
+
+    monkeypatch.setattr(delivery_bindings.os, "fstat", different_ctime)
+    result = verify_delivery_bindings(receipt)
+    assert result["exit_code"] == int(stale)
+    assert result["checks"][0]["status"] == ("sha256_mismatch" if stale else "current")
+    assert _tree(tmp_path) == before
+
+
+@pytest.mark.parametrize("target", ["receipt", "binding"])
+def test_handle_ctime_change_during_read_is_still_detected(tmp_path, monkeypatch, target):
+    path = tmp_path / "file"
+    path.write_bytes(b"original")
+    receipt = _receipt(tmp_path, [path.name])
+    inode = (receipt if target == "receipt" else path).stat().st_ino
+    original_fstat = os.fstat
+    reads = 0
+
+    def changed_ctime(fd):
+        nonlocal reads
+        value = original_fstat(fd)
+        if value.st_ino == inode:
+            reads += 1
+            return _stat_with(value, st_ctime_ns=value.st_ctime_ns + reads * 1_000_000_000)
+        return value
+
+    monkeypatch.setattr(delivery_bindings.os, "fstat", changed_ctime)
+    if target == "receipt":
+        with pytest.raises(ValueError, match="Receipt changed during reading"):
+            verify_delivery_bindings(receipt)
+    else:
+        result = verify_delivery_bindings(receipt)
+        assert result["checks"][0]["status"] == "changed_during_read"
+    assert reads == 2
+
+
+@pytest.mark.parametrize("field", ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns"])
+@pytest.mark.parametrize("target", ["receipt", "binding"])
+def test_path_and_open_handle_must_match_identity_and_content_metadata(tmp_path, monkeypatch, target, field):
+    path = tmp_path / "file"
+    path.write_bytes(b"original")
+    receipt = _receipt(tmp_path, [path.name])
+    inode = (receipt if target == "receipt" else path).stat().st_ino
+    original_fstat = os.fstat
+
+    def mismatched_handle(fd):
+        value = original_fstat(fd)
+        if value.st_ino == inode:
+            mismatched = value.st_mode ^ 0o200 if field == "st_mode" else getattr(value, field) + 1
+            return _stat_with(value, **{field: mismatched})
+        return value
+
+    monkeypatch.setattr(delivery_bindings.os, "fstat", mismatched_handle)
+    if target == "receipt":
+        with pytest.raises(ValueError, match="Receipt changed before reading"):
+            verify_delivery_bindings(receipt)
+    else:
+        result = verify_delivery_bindings(receipt)
+        assert result["checks"][0]["status"] == "changed_during_read"
+
+
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+@pytest.mark.parametrize("target", ["receipt", "binding"])
+def test_only_windows_cross_api_execute_bits_are_normalized(tmp_path, monkeypatch, platform, target):
+    path = tmp_path / "reproduce.cmd"
+    path.write_bytes(b"echo reproduce")
+    receipt = _receipt(tmp_path, [path.name], name="closeout.cmd")
+    selected = (receipt if target == "receipt" else path).stat()
+    original_fstat = os.fstat
+
+    def synthetic_execute_bits(fd):
+        value = original_fstat(fd)
+        if value.st_ino == selected.st_ino:
+            return _stat_with(value, st_mode=selected.st_mode ^ 0o111)
+        # Neutralize the other file's native Windows execute-bit adjustment
+        # when simulating POSIX, so this regression isolates the target file.
+        other = (path if target == "receipt" else receipt).stat()
+        return _stat_with(value, st_mode=other.st_mode)
+
+    monkeypatch.setattr(delivery_bindings, "os", SimpleNamespace(name=platform, fstat=synthetic_execute_bits))
+    if platform == "posix" and target == "receipt":
+        with pytest.raises(ValueError, match="Receipt changed before reading"):
+            verify_delivery_bindings(receipt)
+    else:
+        result = verify_delivery_bindings(receipt)
+        assert result["checks"][0]["status"] == ("current" if platform == "nt" else "changed_during_read")
+
+
+@pytest.mark.parametrize("target", ["receipt", "binding"])
+def test_windows_handle_execute_bits_changed_during_read_are_not_ignored(tmp_path, monkeypatch, target):
+    path = tmp_path / "reproduce.cmd"
+    path.write_bytes(b"echo reproduce")
+    receipt = _receipt(tmp_path, [path.name])
+    inode = (receipt if target == "receipt" else path).stat().st_ino
+    original_fstat = os.fstat
+    reads = 0
+
+    def changed_execute_bits(fd):
+        nonlocal reads
+        value = original_fstat(fd)
+        if value.st_ino == inode:
+            reads += 1
+            return _stat_with(value, st_mode=value.st_mode ^ (0o111 if reads == 2 else 0))
+        return value
+
+    monkeypatch.setattr(delivery_bindings, "os", SimpleNamespace(name="nt", fstat=changed_execute_bits))
+    if target == "receipt":
+        with pytest.raises(ValueError, match="Receipt changed during reading"):
+            verify_delivery_bindings(receipt)
+    else:
+        result = verify_delivery_bindings(receipt)
+        assert result["checks"][0]["status"] == "changed_during_read"
+    assert reads == 2
 
 
 def test_later_read_cannot_leave_earlier_mutated_binding_current(tmp_path, monkeypatch):

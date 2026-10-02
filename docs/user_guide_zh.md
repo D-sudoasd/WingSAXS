@@ -1,17 +1,17 @@
 # 操作、输入输出、UI 与批处理指南
 
-本指南面向当前 checkout 的 CLI、项目 TOML 和 Qt UI。先准备已知实验几何和 mask，再开始精修；PONI、mask、q 单位和输出目录都应随结果保存。科学量、符号、`full2d` 边界和不确定度解释见[科学量、符号、单位与可解释性边界](scientific_basis_zh.md)，模块关系见[软件架构与数据流](architecture_zh.md)。
+本指南对应 WingSAXS 0.6.0，面向当前 checkout 的 CLI、项目 TOML 和 Qt UI。先准备已知实验几何和 mask，再开始精修；PONI、mask、q 单位和输出目录都应随结果保存。科学量、符号、`full2d` 边界和不确定度解释见[科学量、符号、单位与可解释性边界](scientific_basis_zh.md)，模块关系见[软件架构与数据流](architecture_zh.md)。
 
 ## 1. 安装与启动
 
 在项目根目录执行：
 
 ```powershell
-python -m venv .venv-project
+py -3.13 -m venv .venv-project
 .\.venv-project\Scripts\python.exe -m pip install -c constraints\validation-py311-313.txt -e ".[all]"
 ```
 
-安装后的 `bsaxs` 与 `python -m butterfly_saxs` 是同一 CLI。Windows 下建议直接使用 `.\.venv-project\Scripts\bsaxs.exe`；双击 `启动_WingSAXS.cmd` 也只使用这个已验证环境。旧 `.venv` 不会被删除或自动修复。
+项目环境固定使用仓库根目录的 `.venv-project`，与 `启动_WingSAXS.cmd` 的首选环境及下方 CLI 示例一致。安装后的 `bsaxs` 与 `python -m butterfly_saxs` 是同一 CLI；Windows 下可直接使用 `.\.venv-project\Scripts\bsaxs.exe`，或由启动器打开 GUI。
 
 无子命令时 `bsaxs` 打印 JSON 命令清单（与 `bsaxs describe` 相同）：命令、退出码 `0/1/2`、推荐工作流与不可违反的科学边界。`bsaxs doctor --json` 与 `bsaxs-doctor --json` 等价。失败时 stdout 仍是 JSON 错误信封（`lamellarsaxs2d.cli_error.v1`），stderr 保留人类可读的 `错误：` 行。Agent 操作说明见仓库根目录 [AGENTS.md](../AGENTS.md)。
 
@@ -72,7 +72,7 @@ PONI 是物理 q 坐标的校准输入，CBF、EDF、TIF/TIFF 的最小示例：
 | 格式 | 读取器/注意事项 |
 |---|---|
 | `.cbf`, `.edf` | 通过 FabIO 读取；多帧时使用零基 `--frame`。 |
-| `.tif`, `.tiff` | 通过 tifffile 读取；多页时使用零基 `--frame`。 |
+| `.tif`, `.tiff` | 通过 tifffile 读取。单序列文件默认选择该序列；多序列文件须用 `--dataset series:<零基序列号>` 选择。`--frame` 选择所选序列内的零基帧。多序列文件省略 `--dataset` 时，错误信息会列出可选序列及其形状、轴标记。 |
 | `.npy` | 数组必须能选出严格二维图像；多帧数组显式给 `--frame`。 |
 | `.npz` | 使用 `--dataset KEY` 选择键；文件含多个候选二维数组时必须明确选择。含 `data` 及 `qx/qy/q` 的 fixture 也可由 pipeline 读取其 qmap。 |
 | `.h5`, `.hdf5`, `.hdf` | 通过 h5py 读取；多个数据集或路径不明确时显式给 `--dataset`。 |
@@ -85,7 +85,12 @@ PONI 是物理 q 坐标的校准输入，CBF、EDF、TIF/TIFF 的最小示例：
 ```powershell
 .\.venv-project\Scripts\python.exe -m butterfly_saxs analyze data\scan.h5 --dataset "/entry/data" --frame 3 --poni geometry\detector.poni -o results\scan3
 .\.venv-project\Scripts\python.exe -m butterfly_saxs inspect data\stack.tif --frame 0 --poni geometry\detector.poni
+.\.venv-project\Scripts\python.exe -m butterfly_saxs inspect data\multi_series.tif --dataset series:1 --poni geometry\detector.poni
+# 当 series:1 是多帧序列时，选取其中零基索引为 2 的帧。
+.\.venv-project\Scripts\python.exe -m butterfly_saxs analyze data\multi_series_stack.tif --dataset series:1 --frame 2 --poni geometry\detector.poni -o results\series1_frame2
 ```
+
+TIFF `series:<index>` 中的 `<index>` 从 0 开始；例如 `series:1` 选第二个图像序列。`--frame` 随后在该序列内部选择帧。如果文件只有一个序列，可省略 `--dataset`；多序列文件会在选择器错误中提供 `series:0`、`series:1` 等可用选项。
 
 掩膜参数的极性不同：`--valid-mask` 中 `True` 是有效像素；`--mask` 中 `True` 是无效像素。两者都是布尔数组或路径，必须与所选二维图像同形状。
 
@@ -242,6 +247,21 @@ PowerShell 中若使用通配符，建议加引号让 CLI 自己展开；CLI 也
   --series hold_375C --range 60:120:2 --stream
 ```
 
+### 从批次结果生成报告和完整图表包
+
+新批次可在逐帧拟合与原生 CSV/JSON/NPZ 导出后，继续生成统计报告并打包：
+
+```powershell
+.\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\sample\*.edf" `
+  --poni geometry\detector.poni --mask masks\detector.npy `
+  --manifest data\sample\sequence.csv --mode warm_start --stream `
+  --checkpoint results\sample\checkpoint.json -o results\sample `
+  --report --report-radial-bins 128 --report-angular-bins 72 `
+  --report-formats png svg pdf --report-dpi 180 --package
+```
+
+`--report` 使用已导出的图像、q map、有效域和拟合记录生成逐帧统计、序列图、长表及浏览页，不重新拟合；`--package` 随后将原生数据和 `figures/` 下报告纳入可浏览 ZIP。已有批次可单独运行 `bsaxs report results\sample`，不必再跑拟合。有关报告文件、各统计量定义和单位边界，见[批次分析报告与数据、图表包](analysis_report_zh.md)。
+
 无人值守分析使用同一 `batch` 入口，加 `--unattended PACKAGE` 串联逐帧预检、逐环花瓣脊线识别、双椭圆候选评估、流式批次导出和检查点。`PACKAGE` 是原始数据包根目录，应包含所选图像、PONI 与 mask；输出必须在数据包外。首次运行指定新的输出目录，恢复时原命令加 `--resume`：
 
 ```powershell
@@ -304,9 +324,12 @@ UI 的 `Batch` 页提供 `Add frames…`、`Run batch`、`Independent/Warm start
 - `parameters_long.csv`：`parameter/value/stderr/uncertainty/fixed/unit/flags/bound_flags` 等长表；非有限数值留空，不写成 0；
 - `ridge_points.csv`：逐帧逐点的 q、角度、强度、coverage、valid/reason 等；
 - `ellipse_fit.json` 与 `ellipse_fit.jsonl`：逐帧椭圆拟合 JSON；
+- `frame_details.jsonl`：逐帧完整标量蝴蝶拟合、候选解、观测支持、不确定度诊断和已保存 profile 数组的引用；
 - `manifest.json`、`provenance.json`：输入/config hash、模式、版本、时间和用户 provenance；
 - `results.npz`：批次的数组/结果 sidecar；其 `__metadata__` 明确给出 `complete` 与缺失帧列表。失败帧或只从不含数组的 checkpoint 恢复的帧会令 `complete=false`，不能把此文件误称为全帧像素证据；
 - `evolution.png`：可用标量参数按单位分组的演化图。
+
+需要按 q、角度、有效域重新整理像素统计并生成逐帧和序列图时，可在已有目录上运行 `bsaxs report results/batch`；它把报告写入 `figures/analysis_report/`，不会改变原生拟合结果。详细图表与 CSV 清单见[批次分析报告与数据、图表包](analysis_report_zh.md)。
 
 不要只看 `status=ok` 或 `success=True`：同时检查 `scientific_flags`、`coverage`、`condition`、`bound_flags`、`stderr/uncertainty`、`q_unit` 和 mask 记录。`reduced_chi_square` 只是当前残差诊断，不是默认统计检验。
 

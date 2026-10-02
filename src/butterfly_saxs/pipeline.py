@@ -492,6 +492,41 @@ class _FrameBundle:
     external_mask: np.ndarray | None = None
 
 
+def _select_npz_qmap_field(
+    value: Any,
+    *,
+    key: str,
+    frame: int | None,
+    image_shape: tuple[int, int],
+) -> np.ndarray:
+    """Select a frame from an embedded NPZ map while retaining shared 2-D maps."""
+
+    array = np.asarray(value)
+    if array.ndim == 2:
+        return array
+    if array.ndim != 3:
+        # The normal q-map validator reports malformed non-frame fields with
+        # the same shape diagnostics used by in-memory q-map providers.
+        return array
+    if frame is None:
+        raise PipelineError(
+            f"NPZ embedded qmap field {key!r} contains {array.shape[0]} frames; "
+            "select an explicit frame=..."
+        )
+    if frame >= array.shape[0]:
+        raise PipelineError(
+            f"frame {frame} is outside NPZ embedded qmap field {key!r} "
+            f"with {array.shape[0]} frames"
+        )
+    selected = np.asarray(array[frame])
+    if selected.ndim != 2 or selected.shape != image_shape:
+        raise PipelineError(
+            f"selected NPZ qmap field {key!r} must have image shape "
+            f"{image_shape}; frame {frame} has shape {selected.shape}"
+        )
+    return selected
+
+
 def _combine_valid_masks(
     shape: tuple[int, int],
     *,
@@ -772,7 +807,12 @@ def _read_frame_bundle(
             with np.load(path, allow_pickle=False) as bundle_npz:
                 qkeys = {"qx", "qy", "q", "theta", "chi", "mask", "valid_mask"}
                 embedded = {
-                    key: np.asarray(bundle_npz[key])
+                    key: _select_npz_qmap_field(
+                        bundle_npz[key],
+                        key=key,
+                        frame=getattr(loaded, "frame", configured_frame),
+                        image_shape=data.shape,
+                    )
                     for key in qkeys
                     if key in bundle_npz.files
                 }

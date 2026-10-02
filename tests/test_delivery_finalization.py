@@ -157,19 +157,22 @@ def test_archive_is_content_deterministic_across_time_permissions_and_location(t
     assert other['archive']['sha256'] == first['archive']['sha256']
 
 
-def test_csv_changed_before_initial_hash_is_parsed_from_the_same_generation(tmp_path: Path):
+@pytest.mark.parametrize('newline', [b'\n', b'\r\n'], ids=['lf', 'crlf'])
+def test_csv_changed_before_initial_hash_is_parsed_from_the_same_generation(tmp_path: Path, newline: bytes):
     _sample(tmp_path)
+    replacement = newline.join([b'frame_id,status', b'new,failed', b''])
 
     def replace_csv(message):
         if message == 'Indexing frame_summary.csv':
-            (tmp_path / 'frame_summary.csv').write_text('frame_id,status\nnew,failed\n')
+            (tmp_path / 'frame_summary.csv').write_bytes(replacement)
 
     result = delivery.package_batch(tmp_path, progress=replace_csv)
     assert result['samples'][0]['frames'][0]['frame_id'] == 'new'
     assert result['counts']['frame_statuses'] == {'failed': 1}
     assert result['exit_code'] == 1
     with zipfile.ZipFile(tmp_path / 'delivery.zip') as bundle:
-        assert bundle.read('frame_summary.csv') == b'frame_id,status\nnew,failed\n'
+        assert bundle.read('frame_summary.csv') == replacement
+    assert (tmp_path / 'frame_summary.csv').read_bytes() == replacement
 
 
 def test_mutation_of_already_copied_file_rejects_promotion(tmp_path: Path):

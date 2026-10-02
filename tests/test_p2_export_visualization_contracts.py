@@ -37,6 +37,7 @@ def test_export_batch_checks_all_targets_before_writing(tmp_path: Path) -> None:
         "ridge_points",
         "ellipse_fit",
         "ellipse_fit_jsonl",
+        "frame_details",
         "manifest",
         "provenance",
         "npz",

@@ -16,6 +16,7 @@ from . import __version__
 INSPECT_SCHEMA = "lamellarsaxs2d.inspect.v1"
 ANALYSIS_SUMMARY_SCHEMA = "lamellarsaxs2d.analysis_summary.v1"
 BATCH_RUN_SCHEMA = "lamellarsaxs2d.batch_run.v1"
+REPORT_SCHEMA = "wingsaxs.analysis_report.v1"
 SYNTHETIC_SCHEMA = "lamellarsaxs2d.synthetic.v1"
 PROJECT_RUN_SCHEMA = "lamellarsaxs2d.project_run.v2"
 AGENT_MANIFEST_SCHEMA = "lamellarsaxs2d.agent_manifest.v1"
@@ -42,6 +43,7 @@ _SCHEMA_BY_COMMAND = {
     "inspect": INSPECT_SCHEMA,
     "analyze": ANALYSIS_SUMMARY_SCHEMA,
     "batch": BATCH_RUN_SCHEMA,
+    "report": REPORT_SCHEMA,
     "synthetic": SYNTHETIC_SCHEMA,
     "project": PROJECT_RUN_SCHEMA,
 }
@@ -209,6 +211,8 @@ def agent_guidance(
         next_steps.append("bsaxs inspect OUTPUT.npz && bsaxs analyze OUTPUT.npz --ridge-method butterfly_curvature")
     elif command == "project":
         next_steps.append("Prefer `bsaxs batch` when you need streaming CSV/JSON/NPZ longitudinal exports.")
+    elif command == "report":
+        next_steps.append("Review the generated index, summary and figures alongside the source NPZ exports.")
     else:
         next_steps.append("Run `bsaxs describe` for the supported command catalog.")
 
@@ -282,7 +286,7 @@ def agent_manifest() -> dict[str, Any]:
             "bsaxs analyze synthetic.npz --ridge-method butterfly_curvature "
             "--ellipse-preset standard --butterfly-stage evaluate --butterfly-resamples 0",
             "bsaxs preflight PACKAGE --manifest MANIFEST --poni PONI --mask MASK -o results/preflight",
-            "bsaxs batch 'PACKAGE/images/*.edf' --unattended PACKAGE --manifest PACKAGE/manifest.csv --poni PACKAGE/geometry.poni --mask PACKAGE/mask.npy -o results/unattended_001",
+            "bsaxs batch 'PACKAGE/images/*.edf' --unattended PACKAGE --manifest PACKAGE/manifest.csv --poni PACKAGE/geometry.poni --mask PACKAGE/mask.npy -o results/unattended_001 --stream --report --package",
         ],
         "commands": [
             {
@@ -290,6 +294,32 @@ def agent_manifest() -> dict[str, Any]:
                 "purpose": "Index/ZIP existing batch exports or a sample parent directory; --resume reuses unchanged archives without fitting or drawing.",
                 "stdout": "wingsaxs.delivery.v1",
                 "exit_codes": {"0": "Delivery completed.", "1": "Delivery completed with retained warnings or missing outputs; open its index.", "2": EXIT_CODES["2"]},
+            },
+            {
+                "name": "report",
+                "purpose": "Read results.npz and existing frame exports to create radial/angular profiles, fit diagnostics, ellipse candidates and frame/sequence figures; accepts one batch directory or a parent containing sample directories.",
+                "stdout": REPORT_SCHEMA,
+                "artifacts": {
+                    "inputs": "Existing results.npz, frame_summary.csv and fit-detail exports; no refitting.",
+                    "outputs": {
+                        "tables": [
+                            "radial_profiles.csv",
+                            "angular_profiles.csv",
+                            "normal_profiles.csv",
+                            "stored_profile_samples.csv",
+                            "array_catalog.csv",
+                            "fit_diagnostics_long.csv",
+                            "ellipse_candidates.csv",
+                            "frame_measurements.csv",
+                            "parameter_changes.csv",
+                        ],
+                        "figures": "Per-frame and sequence plots under the generated report folder.",
+                        "entry_points": "Index and report_summary.json paths are listed in the command outputs object.",
+                        "frame_data": ["measurements.json", "polar_measurements.npz", "fit_details.json"],
+                        "collection_outputs": ["analysis_reports.html", "analysis_report_summary.json", "collection_parameters.csv", "collection_measurements.csv"],
+                    },
+                },
+                "exit_codes": EXIT_CODES,
             },
             {
                 "name": "verify-delivery",
@@ -326,7 +356,7 @@ def agent_manifest() -> dict[str, Any]:
             },
             {
                 "name": "batch",
-                "purpose": "Independent or quality-gated warm-start series; --unattended adds preflight, streaming evidence and a checkpoint.",
+                "purpose": "Independent or quality-gated warm-start series; --stream writes longitudinal exports, --report analyzes those exports, and --package builds delivery navigation and ZIP.",
                 "stdout": BATCH_RUN_SCHEMA,
                 "exit_codes": EXIT_CODES,
             },
@@ -374,6 +404,7 @@ __all__ = [
     "INSPECT_SCHEMA",
     "INVARIANTS",
     "PROJECT_RUN_SCHEMA",
+    "REPORT_SCHEMA",
     "SYNTHETIC_SCHEMA",
     "agent_guidance",
     "agent_manifest",
