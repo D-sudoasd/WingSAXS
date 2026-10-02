@@ -319,14 +319,25 @@ def test_unsafe_or_ambiguous_zip_members_fail_without_extraction(sample: Path, k
         elif kind == "case_collision":
             archive.writestr("sample/plot.png", "one")
             archive.writestr("sample/Plot.png", "two")
+        elif kind == "backslash":
+            info = zipfile.ZipInfo("sample/index.html")
+            # ZipInfo normalizes backslashes on Windows during construction.
+            # Set the stored name afterward to create the intended unsafe ZIP.
+            info.filename = info.orig_filename = "sample\\index.html"
+            archive.writestr(info, "unsafe")
         else:
-            name = {"traversal": "sample/../outside.csv", "backslash": "sample\\index.html",
+            name = {"traversal": "sample/../outside.csv",
                     "wrong_sample": "another_sample/index.html"}[kind]
             archive.writestr(name, "unsafe")
+    if kind == "backslash":
+        with zipfile.ZipFile(image) as archive:
+            assert [info.orig_filename for info in archive.infolist()] == ["sample\\index.html"]
     report = check_archive_pair(data, image, sample_id="sample")
     assert report["status"] == "blocked"
     assert _reasons(report) & {"unsafe_archive_member", "nonregular_archive_member", "duplicate_archive_member",
                                "unexpected_sample_member", "case_colliding_member"}
+    if kind == "backslash":
+        assert _reasons(report) == {"unsafe_archive_member"}
 
 
 def test_overlays_reject_file_directory_conflicts(sample: Path):

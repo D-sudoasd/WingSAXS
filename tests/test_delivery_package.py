@@ -245,18 +245,24 @@ def test_native_evolution_keeps_mixed_units_stderr_and_candidates(tmp_path: Path
     assert plt.get_fignums() == existing_figures
 
 
-def test_legacy_csv_columns_and_empty_samples_remain_browsable(tmp_path: Path):
+@pytest.mark.parametrize('newline', [b'\n', b'\r\n'], ids=['lf', 'crlf'])
+def test_legacy_csv_columns_and_empty_samples_remain_browsable(tmp_path: Path, newline: bytes):
+    legacy_csv = newline.join([b'frame_id,status,custom', b'original-01,warning,retained', b''])
+    empty_csv = b'frame_id,status' + newline
     _sample(tmp_path / 'legacy')
-    (tmp_path / 'legacy' / 'frame_summary.csv').write_text('frame_id,status,custom\noriginal-01,warning,retained\n')
+    (tmp_path / 'legacy' / 'frame_summary.csv').write_bytes(legacy_csv)
     _sample(tmp_path / 'empty')
-    (tmp_path / 'empty' / 'frame_summary.csv').write_text('frame_id,status\n')
+    (tmp_path / 'empty' / 'frame_summary.csv').write_bytes(empty_csv)
     report = package_batch(tmp_path)
     assert report['exit_code'] == 1
     legacy = next(sample for sample in report['samples'] if sample['sample'] == 'legacy')
     assert legacy['frames'][0]['csv_record'] == 0
     assert legacy['frames'][0]['frame_index'] == ''
     with zipfile.ZipFile(tmp_path / 'delivery.zip') as archive:
-        assert archive.read('legacy/frame_summary.csv') == b'frame_id,status,custom\noriginal-01,warning,retained\n'
+        assert archive.read('legacy/frame_summary.csv') == legacy_csv
+        assert archive.read('empty/frame_summary.csv') == empty_csv
+    assert (tmp_path / 'legacy' / 'frame_summary.csv').read_bytes() == legacy_csv
+    assert (tmp_path / 'empty' / 'frame_summary.csv').read_bytes() == empty_csv
 
 
 @pytest.mark.parametrize('fail_name', ['delivery_summary.json', 'delivery_index.html'])
