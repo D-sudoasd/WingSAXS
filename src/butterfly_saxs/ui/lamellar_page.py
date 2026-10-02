@@ -44,6 +44,42 @@ def _default_page_settings() -> dict[str, Any]:
     ).to_dict()
 
 
+def _source_has_ellipse_payload(source: Any) -> bool:
+    """Return whether the source carries a fitted-ellipse payload."""
+
+    observables = field(source, "observables", field(source, "measurements", {}))
+    containers = (source, observables, field(source, "butterfly", {}))
+    return any(
+        field(container, name) is not None
+        for container in containers
+        for name in ("ellipse_fit", "ellipse", "candidate_fit")
+    )
+
+
+def _has_usable_ellipse_period(sources: list[Any]) -> bool:
+    """Probe the canonical scene builder before making ellipse the page default."""
+
+    if not sources or not any(_source_has_ellipse_payload(source) for source in sources):
+        return False
+    settings = replace(
+        LamellarSettings.from_mapping(_default_page_settings()),
+        mode="single",
+        period_source="ellipse",
+        layer_count=1,
+        stack_count=1,
+        spread_deg=0.0,
+        spacing_jitter_pct=0.0,
+        position_jitter_pct=0.0,
+    )
+    for source in sources:
+        if not _source_has_ellipse_payload(source):
+            continue
+        scene = build_lamellar_scene(source, settings)
+        if scene.metadata.get("available"):
+            return True
+    return False
+
+
 def _build_scenes(sources: list[Any], values: dict[str, Any], cancel: threading.Event) -> list[Any]:
     settings = LamellarSettings.from_mapping(values)
     # Build a multi-frame preview without a saved common reference first.  A
@@ -127,6 +163,7 @@ if QT_AVAILABLE:
             self.setObjectName("lamellarPage")
             self.language = language
             self.settings = _default_page_settings()
+            self._period_source_explicit = False
             self._palette = "blue_orange"
             self._publication_document: dict[str, Any] = {}
             self._publication_dialog: Any = None
@@ -385,6 +422,14 @@ if QT_AVAILABLE:
             self._import_path = None
             self.current_index = 0
             self._image_cache.clear()
+            if not self._period_source_explicit and self.sources:
+                preferred = "ellipse" if _has_usable_ellipse_period(self.sources) else "radial"
+                if preferred != self.settings["period_source"]:
+                    self.settings = LamellarSettings.from_mapping(
+                        {**self.settings, "period_source": preferred}
+                    ).to_dict()
+                    self.controls.set_settings(self.settings)
+                    self.documentChanged.emit()
             self._clear_views("building")
             if not self.sources and self.settings["period_source"] != "manual":
                 self._fresh = False
@@ -400,7 +445,13 @@ if QT_AVAILABLE:
             self._image_cache.clear()
             self._clear_views(reason)
 
-        def update_settings(self, values: Mapping[str, Any], *, record: bool = True) -> None:
+        def update_settings(
+            self,
+            values: Mapping[str, Any],
+            *,
+            record: bool = True,
+            period_source_explicit: bool | None = None,
+        ) -> None:
             try:
                 candidate = LamellarSettings.from_mapping(dict(values)).to_dict()
             except (ValueError, TypeError) as exc:
@@ -408,11 +459,20 @@ if QT_AVAILABLE:
                 self.status.setText(str(exc))
                 return
             if candidate == self.settings:
+                if period_source_explicit is not None:
+                    explicit = bool(period_source_explicit)
+                    if explicit != self._period_source_explicit:
+                        self._period_source_explicit = explicit
+                        self.documentChanged.emit()
                 return
             if record:
                 self._undo.append(self._history_settings())
                 self._undo = self._undo[-100:]
                 self._redo.clear()
+            if period_source_explicit is not None:
+                self._period_source_explicit = bool(period_source_explicit)
+            elif record and candidate["period_source"] != self.settings["period_source"]:
+                self._period_source_explicit = True
             self.settings = candidate
             self.controls.set_settings(candidate)
             self._stop_job("build")
@@ -427,7 +487,12 @@ if QT_AVAILABLE:
             self.documentChanged.emit()
 
         def reset_settings(self) -> None:
-            self.update_settings(_default_page_settings())
+            values = _default_page_settings()
+            if self.sources and self._fresh:
+                values["period_source"] = (
+                    "ellipse" if _has_usable_ellipse_period(self.sources) else "radial"
+                )
+            self.update_settings(values, period_source_explicit=False)
 
         def apply_preview_preset(self, mode: str) -> None:
             """Apply a packet/field preset, using manual relative units when fit data is absent."""
@@ -461,14 +526,28 @@ if QT_AVAILABLE:
                 out_of_plane_deg=0.0,
                 seed=42,
             )
-            self.update_settings(values)
+            self.update_settings(
+                values,
+                period_source_explicit=(
+                    False
+                    if (not self.sources or not self._fresh) and not self._period_source_explicit
+                    else None
+                ),
+            )
 
         def _history_settings(self) -> dict[str, Any]:
-            return {**deepcopy(self.settings), "_palette": self._palette}
+            return {
+                **deepcopy(self.settings),
+                "_palette": self._palette,
+                "_period_source_explicit": self._period_source_explicit,
+            }
 
         def _restore_history(self, values: dict[str, Any]) -> None:
             values = dict(values)
             self._palette = values.pop("_palette", self._palette)
+            self._period_source_explicit = bool(
+                values.pop("_period_source_explicit", self._period_source_explicit)
+            )
             self.controls.set_palette(self._palette)
             self.update_settings(values, record=False)
             self._apply_palette()
@@ -900,7 +979,9 @@ if QT_AVAILABLE:
             dialog.exec()
 
         def document(self) -> dict[str, Any]:
-            return {"version": 1, "settings": deepcopy(self.settings), "camera": self.view3d.camera_state(),
+            return {"version": 1, "settings": deepcopy(self.settings),
+                    "period_source_explicit": self._period_source_explicit,
+                    "camera": self.view3d.camera_state(),
                     "presentation": {"palette": self._palette},
                     "publication": deepcopy(self._publication_document),
                     "frame_index": self.current_index, "fps": self.speed.currentData(), "fresh": self._fresh,
@@ -935,6 +1016,9 @@ if QT_AVAILABLE:
             if document and document.get("version") != 1:
                 raise ValueError("Unsupported lamellar_view version")
             values = LamellarSettings.from_mapping(document.get("settings", {})).to_dict()
+            self._period_source_explicit = bool(
+                document.get("period_source_explicit", bool(document.get("settings")))
+            )
             self.settings = values
             self._publication_document = deepcopy(document.get("publication") or {})
             if self._publication_dialog is not None:

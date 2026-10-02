@@ -38,6 +38,7 @@ def test_report_command_passes_options_and_emits_strict_summary(monkeypatch, tmp
         "angular_bins": 48,
         "formats": ["png", "svg"],
         "dpi": 240,
+        "lamellar_settings": None,
     })]
     payload = json.loads(capsys.readouterr().out)
     assert payload == result
@@ -124,6 +125,15 @@ def test_describe_catalog_exposes_report_artifacts_and_full_workflow(capsys):
     assert report["stdout"] == REPORT_SCHEMA
     assert "results.npz" in report["artifacts"]["inputs"]
     assert "radial_profiles.csv" in report["artifacts"]["outputs"]["tables"]
+    assert {
+        "lamellar_parameters.csv",
+        "lamellar_directions.csv",
+        "lamellar_period_by_angle.csv",
+        "lamellar_changes.csv",
+    }.issubset(report["artifacts"]["outputs"]["tables"])
+    morphology = report["artifacts"]["lamellar_morphology"]
+    assert morphology["defaults"] == {"mode": "multi", "period_source": "ellipse"}
+    assert "not inferred from ellipse theta" in morphology["interpretation"]
     assert "outputs" in report["artifacts"]["outputs"]["entry_points"]
     assert any("--stream --report --package" in command for command in catalog["recommended_agent_workflow"])
     assert agent_manifest() == catalog
@@ -154,6 +164,7 @@ def test_batch_generates_report_after_exports_before_package_and_bounds_stdout(
             "angular_bins": 36,
             "formats": ["png", "pdf"],
             "dpi": 200,
+            "lamellar_settings": None,
         }
         return {
             "status": "completed",
@@ -242,6 +253,181 @@ def test_batch_report_resume_command_preserves_custom_recipe(monkeypatch, tmp_pa
         "bsaxs", "report", str(output), "--resume",
         "--radial-bins", "40", "--angular-bins", "48",
         "--formats", "svg", "tiff", "--dpi", "300",
+    ]
+
+
+def test_report_loads_nested_json_lamellar_settings_and_passes_normalized_values(
+    monkeypatch, tmp_path, capsys
+):
+    settings_path = tmp_path / "lamellar.json"
+    settings_path.write_text(
+        json.dumps({
+            "lamellar": {
+                "mode": "single",
+                "period_source": "ellipse",
+                "thickness_ratio": 0.62,
+                "width_ratio": 3.5,
+                "depth_ratio": 1.7,
+            }
+        }),
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "_build_analysis_report",
+        lambda output_dir, **kwargs: calls.append(kwargs) or {"exit_code": 0},
+    )
+
+    assert main(["report", str(tmp_path), "--lamellar-settings", str(settings_path)]) == 0
+    assert calls[0]["lamellar_settings"]["mode"] == "single"
+    assert calls[0]["lamellar_settings"]["period_source"] == "ellipse"
+    assert calls[0]["lamellar_settings"]["thickness_ratio"] == 0.62
+    assert calls[0]["lamellar_settings"]["width_ratio"] == 3.5
+    assert calls[0]["lamellar_settings"]["depth_ratio"] == 1.7
+    assert calls[0]["lamellar_settings"]["seed"] == 0
+    json.dumps(json.loads(capsys.readouterr().out), allow_nan=False)
+
+
+def test_partial_lamellar_settings_use_report_defaults(monkeypatch, tmp_path, capsys):
+    settings_path = tmp_path / "lamellar.json"
+    settings_path.write_text('{"settings": {"thickness_ratio": 0.6}}', encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "_build_analysis_report",
+        lambda output_dir, **kwargs: calls.append(kwargs) or {"exit_code": 0},
+    )
+
+    assert main(["report", str(tmp_path), "--lamellar-settings", str(settings_path)]) == 0
+    settings = calls[0]["lamellar_settings"]
+    assert settings["mode"] == "multi"
+    assert settings["period_source"] == "ellipse"
+    assert settings["thickness_ratio"] == 0.6
+    assert settings["width_ratio"] == 4.0
+    json.dumps(json.loads(capsys.readouterr().out), allow_nan=False)
+
+
+def test_batch_loads_toml_settings_before_fitting_and_forwards_them(
+    monkeypatch, tmp_path, capsys
+):
+    source = tmp_path / "frame.npy"
+    np.save(source, np.ones((8, 8)))
+    settings_path = tmp_path / "lamellar.toml"
+    settings_path.write_text(
+        'mode = "multi"\nperiod_source = "ellipse"\n'
+        "stack_count = 18\nthickness_ratio = 0.7\n",
+        encoding="utf-8",
+    )
+    analyzed = []
+    reports = []
+    monkeypatch.setattr(
+        cli,
+        "analyze_frame",
+        lambda *args, **kwargs: analyzed.append(True)
+        or {"parameters": {"axis_ratio": 0.42}, "image": np.ones((8, 8))},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_build_analysis_report",
+        lambda output_dir, **kwargs: reports.append(kwargs) or {"exit_code": 0},
+    )
+
+    assert main([
+        "batch", str(source), "-o", str(tmp_path / "output"), "--report",
+        "--report-lamellar-settings", str(settings_path),
+    ]) == 0
+    assert analyzed
+    settings = reports[0]["lamellar_settings"]
+    assert settings["mode"] == "multi"
+    assert settings["period_source"] == "ellipse"
+    assert settings["stack_count"] == 18
+    assert settings["thickness_ratio"] == 0.7
+    json.dumps(json.loads(capsys.readouterr().out), allow_nan=False)
+
+
+def test_invalid_batch_lamellar_settings_fail_before_frame_analysis(
+    monkeypatch, tmp_path, capsys
+):
+    source = tmp_path / "frame.npy"
+    np.save(source, np.ones((8, 8)))
+    settings_path = tmp_path / "invalid.json"
+    settings_path.write_text('{"thickness_ratio": 1.0}', encoding="utf-8")
+    analyzed = False
+
+    def analyze(*args, **kwargs):
+        nonlocal analyzed
+        analyzed = True
+        raise AssertionError("invalid lamellar settings must fail before fitting")
+
+    monkeypatch.setattr(cli, "analyze_frame", analyze)
+    assert main([
+        "batch", str(source), "-o", str(tmp_path / "output"), "--report",
+        "--report-lamellar-settings", str(settings_path),
+    ]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "value_error"
+    assert "thickness_ratio" in payload["error"]["message"]
+    assert not analyzed
+
+
+def test_unknown_nested_lamellar_field_fails_before_batch_fit(monkeypatch, tmp_path, capsys):
+    source = tmp_path / "frame.npy"
+    np.save(source, np.ones((8, 8)))
+    settings_path = tmp_path / "typo.json"
+    settings_path.write_text(
+        json.dumps({
+            "analysis": {"q_min": 0.1},
+            "lamellar_settings": {"thickness_ratios": 0.74},
+        }),
+        encoding="utf-8",
+    )
+    analyzed = False
+
+    def analyze(*args, **kwargs):
+        nonlocal analyzed
+        analyzed = True
+        raise AssertionError("unknown lamellar fields must fail before fitting")
+
+    monkeypatch.setattr(cli, "analyze_frame", analyze)
+    assert main([
+        "batch", str(source), "-o", str(tmp_path / "output"), "--report",
+        "--report-lamellar-settings", str(settings_path),
+    ]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    message = payload["error"]["message"]
+    assert payload["error"]["code"] == "value_error"
+    assert "thickness_ratios" in message
+    assert "thickness_ratio" in message
+    assert not analyzed
+
+
+def test_batch_report_recovery_command_retains_lamellar_settings_path(
+    monkeypatch, tmp_path, capsys
+):
+    source = tmp_path / "frame.npy"
+    np.save(source, np.ones((8, 8)))
+    output = tmp_path / "output"
+    settings_path = tmp_path / "lamellar.toml"
+    settings_path.write_text('mode = "multi"\n', encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "analyze_frame",
+        lambda *args, **kwargs: {"parameters": {"axis_ratio": 0.42}, "image": np.ones((8, 8))},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_build_analysis_report",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("report renderer failed")),
+    )
+    assert main([
+        "batch", str(source), "-o", str(output), "--report",
+        "--report-lamellar-settings", str(settings_path),
+    ]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["analysis_report"]["next_command"] == [
+        "bsaxs", "report", str(output), "--resume",
+        "--lamellar-settings", str(settings_path),
     ]
 
 

@@ -69,6 +69,17 @@ def source(q=.2, frame=0, *, status="ok", image=True):
     return data
 
 
+def ellipse_source(q=.2, frame=0, *, image=True):
+    data = source(q, frame, image=image)
+    data["ellipse_fit"] = {
+        "parameters": {"a": .3, "b": .15, "theta_deg": 0.},
+        "center": [0., 0.],
+        "q_unit": "nm^-1",
+        "status": "available",
+    }
+    return data
+
+
 @pytest.fixture
 def page(qtbot, monkeypatch):
     monkeypatch.setattr(page_module, "Lamellar3DView", Stub3D)
@@ -127,6 +138,54 @@ def test_fit_driven_preview_retains_observed_branches_and_period(page, qtbot):
     assert page.current_scene.metadata["populations"][0]["period"] == pytest.approx(2. * np.pi / .2)
     assert set(page.current_scene.branch_ids.tolist()) == {0}
     assert set(page.current_scene.stack_ids.tolist()) == set(range(0, 64, 2))
+
+
+def test_fresh_ellipse_fit_selects_ellipse_periods_by_default(page, qtbot):
+    page.set_source(ellipse_source())
+    ready(qtbot, page)
+
+    assert page.settings["period_source"] == "ellipse"
+    assert page.current_scene.metadata["period_source"] == "ellipse"
+    assert page.current_scene.metadata["available"]
+
+
+def test_unusable_ellipse_fit_falls_back_to_radial_periods(page, qtbot):
+    data = source()
+    data["ellipse_fit"] = {"status": "failed", "parameters": {}}
+    page.set_source(data)
+    ready(qtbot, page)
+
+    assert page.settings["period_source"] == "radial"
+    assert page.current_scene.metadata["period_source"] == "radial"
+    assert page.current_scene.metadata["available"]
+
+
+@pytest.mark.parametrize("period_source", ["radial", "manual"])
+def test_explicit_period_source_survives_new_fit_source(page, qtbot, period_source):
+    page.set_source(ellipse_source())
+    ready(qtbot, page)
+    page.update_settings({**page.settings, "period_source": period_source})
+    ready(qtbot, page)
+    assert page._period_source_explicit
+
+    page.set_source(ellipse_source(.16, frame=1))
+    ready(qtbot, page)
+
+    assert page.settings["period_source"] == period_source
+    assert page.current_scene.metadata["period_source"] == period_source
+
+
+def test_reset_period_source_returns_to_fit_driven_default(page, qtbot):
+    page.set_source(ellipse_source())
+    ready(qtbot, page)
+    page.update_settings({**page.settings, "period_source": "radial"})
+    ready(qtbot, page)
+
+    page.reset_settings()
+    ready(qtbot, page)
+
+    assert page.settings["period_source"] == "ellipse"
+    assert not page._period_source_explicit
 
 
 def test_sequence_promotes_an_explicit_small_reference_to_a_shared_safe_scale():
@@ -326,6 +385,7 @@ def test_document_roundtrip_and_context_mismatch(page, qtbot):
     page.view3d.set_camera_state({"yaw": 70.})
     saved = page.document()
     vertices = page.current_scene.vertices.copy()
+    assert saved["period_source_explicit"] is False
     assert "observed" not in saved["sources"][0]
     page.restore_document(saved, context_signature="original input hashes")
     ready(qtbot, page)
@@ -335,6 +395,23 @@ def test_document_roundtrip_and_context_mismatch(page, qtbot):
     qtbot.wait(250)
     assert page.current_scene is None
     assert not page.export_button.isEnabled()
+
+
+def test_document_roundtrip_preserves_explicit_period_source(page, qtbot):
+    page.set_source(ellipse_source())
+    ready(qtbot, page)
+    page.update_settings({**page.settings, "period_source": "radial"})
+    ready(qtbot, page)
+    saved = page.document()
+
+    page.restore_document(saved)
+    ready(qtbot, page)
+    page.set_source(ellipse_source(.16, frame=1))
+    ready(qtbot, page)
+
+    assert saved["period_source_explicit"] is True
+    assert page.settings["period_source"] == "radial"
+    assert page._period_source_explicit
 
 
 def test_legacy_document_with_current_context_is_stale_but_manual_remains_available(page, qtbot):
@@ -382,6 +459,20 @@ def test_legacy_document_remains_viewable_without_current_input_context(page, qt
 
     assert page._fresh
     assert page.current_scene.metadata["source_identity"]["frame"] == 8
+
+
+def test_legacy_document_period_source_is_preserved_as_explicit(page, qtbot):
+    document = {
+        "version": 1,
+        "settings": {"mode": "single", "period_source": "radial", "layer_count": 1, "stack_count": 2},
+        "fresh": True,
+        "sources": [ellipse_source(image=False)],
+    }
+    page.restore_document(document)
+    ready(qtbot, page)
+
+    assert page.settings["period_source"] == "radial"
+    assert page._period_source_explicit
 
 
 def test_unit_display_spelling_is_not_a_new_physical_context():

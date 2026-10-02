@@ -659,6 +659,54 @@ class FrameRef:
         }
 
 
+def _inherit_manifest_time_unit(rows: Sequence[Any], time_unit: Any) -> list[Any]:
+    """Copy a root acquisition-time unit onto entries that do not define one."""
+
+    if time_unit is None or not str(time_unit).strip():
+        return list(rows)
+    inherited: list[Any] = []
+    for row in rows:
+        if isinstance(row, FrameRef):
+            metadata = dict(row.metadata or {})
+            if "time_unit" in metadata and metadata["time_unit"] is not None:
+                inherited.append(row)
+                continue
+            metadata["time_unit"] = time_unit
+            inherited.append(
+                FrameRef(
+                    row.path,
+                    time=row.time,
+                    frame_id=row.frame_id,
+                    metadata=metadata,
+                    order=row.order,
+                    source=row.source,
+                    dataset=row.dataset,
+                    frame=row.frame,
+                )
+            )
+            continue
+        if isinstance(row, Mapping):
+            entry = dict(row)
+            metadata_value = entry.get("metadata")
+            if metadata_value is not None and not isinstance(metadata_value, Mapping):
+                inherited.append(row)
+                continue
+            metadata = dict(metadata_value or {})
+            if (entry.get("time_unit") is not None
+                    or ("time_unit" in metadata and metadata["time_unit"] is not None)):
+                inherited.append(row)
+                continue
+            metadata["time_unit"] = time_unit
+            entry["metadata"] = metadata
+            inherited.append(entry)
+            continue
+        if isinstance(row, (str, os.PathLike)):
+            inherited.append({"path": os.fspath(row), "metadata": {"time_unit": time_unit}})
+            continue
+        inherited.append(row)
+    return inherited
+
+
 def _manifest_rows(manifest: Any) -> list[Any]:
     if manifest is None:
         return []
@@ -688,11 +736,15 @@ def _manifest_rows(manifest: Any) -> list[Any]:
             resolved_rows.append(resolved)
         return resolved_rows
     if isinstance(manifest, Mapping):
+        common_time_unit = manifest.get("time_unit")
+        metadata = manifest.get("metadata")
+        if (common_time_unit is None or not str(common_time_unit).strip()) and isinstance(metadata, Mapping):
+            common_time_unit = metadata.get("time_unit")
         for key in ("frames", "frame_manifest", "manifest", "data", "items"):
             if key in manifest and isinstance(manifest[key], Sequence) and not isinstance(
                 manifest[key], (str, bytes)
             ):
-                return list(manifest[key])
+                return _inherit_manifest_time_unit(manifest[key], common_time_unit)
         # A mapping from filename to metadata is a convenient manifest form.
         rows: list[dict[str, Any]] = []
         for path, metadata in manifest.items():

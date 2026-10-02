@@ -39,6 +39,28 @@ def _rows(path: Path) -> list[dict]:
         return read_csv_rows(handle)
 
 
+def test_sequence_direction_summary_uses_axial_statistics_without_inventing_axis():
+    from butterfly_saxs.report import _direction_summary
+
+    summary = _direction_summary([
+        {"branch_id": 0, "angle_deg": 179.0},
+        {"branch_id": 0, "angle_deg": 1.0},
+        {"branch_id": 1, "angle_deg": 0.0},
+        {"branch_id": 1, "angle_deg": 90.0},
+    ])
+    wrapped, degenerate = summary
+    assert min(abs(wrapped["axial_mean_deg"]), abs(wrapped["axial_mean_deg"] - 180)) < 1e-10
+    assert wrapped["angle_max_deg"] - wrapped["angle_min_deg"] == pytest.approx(2)
+    assert wrapped["count"] == 2
+    assert degenerate["axial_mean_deg"] is None
+    assert degenerate["reason"] == "undefined_axial_mean"
+
+
+def test_unknown_lamellar_setting_reports_the_typo_before_reading_batch(tmp_path):
+    with pytest.raises(ValueError, match="Unknown lamellar settings: thickness_ratios"):
+        build_analysis_report(tmp_path, lamellar_settings={"lamellar": {"thickness_ratios": 0.74}})
+
+
 def test_report_preserves_failed_frame_and_measured_arrays(tmp_path):
     folder = _batch(tmp_path / "batch")
     archive_before = (folder / "results.npz").read_bytes()
@@ -169,3 +191,31 @@ def test_parameter_changes_keep_candidate_estimates_separate():
     assert trends["value"]["n_finite"] == 1
     assert trends["candidate_value"]["n_finite"] == 2
     assert trends["candidate_value"]["change"] == pytest.approx(0.2)
+
+
+def test_lamellar_figure_failure_keeps_intensity_report_and_fit_data(tmp_path, monkeypatch):
+    from butterfly_saxs import lamellar_report_figures
+
+    folder = _batch(tmp_path / "batch", failed=False)
+    records_path = folder / "frame_details.jsonl"
+    records = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record["result"]["ellipse_fit"].update(
+            a=0.3, b=0.15, theta_deg=25., center=[0., 0.],
+            success=True, status="ok", reference_axis_deg=0.)
+    records_path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    def fail_drawing(*args, **kwargs):
+        raise ValueError("scene drawing failed")
+
+    monkeypatch.setattr(lamellar_report_figures, "render_lamellar_report_frame", fail_drawing)
+    report = build_analysis_report(folder, radial_bins=4, angular_bins=6, formats=("png",), dpi=40)
+    assert report["counts"]["reported"] == 2
+    assert report["counts"]["incomplete"] == 0
+    assert report["counts"]["lamellar_incomplete"] == 2
+    assert report["exit_code"] == 1
+    for frame in report["frames"]:
+        assert frame["report_status"] == "completed"
+        assert frame["figures"]
+        assert frame["lamellar_error"] == "scene drawing failed"
+        assert "lamellar_analysis" in frame["data"]

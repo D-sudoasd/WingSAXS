@@ -1,6 +1,6 @@
 # 操作、输入输出、UI 与批处理指南
 
-本指南对应 WingSAXS 0.6.0，面向当前 checkout 的 CLI、项目 TOML 和 Qt UI。先准备已知实验几何和 mask，再开始精修；PONI、mask、q 单位和输出目录都应随结果保存。科学量、符号、`full2d` 边界和不确定度解释见[科学量、符号、单位与可解释性边界](scientific_basis_zh.md)，模块关系见[软件架构与数据流](architecture_zh.md)。
+本指南对应 WingSAXS 0.7.0，面向当前 checkout 的 CLI、项目 TOML 和 Qt UI。先准备已知实验几何和 mask，再开始精修；PONI、mask、q 单位和输出目录都应随结果保存。科学量、符号、`full2d` 边界和不确定度解释见[科学量、符号、单位与可解释性边界](scientific_basis_zh.md)，模块关系见[软件架构与数据流](architecture_zh.md)。
 
 ## 1. 安装与启动
 

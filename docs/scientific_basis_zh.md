@@ -120,6 +120,15 @@ L_z = \frac{2\pi}{q_{z,\,nm^{-1}}}.
 
 当前字段名为 `Ln_from_minor_axis_nm` 和 `Lz_from_draw_axis_nm`，pipeline 还提供 `L_N`/`L_z` 别名。若中心不在原点，两个长度保持 `NaN` 并带 `spacing_unavailable_nonzero_center`；即使中心满足条件，也保留 `spacing_requires_origin_centered_ellipse_assumption`，提醒这不是无条件的结构结论。
 
+批次报告的片层分析沿用这些定义，并按拟合成员分别计算方向相关的表观周期。设成员的全局轴角为 `reference_axis_deg ± theta_deg`，所考察 q 方向为 `β`，则
+
+\[
+q(\beta)=\frac{ab}{\sqrt{b^2\cos^2(\beta-\theta_i)+a^2\sin^2(\beta-\theta_i)}},
+\qquad L_{\rm app}(\beta)=\frac{2\pi}{q(\beta)_{nm^{-1}}}.
+\]
+
+`β` 等于本帧记录的 `draw_axis_deg` 时得到该成员的 `Lz_from_draw_axis_nm`。模型曲线在没有实测脊点的角度仍属于外推；表格和图中另列观测支持。未校准的 q 只能给出无量纲相对周期 `b/q(β)`。层片示意的法向使用保留的实测 q 方向，并明确采用“q 方向对应所绘层片法向”的假设；绘制厚度、宽度、深度、层数和空间排列由设置给出。
+
 ### 4.3 与 Grubb 2021 关系式的边界
 
 Grubb 2021 在不同几何操作/定义下写出 `L_N = L_z cosϕ`（图 2 的层间滑移关系）以及正文旋转状态中的 `L_N = L_z cosψ`。它们依赖所定义的 `ϕ`、`α`、`ψ` 和旋转顺序，不能合并成一个普适公式。软件的 `L_N`/`L_z` 是 q 椭圆的表观长度派生量，不会自动选择或验证上述结构机制。

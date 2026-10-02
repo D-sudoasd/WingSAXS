@@ -36,6 +36,7 @@ INVARIANTS = (
     "Do not overwrite outputs without an explicit --force; --force never applies to raw inputs.",
     "Identify (trace) then Evaluate; --full2d is a separate empirical intensity model.",
     "geometry-only analysis must not silently start full2d.",
+    "Lamellar reports use a parameterized geometry schematic: for observed direction beta, the matching fitted ellipse branch supplies the conditional period 2*pi/R(beta); keep Ln_from_minor_axis=2*pi/b as a separate global reference, and leave ambiguous branch matches without an invented directional period.",
     "JSON stdout is strict (no NaN/Infinity). Human diagnostics stay on stderr.",
 )
 
@@ -297,7 +298,7 @@ def agent_manifest() -> dict[str, Any]:
             },
             {
                 "name": "report",
-                "purpose": "Read results.npz and existing frame exports to create radial/angular profiles, fit diagnostics, ellipse candidates and frame/sequence figures; accepts one batch directory or a parent containing sample directories.",
+                "purpose": "Read existing batch exports without refitting to create intensity statistics, fit diagnostics, ellipse candidates, parameterized lamellar geometry summaries and frame/sequence figures; accepts one batch directory or a parent containing sample directories. For each retained observed q-direction beta, ellipse mode reports conditional period 2*pi/R(beta) from the corresponding fitted branch; it keeps Ln_from_minor_axis=2*pi/b separate.",
                 "stdout": REPORT_SCHEMA,
                 "artifacts": {
                     "inputs": "Existing results.npz, frame_summary.csv and fit-detail exports; no refitting.",
@@ -312,11 +313,22 @@ def agent_manifest() -> dict[str, Any]:
                             "ellipse_candidates.csv",
                             "frame_measurements.csv",
                             "parameter_changes.csv",
+                            "lamellar_parameters.csv",
+                            "lamellar_directions.csv",
+                            "lamellar_period_by_angle.csv",
+                            "lamellar_radial_peaks.csv",
+                            "lamellar_changes.csv",
                         ],
-                        "figures": "Per-frame and sequence plots under the generated report folder.",
+                        "figures": "Per-frame SAXS/lamellar geometry figures and sequence plots under the generated report folder; PNG/SVG/PDF or TIFF according to requested formats.",
                         "entry_points": "Index and report_summary.json paths are listed in the command outputs object.",
-                        "frame_data": ["measurements.json", "polar_measurements.npz", "fit_details.json"],
-                        "collection_outputs": ["analysis_reports.html", "analysis_report_summary.json", "collection_parameters.csv", "collection_measurements.csv"],
+                        "frame_data": ["measurements.json", "polar_measurements.npz", "fit_details.json", "lamellar_analysis.json", "lamellar_geometry.npz when a scene is available"],
+                        "collection_outputs": ["analysis_reports.html", "analysis_report_summary.json", "collection_parameters.csv", "collection_measurements.csv", "collection_lamellar_parameters.csv"],
+                    },
+                    "lamellar_morphology": {
+                        "defaults": {"mode": "multi", "period_source": "ellipse"},
+                        "settings": "Pass JSON/TOML with --lamellar-settings for report or --report-lamellar-settings for batch --report; thickness_ratio, width_ratio, depth_ratio and stack/layout controls are editable assumptions.",
+                        "interpretation": "Each retained observed direction beta gets conditional period 2*pi/R(beta) from its corresponding fitted ellipse branch. Ln_from_minor_axis=2*pi/b remains a separate global reference. Lamellar-normal directions come from observed q-angle/support records and are not inferred from ellipse theta; ambiguous branch matches have no fabricated directional period. Uncalibrated q yields relative geometry units only.",
+                        "limits": "Geometry is a parameter-driven schematic; assumed thickness and box dimensions are not fitted microstructure. It does not provide a unique microscopic or three-dimensional reconstruction and does not run full2d.",
                     },
                 },
                 "exit_codes": EXIT_CODES,
@@ -356,7 +368,7 @@ def agent_manifest() -> dict[str, Any]:
             },
             {
                 "name": "batch",
-                "purpose": "Independent or quality-gated warm-start series; --stream writes longitudinal exports, --report analyzes those exports, and --package builds delivery navigation and ZIP.",
+                "purpose": "Independent or quality-gated warm-start series; --stream writes longitudinal exports, --report analyzes exports and generates parameterized lamellar geometry using observed direction evidence, and --package builds delivery navigation and ZIP.",
                 "stdout": BATCH_RUN_SCHEMA,
                 "exit_codes": EXIT_CODES,
             },

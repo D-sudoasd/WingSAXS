@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml"><img src="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/WingSAXS-0.6.0-blue" alt="WingSAXS 0.6.0">
+  <img src="https://img.shields.io/badge/WingSAXS-0.7.0-blue" alt="WingSAXS 0.7.0">
   <img src="https://img.shields.io/badge/Python-3.11--3.13-blue" alt="Python 3.11 to 3.13">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
@@ -49,6 +49,7 @@ Synthetic demonstration (pixel-q): the empirical double ellipse is overlaid on a
 - **Estimates with confidence**: the default `standard` fit follows the measured trajectories. Optional `flat_ellipse` / `very_flat_ellipse` presets supply explicit bounds. Finite boundary or extrapolated solutions remain inspectable candidates, with their support and limitations alongside the values.
 - **Batch review**: independent or warm-start fitting, cancel/progress, checkpoints, streaming CSV/JSON/NPZ. Limited results remain warning frames in the sequence; missing measurements remain gaps. Resolved geometry can initialize the next frame, which is refitted to its own data.
 - **Reusable analysis reports**: `bsaxs report results/batch` derives per-frame and sequence figures plus long measurement tables from existing native batch exports without refitting, including stored normal profiles and fit-support figures when those records exist. Add `--report --package` to a batch run to generate the report and browsable ZIP in the same run; multiple samples can be reported from one parent directory. See the [analysis report guide](docs/analysis_report_zh.md).
+- **Ellipse-driven lamellar analysis**: reports now include conditional ellipse periods, their dependence on q-direction, observed direction support, parameter evolution and deterministic 2D/3D lamellar schematics. Geometry arrays and drawing assumptions accompany the figures; `--lamellar-settings` accepts a JSON/TOML file for editing the scene dimensions and organization.
 - **Workbench**: Identify trajectories → Evaluate; bilingual UI; first-order ring overlay instead of a capped tilted ellipse; lamellar studio and 0.4 publication artboards are schematics, not a unique inversion ([studio](docs/lamellar_workbench_zh.md), [figures](docs/publication_figures_zh.md)).
 - **Optional `full2d`**: empirical whole-pixel intensity refinement. It is a different model from the butterfly geometry measurement.
 - **Measurement and fit figures**: export fixed-size SVG/PDF and high-resolution TIFF/PNG with source arrays, curve/profile CSVs, and checksums. Inspect measured data, candidate ellipses, overlays, and actual `full2d` predictions without promoting a candidate to a scientifically accepted result. See the [figure export guide](docs/butterfly_figures_zh.md).

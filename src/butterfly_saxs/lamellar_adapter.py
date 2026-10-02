@@ -109,6 +109,10 @@ def _q_unit_from_source(
         return str(direct)
     ellipse = _read(root, ("ellipse_fit", "ellipse"), None)
     direct = _read(ellipse, ("q_unit", "source_q_unit"), None)
+    if direct in (None, ""):
+        direct = _read(
+            _ellipse_payload(root), ("q_unit", "source_q_unit"), None
+        )
     if direct not in (None, "") and _normalise_q_unit(direct) not in {
         "unknown",
         "none",
@@ -244,11 +248,24 @@ def _branch_value(peak: Any) -> int | None:
     )
     if value is _MISSING:
         return None
-    try:
-        number = int(value)
-    except (TypeError, ValueError, OverflowError):
+    number = _exact_integer(value)
+    if number is None:
         return None
     return number
+
+
+def _exact_integer(value: Any) -> int | None:
+    """Return an integer-valued identifier without truncating numeric input."""
+
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    number = _finite(value)
+    if number is None or not float(number).is_integer():
+        return None
+    try:
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _radial_peaks(root: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -445,6 +462,246 @@ def _ellipse_payload(root: Mapping[str, Any]) -> Any:
         if candidate is not _MISSING and candidate is not None:
             return candidate
     return None
+
+
+def _ridge_point_rows(value: Any) -> list[tuple[int, Any, str]]:
+    """Return ordered measured ridge-point rows without inventing branch IDs."""
+
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        if any(
+            _read(value, (name,), _MISSING) is not _MISSING
+            for name in ("qx", "q_x", "qy", "q_y", "angle", "angle_deg")
+        ):
+            return [(0, value, "ridge_points")]
+        for name in ("ridge_points", "points", "ridges", "ridge"):
+            nested = _read(value, (name,), _MISSING)
+            if nested is not _MISSING and nested is not None:
+                return _ridge_point_rows(nested)
+        rows: list[tuple[int, Any, str]] = []
+        for collection_name, collection in value.items():
+            if isinstance(collection, (Mapping, Sequence, np.ndarray)) and not isinstance(
+                collection, (str, bytes)
+            ):
+                rows.extend(
+                    (index, point, str(collection_name))
+                    for index, point, _ in _ridge_point_rows(collection)
+                )
+        return rows
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _ridge_point_rows(value.item())
+        value = value.tolist()
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        rows: list[tuple[int, Any, str]] = []
+        for index, point in enumerate(value):
+            if isinstance(point, Sequence) and not isinstance(
+                point, (str, bytes, Mapping)
+            ):
+                coordinates = list(point)
+                if len(coordinates) >= 2:
+                    point = {"qx": coordinates[0], "qy": coordinates[1]}
+            rows.append((index, point, "ridge_points"))
+        return rows
+    return []
+
+
+def _ridge_point_source(root: Mapping[str, Any]) -> tuple[list[Any], str, bool]:
+    """Choose the first native observed-ridge collection in the source envelope."""
+
+    candidates: list[tuple[Any, str]] = []
+    for key in ("ridge_points", "ridges"):
+        value = _read(root, (key,), _MISSING)
+        if value is not _MISSING and value is not None:
+            candidates.append((value, key))
+    observables = _read(root, ("observables", "measurements"), None)
+    for container, prefix in ((observables, "observables"), (_read(root, ("butterfly",), None), "butterfly")):
+        for key in ("ridge_points", "ridges", "ridge"):
+            value = _read(container, (key,), _MISSING)
+            if value is not _MISSING and value is not None:
+                candidates.append((value, f"{prefix}.{key}"))
+    for value, source_name in candidates:
+        rows = _ridge_point_rows(value)
+        if rows:
+            aligned_sequence = isinstance(value, (Sequence, np.ndarray)) and not isinstance(
+                value, (str, bytes)
+            )
+            if isinstance(value, Mapping):
+                nested = _read(value, ("ridge_points", "points", "ridges", "ridge"), None)
+                aligned_sequence = isinstance(nested, (Sequence, np.ndarray)) and not isinstance(
+                    nested, (str, bytes)
+                )
+            return rows, source_name, aligned_sequence
+    return [], "ridge_points", False
+
+
+def _fit_branch_assignments(
+    ellipse: Any, point_count: int, *, allow_ordered_alignment: bool = True
+) -> dict[int, int]:
+    """Align only explicit ellipse-fit labels to their retained source points."""
+
+    if ellipse is None:
+        return {}
+    assignments = _read(
+        ellipse,
+        ("branch_assignment_values", "branch_assignment", "branch_assignments"),
+        None,
+    )
+    if isinstance(assignments, Mapping):
+        assignments = _read(
+            assignments, ("point_branch", "labels", "branch_id", "values"), None
+        )
+    if assignments is None:
+        return {}
+    try:
+        labels = np.asarray(assignments).reshape(-1)
+    except (TypeError, ValueError):
+        return {}
+    raw_indices = _read(ellipse, ("branch_assignment_indices",), None)
+    if raw_indices is not None:
+        try:
+            raw_index_values = np.asarray(raw_indices).reshape(-1)
+        except (TypeError, ValueError, OverflowError):
+            return {}
+        if len(raw_index_values) != len(labels):
+            return {}
+        indices = [_exact_integer(value) for value in raw_index_values]
+    elif allow_ordered_alignment and len(labels) == point_count:
+        indices = list(range(point_count))
+    else:
+        # A label vector with no index map is not safe to align to a filtered
+        # or reordered ridge collection.
+        return {}
+    result: dict[int, int] = {}
+    for index, label in zip(indices, labels, strict=True):
+        if index is None or index < 0 or index >= point_count:
+            continue
+        branch = _exact_integer(label)
+        if branch is None:
+            continue
+        if branch in {0, 1}:
+            result[int(index)] = branch
+    return result
+
+
+def observed_direction_support(source: Any) -> list[dict[str, Any]]:
+    """Normalize accepted observed ridge points for orientation-only use.
+
+    Coordinates, direction, and explicit branch labels come from retained
+    measured points.  The function does not infer points or promote quadrant
+    labels into fitted branch IDs.
+    """
+
+    root = _source_mapping(source)
+    rows, source_name, assignment_alignment_is_ordered = _ridge_point_source(root)
+    if not rows:
+        return []
+    ellipse = _ellipse_payload(root)
+    fit_assignments = _fit_branch_assignments(
+        ellipse, len(rows), allow_ordered_alignment=assignment_alignment_is_ordered
+    )
+    source_unit = _q_unit_from_source(root)
+    result: list[dict[str, Any]] = []
+    for row_order, (source_row_index, point, collection_name) in enumerate(rows):
+        if not isinstance(point, Mapping) and not hasattr(point, "__dict__"):
+            continue
+        metadata = _read(point, ("metadata",), {})
+        valid = _read(point, ("valid",), _read(metadata, ("valid",), None))
+        accepted = _read(point, ("accepted",), _read(metadata, ("accepted",), None))
+        if not (
+            isinstance(valid, (bool, np.bool_))
+            and bool(valid)
+            and isinstance(accepted, (bool, np.bool_))
+            and bool(accepted)
+        ):
+            continue
+        status = str(
+            _read(
+                point,
+                ("status", "identifiability_status"),
+                _read(metadata, ("status", "identifiability_status"), "observed"),
+            )
+            or "observed"
+        ).strip().lower()
+        if status in {"invalid", "rejected", "failed", "unavailable", "missing"}:
+            continue
+        qx = _finite(_read(point, ("qx", "q_x"), _read(metadata, ("qx", "q_x"), _MISSING)))
+        qy = _finite(_read(point, ("qy", "q_y"), _read(metadata, ("qy", "q_y"), _MISSING)))
+        if qx is not None and qy is not None and np.hypot(qx, qy) > 0.0:
+            q = float(np.hypot(qx, qy))
+            angle = float(np.degrees(np.arctan2(qy, qx)))
+        else:
+            qx = None
+            qy = None
+            angle = _angle_deg(point)
+            q = _finite(_read(point, ("q", "q_star", "q_position"), _read(metadata, ("q", "q_star", "q_position"), _MISSING)))
+            if angle is None or q is None or q <= 0.0:
+                continue
+        unit = str(
+            _read(point, ("q_unit", "source_q_unit"), _read(metadata, ("q_unit", "source_q_unit"), source_unit))
+            or source_unit
+        )
+        source_branch_id = _branch_value(point)
+        original_branch_source = str(
+            _read(
+                point,
+                ("branch_assignment_source",),
+                _read(
+                    metadata,
+                    ("branch_assignment_source",),
+                    "source_branch_id" if source_branch_id is not None else "",
+                ),
+            )
+            or ""
+        )
+        point_index_value = _read(point, ("point_index",), _MISSING)
+        exact_point_index = (
+            None if point_index_value is _MISSING else _exact_integer(point_index_value)
+        )
+        source_index = (
+            exact_point_index
+            if exact_point_index is not None and exact_point_index >= 0
+            else source_row_index
+        )
+        point_index = int(source_index if source_index >= 0 else row_order)
+        branch = source_branch_id
+        branch_source = original_branch_source
+        if (branch is None or branch == -1) and point_index in fit_assignments:
+            branch = fit_assignments[point_index]
+            branch_source = "ellipse_fit.branch_assignment"
+        row = {
+            "point_index": int(point_index),
+            "qx": qx,
+            "qy": qy,
+            "q": q,
+            "angle_deg": float(angle),
+            "q_unit": unit,
+            "branch_id": branch,
+            "branch_id_source": branch_source or None,
+            "source_branch_id": source_branch_id,
+            "source_branch_id_source": original_branch_source or None,
+            "branch_assignment_source": _read(
+                point,
+                ("branch_assignment_source",),
+                _read(metadata, ("branch_assignment_source",), None),
+            ),
+            "source": f"{source_name}.{collection_name}",
+            "status": status,
+            "reason": str(
+                _read(point, ("reason",), _read(metadata, ("reason",), "")) or ""
+            ),
+            "valid": True,
+            "accepted": True,
+        }
+        for name in ("coverage", "support", "localization_sigma_q", "normal_fwhm_q"):
+            value = _finite(
+                _read(point, (name,), _read(metadata, (name,), _MISSING))
+            )
+            if value is not None:
+                row[name] = value
+        result.append(row)
+    return result
 
 
 def _parameter_value(value: Any) -> tuple[float | None, bool, str]:
@@ -696,8 +953,9 @@ def _period_record(
     *,
     candidate_value: float | None = None,
     interval: Any = None,
+    branch_id: int | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "name": str(name),
         "value": None if value is None else float(value),
         "unit": str(unit),
@@ -711,3 +969,6 @@ def _period_record(
             else {}
         ),
     }
+    if branch_id is not None:
+        result["branch_id"] = int(branch_id)
+    return result
