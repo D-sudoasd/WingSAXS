@@ -379,6 +379,16 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="科研图中栅格内容的分辨率（默认 600 dpi）")
     _add_refinement_options(analyze_parser)
 
+    package_parser = sub.add_parser("package", help="汇总已有批次的数据和图，无需重新拟合或绘图")
+    package_parser.add_argument("output_dir", help="单批次输出或包含各样品输出的父目录")
+    package_parser.add_argument("--resume", action="store_true", help="续做交付；复用未改变的 ZIP")
+    package_parser.add_argument("--force", action="store_true", help="重建已生成的交付索引和 ZIP")
+    package_parser.add_argument("--no-archive", "--no-archives", action="store_true", help="只建立导航；明确跳过 ZIP")
+
+    delivery_check = sub.add_parser("verify-delivery", help="只读核对所选结项回执的当前文件绑定，不改写历史或科学状态")
+    delivery_check.add_argument("receipt", help="包含顶层 bindings 列表的现有结项 JSON")
+    delivery_check.add_argument("--root", help="绑定相对路径的输出根目录；默认回执所在目录")
+
     batch_parser = sub.add_parser("batch", help="批量分析原位序列")
     batch_parser.add_argument("inputs", nargs="*", help="输入图像或通配符")
     batch_parser.add_argument("-c", "--config", help="TOML 项目配置（可提供 inputs.files）")
@@ -394,6 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--mode", choices=("independent", "warm_start"), help="序列拟合模式")
     batch_parser.add_argument("--manifest", help="JSON/CSV 帧清单（含 time/frame_id 等元数据）")
     batch_parser.add_argument("--checkpoint", help="批量检查点 JSON 路径")
+    batch_parser.add_argument("--package", action="store_true", help="导出后继续生成可浏览导航和交付 ZIP；交付失败可单独续做")
     batch_parser.add_argument("--resume", action="store_true", help="从已有检查点恢复")
     batch_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
     batch_parser.add_argument(
@@ -1089,6 +1100,30 @@ def _handle_batch(args: argparse.Namespace) -> int:
                            if (reason := _quality_warning_reason(frame.result)) is not None), None)
     exit_code = 1 if (run.failures or run.cancelled or warning_reason or report["n_warning"] or
                       (preflight_summary is not None and preflight_summary["status_color"] != "green")) else 0
+    if args.package:
+        from .delivery import package_batch
+
+        try:
+            delivery = package_batch(
+                output_dir, resume=resume, force=bool(args.force),
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            report["delivery"] = {key: delivery[key] for key in (
+                "status", "operation_status", "counts", "archive", "outputs", "next_action"
+            )}
+            if delivery["exit_code"]:
+                exit_code = 1
+        except (OSError, ValueError) as exc:
+            # The fit and its native exports have already completed. A ZIP or
+            # index fault must not misreport them as a crashed analysis, nor
+            # require rerunning it just to finish delivery.
+            report["delivery"] = {
+                "operation_status": "incomplete", "error": str(exc),
+                "next_command": ["bsaxs", "package", str(output_dir), "--resume"],
+            }
+            print(f"Analysis exports saved; delivery incomplete: {exc}. "
+                  "Use the reported package command to finish without refitting.", file=sys.stderr)
+            exit_code = 1
     report = annotate_report(report, command="batch", exit_code=exit_code,
                              quality_gate_reason=warning_reason)
     _print_json(report)
@@ -1375,6 +1410,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_inspect(args)
         if command == "analyze":
             return _handle_analyze(args)
+        if command == "package":
+            from .delivery import package_batch
+
+            report = package_batch(
+                args.output_dir, archive=not args.no_archive, resume=args.resume, force=args.force,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            _print_json(report)
+            return report["exit_code"]
+        if command == "verify-delivery":
+            from .delivery_bindings import verify_delivery_bindings
+
+            report = verify_delivery_bindings(Path(args.receipt), root=Path(args.root) if args.root else None)
+            _print_json(report)
+            return report["exit_code"]
         if command == "batch":
             return _handle_batch(args)
         if command == "synthetic":

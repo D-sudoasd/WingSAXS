@@ -1,0 +1,169 @@
+--- a/scripts/finalize_minimal_delivery.py
++++ b/scripts/finalize_minimal_delivery.py
+@@ -30,3 +30,2 @@
+     BundleError,
+-    _check_archive_relative_links,
+     _figure_support_files,
+@@ -34,2 +33,6 @@
+     stable_sha256,
++)
++
++from butterfly_saxs.delivery_pairs import (  # noqa: E402
++    check_archive_pair, check_planned_pair, plan_image_members, reuse_image_archive,
+ )
+@@ -1246,49 +1249,37 @@
+ 
+-def _check_sample_relative_links(
+-    data_zip: Path,
+-    sample: Path,
+-    figure_members: list[Path],
+-) -> None:
+-    available: set[str] = set()
+-    html_members: list[tuple[str, str]] = []
+-    sample_id = sample.name
+-    with zipfile.ZipFile(data_zip, "r") as archive:
+-        for name in archive.namelist():
+-            if name.endswith("/"):
+-                continue
+-            normalized = PurePosixPath(name).as_posix()
+-            if PurePosixPath(normalized).parts[0] != sample_id:
+-                continue
+-            available.add(normalized)
+-            if normalized.casefold().endswith((".html", ".htm")):
+-                try:
+-                    html_members.append((normalized, archive.read(name).decode("utf-8")))
+-                except UnicodeDecodeError as exc:
+-                    raise DeliveryError(f"data ZIP HTML is not UTF-8: {name}") from exc
+-    for path in figure_members:
+-        relative = path.relative_to(sample).as_posix()
+-        normalized = PurePosixPath(sample_id, relative).as_posix()
+-        available.add(normalized)
+-        if normalized.casefold().endswith((".html", ".htm")):
+-            try:
+-                html_members.append((normalized, path.read_text(encoding="utf-8")))
+-            except UnicodeDecodeError as exc:
+-                raise DeliveryError(f"image package HTML is not UTF-8: {path}") from exc
+-    link_pattern = re.compile(r"(?:href|src)=[\"']([^\"']+)[\"']", re.IGNORECASE)
+-    missing: list[str] = []
+-    for page, content in html_members:
+-        page_path = PurePosixPath(page)
+-        for raw in link_pattern.findall(content):
+-            target = raw.split("#", 1)[0].split("?", 1)[0]
+-            if not target or target.startswith(("http:", "https:", "mailto:", "data:", "javascript:")):
+-                continue
+-            resolved = PurePosixPath(os.path.normpath(str(page_path.parent / target)).replace("\\", "/"))
+-            if resolved.is_absolute() or ".." in resolved.parts:
+-                missing.append(f"{page} -> {target} (escapes sample)")
+-                continue
+-            candidate = resolved.as_posix()
+-            if candidate not in available:
+-                missing.append(f"{page} -> {target}")
+-    if missing:
+-        raise DeliveryError(f"paired data/image relative-link preflight failed: {missing[:8]}")
++def _bound_image_records(sample: Path, manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
++    records = list(manifest.get("artifacts", []))
++    # This transient binding is never written into its own source manifest.
++    if not any(row.get("path") == "bundle_manifest.json" for row in records):
++        path = sample / "bundle_manifest.json"
++        records.append({"path": "bundle_manifest.json", "sha256": sha256_file(path),
++                        "size_bytes": path.stat().st_size})
++    return records
++
++
++def _prepare_image_archive_members(data_zip: Path, sample: Path, manifest: Mapping[str, Any],
++                                   member_paths: list[Path] | None = None) -> list[Path]:
++    initial = member_paths if member_paths is not None else _image_archive_members(sample, manifest)
++    plan = plan_image_members(sample, [path.relative_to(sample).as_posix() for path in initial],
++                              _bound_image_records(sample, manifest), data_zip=data_zip)
++    if plan["status"] != "ready":
++        raise DeliveryError(f"registered IMAGE member plan failed: {plan['issues'][:8]}")
++    members = [sample / row["path"] for row in plan["members"]]
++    _check_sample_relative_links(data_zip, sample, members)
++    return members
++
++
++def _check_image_archive_links(data_zip: Path, image_zip: Path, sample_id: str) -> dict[str, Any]:
++    report = check_archive_pair(data_zip, image_zip, sample_id=sample_id)
++    if report["status"] != "ready":
++        raise DeliveryError(f"effective paired archive links failed: {report['issues'][:8]}")
++    return report
++
++
++def _check_sample_relative_links(data_zip: Path, sample: Path,
++                                 figure_members: list[Path]) -> None:
++    report = check_planned_pair(data_zip, sample,
++                                [path.relative_to(sample).as_posix() for path in figure_members])
++    if report["status"] != "ready":
++        raise DeliveryError(f"effective paired archive links failed: {report['issues'][:8]}")
+ 
+@@ -1311,2 +1302,11 @@
+     }
++    if archive_path.exists():
++        bound = {str(row["path"]): row for row in _bound_image_records(sample, manifest)}
++        expected = [bound.get(path.relative_to(sample).as_posix(),
++                              {"path": path.relative_to(sample).as_posix()}) for path in ordered]
++        reused = reuse_image_archive(sample, archive_path, expected)
++        if reused["status"] != "reused":
++            raise DeliveryError(f"existing immutable IMAGE archive does not match: {reused['issues'][:8]}")
++        return reused
++
+     archive_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -1629,7 +1629,4 @@
+         manifest = _read_json(sample / "bundle_manifest.json")
+-        member_paths = _image_archive_members(sample, manifest)
+-        _check_sample_relative_links(
+-            Path(data_archives[sample_id]["path"]),
+-            sample,
+-            member_paths,
++        member_paths = _prepare_image_archive_members(
++            Path(data_archives[sample_id]["path"]), sample, manifest,
+         )
+@@ -1656,3 +1653,3 @@
+         )
+-        _check_archive_relative_links(Path(data_archives[sample_id]["path"]), image_archive)
++        _check_image_archive_links(Path(data_archives[sample_id]["path"]), image_archive, sample_id)
+         image_archives[sample_id]["paired_relative_links_verified"] = True
+--- a/scripts/revise_run03_current_delivery.py
++++ b/scripts/revise_run03_current_delivery.py
+@@ -99,26 +99,12 @@
+ def effective_pair_links(data_path, image_path=None, overrides=None):
+-    # Real extraction order: images overlay old DATA navigation of the same name.
+-    members = {}
+-    for path in [p for p in (data_path, image_path) if p is not None]:
+-        with zipfile.ZipFile(path) as z:
+-            for name in z.namelist():
+-                if name.endswith("/"):
+-                    continue
+-                members[name] = z.read(name).decode("utf-8") if name.lower().endswith((".html", ".htm")) else None
+-    for p in overrides or []:
+-        name = SAMPLE.name + "/" + p.relative_to(SAMPLE).as_posix()
+-        members[name] = p.read_text(encoding="utf-8") if name.lower().endswith((".html", ".htm")) else None
+-    missing = []
+-    for name, text in members.items():
+-        if text is None:
+-            continue
+-        for raw in re.findall(r'(?:href|src)=["\x27]([^"\x27]+)', text):
+-            target = html.unescape(raw).split("#", 1)[0].split("?", 1)[0]
+-            if not target or target.startswith(("http:", "https:", "mailto:", "data:", "javascript:")):
+-                continue
+-            resolved = os.path.normpath(str(Path(name).parent / target)).replace("\\", "/")
+-            if resolved not in members:
+-                missing.append(name + " -> " + target)
+-    assert not missing, "effective paired archive links unresolved: " + str(missing[:12])
+-    return len(members)
++    if image_path is not None and overrides:
++        raise ValueError("provide an IMAGE archive or local IMAGE members, not both")
++    if image_path is not None:
++        report = helper._check_image_archive_links(Path(data_path), Path(image_path), SAMPLE.name)
++    else:
++        report = helper.check_planned_pair(Path(data_path), SAMPLE,
++                    [p.relative_to(SAMPLE).as_posix() for p in overrides or []])
++        if report["status"] != "ready":
++            raise helper.DeliveryError(f"effective paired archive links failed: {report['issues'][:8]}")
++    return report["effective_member_count"]
+ 
+@@ -230,3 +216,3 @@
+     data_zip = Path(receipts["data_archives"]["archives"][SAMPLE.name]["path"])
+-    effective_pair_links(data_zip, overrides=members)
++    members = helper._prepare_image_archive_members(data_zip, SAMPLE, manifest, member_paths=members)
+     result = helper._write_image_zip(SAMPLE, manifest, archive, member_paths=members)

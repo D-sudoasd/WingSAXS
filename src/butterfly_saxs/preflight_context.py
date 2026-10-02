@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import csv
 import glob as glob_module
+import io
 import json
 import math
 from pathlib import Path
@@ -13,6 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .batch import FrameRef, natural_sort_key
+from .csv_utils import read_csv_rows
 
 
 MANIFEST_KEYS = ("frames", "frame_manifest", "manifest", "data", "items")
@@ -163,14 +165,14 @@ def parse_manifest_file(path: Path, *, error_type: type[Exception] = ValueError)
     try:
         if suffix == ".csv":
             text = raw.decode("utf-8-sig")
-            return list(csv.DictReader(text.splitlines()))
+            return read_csv_rows(io.StringIO(text, newline=""))
         if suffix == ".json":
             return json.loads(raw.decode("utf-8-sig"))
         if suffix == ".toml":
             import tomllib
 
             return tomllib.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeError, json.JSONDecodeError, ValueError, csv.Error) as exc:
         raise error_type(f"could not parse manifest {path}: {exc}") from exc
     except ImportError as exc:  # pragma: no cover - tomllib is stdlib on supported Python
         raise error_type("TOML manifest requires Python 3.11 or newer") from exc

@@ -1193,87 +1193,53 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
+    from .visualization import _parameter_evolution_label, plot_parameter_evolution
 
-    series: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
-    for index, item in enumerate(results):
-        x_value = item.frame.time
-        try:
-            x = float(x_value) if x_value is not None else float(index)
-        except (TypeError, ValueError):
-            x = float(index)
-        if not math.isfinite(x):
-            x = float(index)
-        for parameter in _parameters(item.result):
+    # One quantity/unit per panel avoids assigning generic length/intensity
+    # units to ratios, angles or unlike quantities. Keep every frame, including
+    # missing values, so the visual sequence agrees with the CSV frame index.
+    parameter_rows = [_parameters(item.result) for item in results]
+    keys = list(dict.fromkeys(
+        (parameter["parameter"], str(parameter.get("unit") or "").strip())
+        for parameters in parameter_rows for parameter in parameters
+    ))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not keys:
+        fig, axis = plt.subplots(figsize=(9, 5), constrained_layout=True)
+        axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
+        axis.set_axis_off()
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        return path
+    aliases = {key: f"quantity_{index}" for index, key in enumerate(keys)}
+    labels, units = {}, {}
+    for (name, unit), alias in aliases.items():
+        explicit_units = {name: unit} if unit else None
+        rendered = _parameter_evolution_label(name, parameter_units=explicit_units)
+        labels[alias], units[alias] = rendered.rsplit(" (", 1)
+        units[alias] = units[alias].removesuffix(")")
+    rows = []
+    has_time = any(item.frame.time is not None for item in results)
+    for index, (item, parameters) in enumerate(zip(results, parameter_rows)):
+        row = {"frame_index": index, "time": item.frame.time, "status": item.status}
+        for parameter in parameters:
+            key = (parameter["parameter"], str(parameter.get("unit") or "").strip())
+            alias = aliases[key]
             value = parameter.get("value")
             if value in (None, ""):
                 value = parameter.get("candidate_value")
-            try:
-                y = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(y):
-                unit = parameter.get("unit")
-                unit_key = str(unit).strip() if unit not in (None, "") else None
-                series.setdefault((parameter["parameter"], unit_key), []).append(
-                    {
-                        "frame_index": index,
-                        "x": x,
-                        "y": y,
-                        "publication_status": parameter.get("publication_status", "not_assessed"),
-                    }
-                )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    groups: dict[str, list[tuple[str, str | None]]] = {}
-    for key in series:
-        name, unit = key
-        # Parameters without a declared unit are kept on separate panels: a
-        # missing unit is not evidence that two quantities are commensurate.
-        group = unit if unit is not None else f"__unknown__:{name}"
-        groups.setdefault(group, []).append(key)
-    panel_count = max(1, len(groups))
-    fig, axes = plt.subplots(
-        nrows=panel_count,
-        ncols=1,
-        figsize=(9, max(5, 3.2 * panel_count)),
-        squeeze=False,
-        constrained_layout=True,
+            row[alias] = value
+            row[f"{alias}_stderr"] = parameter.get("stderr")
+            state = item.status
+            if parameter.get("publication_status") != "available":
+                state = "candidate" if state == "ok" else f"{state}; candidate"
+            row[f"{alias}_status"] = state
+        rows.append(row)
+    # FrameRef.time has no declared universal time unit; never assume seconds.
+    fig = plot_parameter_evolution(
+        rows, parameters=list(aliases.values()), x_key="time" if has_time else "frame_index",
+        parameter_labels=labels, parameter_units=units, output=path, dpi=160,
     )
-    axes_flat = list(axes[:, 0])
-    if series:
-        x_label = "time" if any(item.frame.time is not None for item in results) else "frame"
-        for axis, (group, keys) in zip(axes_flat, groups.items()):
-            for name, unit in keys:
-                points = series[(name, unit)]
-                points.sort(key=lambda point: point["frame_index"])
-                color = axis._get_lines.get_next_color()
-                axis.plot([], [], color=color, linestyle="None", marker="o", label=name)
-                assessed = [point for point in points if point["publication_status"] == "available"]
-                candidates = [point for point in points if point["publication_status"] != "available"]
-                if assessed:
-                    axis.scatter(
-                        [point["x"] for point in assessed],
-                        [point["y"] for point in assessed],
-                        marker="o",
-                        color=color,
-                    )
-                if candidates:
-                    axis.scatter(
-                        [point["x"] for point in candidates],
-                        [point["y"] for point in candidates],
-                        marker="x",
-                        color=color,
-                        label=f"{name} candidate only",
-                    )
-            unit_label = group if not group.startswith("__unknown__:") else "unit unspecified"
-            axis.set_ylabel(f"parameter value ({unit_label})")
-            axis.legend(loc="best", fontsize="small")
-            axis.set_xlabel(x_label)
-            axis.grid(True, alpha=0.25)
-    else:
-        axis = axes_flat[0]
-        axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
-        axis.set_axis_off()
-    fig.savefig(path, dpi=160)
     plt.close(fig)
     return path
 

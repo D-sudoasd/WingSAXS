@@ -121,6 +121,9 @@ bsaxs preflight data/package --manifest manifest.csv \
 
 For an unattended package run, use `bsaxs batch "data/package/images/*.edf" --unattended data/package --manifest data/package/manifest.csv --poni data/package/geometry.poni --mask data/package/mask.npy -o results/unattended_001`. This performs preflight before fitting, writes a checkpoint and streams batch evidence. A red preflight blocks fitting; warnings or failed frames return a nonzero exit status. Keep the output outside the raw package and use `--resume` with the same inputs and settings after interruption.
 
+Finish existing batch exports without fitting or drawing again: `bsaxs package results/all_samples` creates a browsable sample/data/figure index and ZIP. Use `--resume` to finish an interrupted delivery or reuse an unchanged archive, `--no-archive` for navigation only, or add `--package` to a new `bsaxs batch` run to continue through delivery automatically. Original warnings and missing outputs stay visible. [Batch delivery guide](docs/batch_delivery_zh.md)
+
+
 `bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_WingSAXS.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
 
 Agents (and any non-interactive operator) should start with `bsaxs describe` or a bare `bsaxs`. That prints a JSON catalog of commands, exit codes, and scientific invariants. Environment checks: `bsaxs doctor --json` (same as `bsaxs-doctor`). Failed commands emit a JSON error envelope on stdout and a human `错误：` line on stderr. See [AGENTS.md](AGENTS.md).

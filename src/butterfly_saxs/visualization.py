@@ -216,6 +216,81 @@ def plot_fit_diagnostics(
         fig.savefig(target, **save_kwargs)
     return fig
 
+# These labels describe the recorded quantities, not an inferred 3D structure.
+# q-coordinate units must be supplied explicitly; they cannot be inferred from
+# the magnitude of an ellipse radius or a radial peak.
+_EVOLUTION_QUANTITIES = {
+    "a": ("Ellipse semi-major axis a", None),
+    "b": ("Ellipse semi-minor axis b", None),
+    "axis_ratio": ("Axis ratio b/a", "dimensionless"),
+    "ellipticity": ("Ellipticity", "dimensionless"),
+    "eccentricity": ("Eccentricity", "dimensionless"),
+    "theta": ("Apparent ellipse axis tilt", "rad"),
+    "theta_deg": ("Apparent ellipse axis tilt", "deg"),
+    "reference_axis_deg": ("Reference axis angle", "deg"),
+    "lobe_angle": ("Lobe angle", "rad"),
+    "lobe_angle_deg": ("Lobe angle", "deg"),
+    "angular_width": ("Angular width", "rad"),
+    "angular_width_deg": ("Angular width", "deg"),
+    "radial_sigma": ("Radial Gaussian width", None),
+    "radial_gamma": ("Radial Lorentzian width", None),
+    "q_star": ("Radial peak q*", None),
+    "q_star_nm_inv": ("Radial peak q*", "nm^-1"),
+    "q_star_Ainv": ("Radial peak q*", "Å^-1"),
+    "q_star_from_arcs": ("Observed-arc radius q*", None),
+    "Ln_nm": ("Radial peak spacing 2π/q*", "nm"),
+    "Ln_from_minor_axis_nm": ("Conditional minor-axis spacing Ln", "nm"),
+    "Lz_from_draw_axis_nm": ("Conditional draw-axis spacing Lz", "nm"),
+    "Ln_candidate_from_minor_axis_nm": ("Candidate minor-axis spacing Ln", "nm"),
+    "Lz_candidate_from_draw_axis_nm": ("Candidate draw-axis spacing Lz", "nm"),
+    "L_candidate_from_major_axis_nm": ("Candidate major-axis spacing", "nm"),
+    "L_from_observed_radius_nm": ("Observed-radius spacing 2π/q*", "nm"),
+}
+
+
+def _evolution_number(value: Any) -> float:
+    """Read one finite scalar without inventing a value for unavailable data."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float("nan")
+    return number if np.isfinite(number) else float("nan")
+
+
+def _parameter_evolution_x(
+    rows: Sequence[Mapping[str, Any]], x_key: str,
+) -> tuple[np.ndarray, str]:
+    """Use one coordinate system for the entire series, in original row order."""
+
+    values = np.asarray([_evolution_number(row.get(x_key)) for row in rows])
+    if len(rows) and np.all(np.isfinite(values)):
+        label = {"time_s": "Time (s)", "frame_index": "Frame index"}.get(
+            x_key, x_key.replace("_", " ")
+        )
+        return values, label
+    source = "time" if x_key == "time_s" else x_key.replace("_", " ")
+    return np.arange(len(rows), dtype=float), (
+        f"Frame index (0-based row order; {source} incomplete)"
+    )
+
+
+def _parameter_evolution_label(
+    name: str,
+    parameter_labels: Mapping[str, str] | None = None,
+    parameter_units: Mapping[str, str | None] | None = None,
+) -> str:
+    """Label documented quantities; never assume a physical q/intensity unit."""
+
+    label, unit = _EVOLUTION_QUANTITIES.get(name, (name.replace("_", " "), None))
+    if parameter_labels is not None and name in parameter_labels:
+        label = parameter_labels[name]
+    if parameter_units is not None and name in parameter_units:
+        unit = parameter_units[name]
+    suffix = str(unit).strip() if unit is not None else ""
+    return f"{label} ({suffix or 'unit unspecified'})"
+
+
 def plot_parameter_evolution(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -223,69 +298,110 @@ def plot_parameter_evolution(
     x_key: str = "time_s",
     output: str | Path | None = None,
     dpi: int = 300,
+    parameter_labels: Mapping[str, str] | None = None,
+    parameter_units: Mapping[str, str | None] | None = None,
 ) -> Any:
-    """Plot fitted parameters without hiding failed frames or missing values."""
+    """Plot recorded estimates, statuses, gaps and available standard errors.
+
+    Finite values are retained even for warning or failed fits; their status is
+    shown by separate markers. A ``<parameter>_status`` field takes precedence
+    over the row's ``status`` so parameter-specific candidates remain visible.
+    Missing values break the connecting line and
+    appear as ticks in an axes-relative bottom strip, never as measured zeros.
+    Only finite, nonnegative reported standard errors produce error bars. If
+    any requested x coordinate is unavailable, *all* points use zero-based row
+    order rather than mixing time and frame numbers. Rows are never sorted.
+
+    ``parameter_labels`` and ``parameter_units`` optionally describe quantities
+    known by the caller. They change labels only, with no unit conversion.
+    Undeclared units remain unspecified, except for documented quantities with
+    explicit units (e.g. ``theta_deg`` and ``Ln_nm``) and dimensionless ratios.
+    The returned Matplotlib Figure is owned by the caller.
+    """
 
     import matplotlib.pyplot as plt
 
     if not parameters:
         raise ValueError("parameters 不能为空")
-    x_values: list[float] = []
-    for index, row in enumerate(rows):
-        raw = row.get(x_key)
-        try:
-            x = float(raw) if raw is not None else float(index)
-        except (TypeError, ValueError):
-            x = float(index)
-        x_values.append(x)
+    x, x_label = _parameter_evolution_x(rows, x_key)
+    # These are display categories only; "available" is not scientific acceptance.
+    ordinary_estimate_statuses = {"ok", "success", "available"}
+    failed_statuses = {"failed", "failure", "error", "bad_fit", "cancelled", "canceled"}
 
-    fig, axes = plt.subplots(len(parameters), 1, figsize=(7.0, max(2.2, 2.1 * len(parameters))), sharex=True, constrained_layout=True)
+    fig, axes = plt.subplots(
+        len(parameters), 1,
+        figsize=(7.8, max(2.8, 2.7 * len(parameters))),
+        sharex=True, constrained_layout=True,
+    )
     axes_arr = np.atleast_1d(axes)
     for ax, name in zip(axes_arr, parameters):
-        y = np.full(len(rows), np.nan, dtype=float)
+        statuses = np.asarray([
+            str(row.get(f"{name}_status", row.get("status")) or "unspecified")
+            .strip().lower() or "unspecified"
+            for row in rows
+        ], dtype=object)
+        status_order = list(dict.fromkeys(statuses))
+        y = np.asarray([_evolution_number(row.get(name)) for row in rows])
         err = np.full(len(rows), np.nan, dtype=float)
-        failed_x: list[float] = []
         for i, row in enumerate(rows):
-            status = str(row.get("status", "ok"))
-            value = row.get(name)
-            if status not in {"ok", "success", "partial", "recovered"}:
-                failed_x.append(x_values[i])
-                continue
-            try:
-                y[i] = float(value)
-            except (TypeError, ValueError):
-                continue
             for key in (f"{name}_stderr", f"stderr_{name}"):
-                if row.get(key) is not None:
-                    try:
-                        err[i] = float(row[key])
-                    except (TypeError, ValueError):
-                        pass
+                candidate = _evolution_number(row.get(key))
+                if np.isfinite(candidate) and candidate >= 0:
+                    err[i] = candidate
                     break
-        ok = np.isfinite(y)
-        if np.any(ok):
-            yerr = np.where(np.isfinite(err[ok]), err[ok], 0.0)
+        finite = np.isfinite(y)
+        if np.any(finite):
+            # Keep NaNs in place: compressing to finite points joins gaps.
+            ax.plot(x, y, color="#8A8A8A", lw=1.0, zorder=1, label="_sequence")
+        for status in status_order:
+            selected = statuses == status
+            if status in ordinary_estimate_statuses:
+                color, marker = OKABE_ITO["data"], "o"
+            elif status in failed_statuses:
+                color, marker = OKABE_ITO["failed"], "x"
+            else:
+                color, marker = OKABE_ITO["ellipse_b"], "^"
+            status_label = status.replace("_", " ")
+            estimates = selected & finite
+            if np.any(estimates):
+                ax.scatter(
+                    x[estimates], y[estimates], color=color, marker=marker,
+                    s=25, linewidths=1.1, zorder=3,
+                    label=f"Estimate ({status_label})",
+                )
+            missing = selected & ~finite
+            if np.any(missing):
+                ax.scatter(
+                    x[missing], np.full(np.count_nonzero(missing), 0.025),
+                    transform=ax.get_xaxis_transform(), marker="|", color=color,
+                    s=70, linewidths=1.4, zorder=3,
+                    label=f"No finite estimate ({status_label})",
+                )
+        known_error = finite & np.isfinite(err)
+        if np.any(known_error):
+            # Missing/invalid errors are omitted, not replaced with zero.
             ax.errorbar(
-                np.asarray(x_values)[ok],
-                y[ok],
-                yerr=yerr,
-                color=OKABE_ITO["data"],
-                marker="o",
-                ms=3.5,
-                lw=1.2,
-                capsize=2,
-                label="Fit (error bar = stderr when available)",
+                x[known_error], y[known_error], yerr=err[known_error], fmt="none",
+                ecolor="#666666", elinewidth=1.0, capsize=2, zorder=2,
+                label="Reported standard error",
             )
-        if failed_x:
-            bottom, top = ax.get_ylim()
-            marker_y = bottom + 0.04 * (top - bottom if top > bottom else 1.0)
-            ax.scatter(failed_x, np.full(len(failed_x), marker_y), marker="x", color=OKABE_ITO["failed"], s=22, label="Failed/missing")
-        ax.set_ylabel(name)
+        if not np.any(finite):
+            ax.text(
+                0.5, 0.5, "No finite estimates" if len(rows) else "No frames",
+                transform=ax.transAxes, ha="center", va="center", color="#666666",
+            )
+        ax.set_ylabel(_parameter_evolution_label(name, parameter_labels, parameter_units))
         ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(axis="y", alpha=0.18)
+        ax.margins(x=0.05, y=0.15)
         handles, _ = ax.get_legend_handles_labels()
         if handles:
             ax.legend(frameon=False, fontsize=7, loc="best")
-    axes_arr[-1].set_xlabel("Time (s)" if x_key == "time_s" else x_key)
+    axes_arr[-1].set_xlabel(x_label)
+    if x_label.startswith("Frame index"):
+        from matplotlib.ticker import MaxNLocator
+
+        axes_arr[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
     if output is not None:
         target = Path(output)
         target.parent.mkdir(parents=True, exist_ok=True)

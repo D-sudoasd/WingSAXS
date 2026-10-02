@@ -286,6 +286,18 @@ def agent_manifest() -> dict[str, Any]:
         ],
         "commands": [
             {
+                "name": "package",
+                "purpose": "Index/ZIP existing batch exports or a sample parent directory; --resume reuses unchanged archives without fitting or drawing.",
+                "stdout": "wingsaxs.delivery.v1",
+                "exit_codes": {"0": "Delivery completed.", "1": "Delivery completed with retained warnings or missing outputs; open its index.", "2": EXIT_CODES["2"]},
+            },
+            {
+                "name": "verify-delivery",
+                "purpose": "Read-only freshness check of the explicitly selected closeout receipt's top-level bindings; no historical recursion or scientific acceptance.",
+                "stdout": "wingsaxs.delivery-bindings.v1",
+                "exit_codes": {"0": "Selected bindings match current files.", "1": "A named file is missing, stale or changed during reading.", "2": EXIT_CODES["2"]},
+            },
+            {
                 "name": "describe",
                 "purpose": "Print this machine-readable catalog.",
                 "stdout": AGENT_MANIFEST_SCHEMA,
