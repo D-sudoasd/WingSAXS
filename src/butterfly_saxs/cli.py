@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from pathlib import Path
 import os
 import sys
+import tomllib
 from typing import Any, Sequence
 
 from .cancellation import AnalysisCancelled
@@ -96,6 +97,7 @@ def _report_resume_command(
     angular_bins: int,
     formats: Sequence[str],
     dpi: int,
+    lamellar_settings_path: str | os.PathLike[str] | None = None,
 ) -> list[str]:
     command = ["bsaxs", "report", os.fspath(output_dir), "--resume"]
     if radial_bins != 128:
@@ -106,7 +108,61 @@ def _report_resume_command(
         command.extend(("--formats", *(str(value) for value in formats)))
     if dpi != 180:
         command.extend(("--dpi", str(dpi)))
+    if lamellar_settings_path is not None:
+        command.extend(("--lamellar-settings", os.fspath(lamellar_settings_path)))
     return command
+
+
+def _load_lamellar_settings(path: str | os.PathLike[str] | None) -> dict[str, Any] | None:
+    """Load and validate one JSON/TOML lamellar geometry settings mapping."""
+
+    if path is None:
+        return None
+    source = Path(path).expanduser()
+    raw = source.read_text(encoding="utf-8-sig")
+    suffix = source.suffix.lower()
+    try:
+        if suffix == ".json":
+            value = json.loads(raw)
+        elif suffix == ".toml":
+            value = tomllib.loads(raw)
+        elif suffix:
+            raise ValueError("lamellar settings file must use .json or .toml")
+        else:
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError:
+                value = tomllib.loads(raw)
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"invalid lamellar settings file {source}: {exc}") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("lamellar settings file must contain a mapping")
+
+    from .lamellar_models import LamellarSettings
+
+    try:
+        settings_mapping: Mapping[str, Any] = value
+        for key in ("lamellar", "lamellar_settings", "settings"):
+            nested = value.get(key)
+            if isinstance(nested, Mapping):
+                settings_mapping = nested
+                break
+        allowed_fields = set(LamellarSettings().to_dict())
+        unknown_fields = sorted(set(settings_mapping) - allowed_fields)
+        if unknown_fields:
+            supported = ", ".join(sorted(allowed_fields))
+            names = ", ".join(str(name) for name in unknown_fields)
+            raise ValueError(
+                f"unknown lamellar setting(s): {names}; supported fields: {supported}"
+            )
+        # LamellarSettings' general-purpose defaults serve interactive use;
+        # reports deliberately default to ellipse-derived period and multiple
+        # stacks. Merge those report defaults before applying user overrides.
+        normalized = {"mode": "multi", "period_source": "ellipse"}
+        normalized.update(settings_mapping)
+        return LamellarSettings.from_mapping(normalized).to_dict()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid lamellar settings in {source}: {exc}") from exc
 
 
 def _config(value: str | None) -> ProjectConfig | None:
@@ -446,6 +502,10 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="图表格式（可选 png、svg、pdf、tiff；默认 png svg pdf）")
     report_parser.add_argument("--dpi", type=_REPORT_DPI, default=180,
                                 help="栅格图分辨率（默认 180）")
+    report_parser.add_argument(
+        "--lamellar-settings",
+        help="JSON/TOML 片层示意参数；椭圆派生周期和绘制假设可在此设置",
+    )
 
     delivery_check = sub.add_parser("verify-delivery", help="只读核对所选结项回执的当前文件绑定，不改写历史或科学状态")
     delivery_check.add_argument("receipt", help="包含顶层 bindings 列表的现有结项 JSON")
@@ -477,6 +537,10 @@ def build_parser() -> argparse.ArgumentParser:
                                help="--report 的图表格式（默认 png svg pdf）")
     batch_parser.add_argument("--report-dpi", type=_REPORT_DPI, default=180,
                                help="--report 的栅格图分辨率（默认 180）")
+    batch_parser.add_argument(
+        "--report-lamellar-settings",
+        help="--report 使用的 JSON/TOML 片层示意参数；拟合前加载并校验",
+    )
     batch_parser.add_argument("--resume", action="store_true", help="从已有检查点恢复")
     batch_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
     batch_parser.add_argument(
@@ -745,25 +809,32 @@ def _build_analysis_report(
     angular_bins: int = 72,
     formats: Sequence[str] = ("png", "svg", "pdf"),
     dpi: int = 180,
+    lamellar_settings: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Load the optional report pipeline only when a report is requested."""
 
     from .report import build_analysis_report
 
+    options: dict[str, Any] = {
+        "resume": resume,
+        "force": force,
+        "radial_bins": radial_bins,
+        "angular_bins": angular_bins,
+        "formats": tuple(formats),
+        "dpi": dpi,
+        "progress": lambda message: print(message, file=sys.stderr, flush=True),
+    }
+    if lamellar_settings is not None:
+        options["lamellar_settings"] = dict(lamellar_settings)
     return build_analysis_report(
         output_dir,
-        resume=resume,
-        force=force,
-        radial_bins=radial_bins,
-        angular_bins=angular_bins,
-        formats=tuple(formats),
-        dpi=dpi,
-        progress=lambda message: print(message, file=sys.stderr, flush=True),
+        **options,
     )
 
 
 def _handle_report(args: argparse.Namespace) -> int:
     _validate_report_options(args.radial_bins, args.angular_bins)
+    lamellar_settings = _load_lamellar_settings(args.lamellar_settings)
     result = _build_analysis_report(
         args.output_dir,
         resume=args.resume,
@@ -772,12 +843,18 @@ def _handle_report(args: argparse.Namespace) -> int:
         angular_bins=args.angular_bins,
         formats=args.formats,
         dpi=args.dpi,
+        lamellar_settings=lamellar_settings,
     )
     _print_json(result)
     return int(result.get("exit_code", 0))
 
 
 def _handle_batch(args: argparse.Namespace) -> int:
+    if args.report_lamellar_settings and not args.report:
+        raise PipelineError("--report-lamellar-settings requires --report")
+    # Parse and validate geometry before any frame loading or fitting so a
+    # malformed presentation recipe cannot waste a completed batch run.
+    lamellar_settings = _load_lamellar_settings(args.report_lamellar_settings)
     if args.report:
         _validate_report_options(args.report_radial_bins, args.report_angular_bins)
     from . import batch as batch_module
@@ -1223,6 +1300,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
             angular_bins=args.report_angular_bins,
             formats=args.report_formats,
             dpi=args.report_dpi,
+            lamellar_settings_path=args.report_lamellar_settings,
         )
         try:
             report_result = _build_analysis_report(
@@ -1233,6 +1311,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
                 angular_bins=args.report_angular_bins,
                 formats=args.report_formats,
                 dpi=args.report_dpi,
+                lamellar_settings=lamellar_settings,
             )
             status = report_result.get("status", report_result.get("operation_status", "completed"))
             report_summary = {

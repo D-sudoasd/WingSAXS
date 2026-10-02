@@ -111,7 +111,7 @@ def _q_unit_label(scene: Any) -> str:
     value = metadata.get("q_unit") if isinstance(metadata, Mapping) else None
     if value in (None, ""):
         value = _get(scene, "q_unit", None)
-    return str(value or "unknown")
+    return str(value or "unknown").replace("⁻¹", "^-1")
 
 
 def _font() -> FontProperties:

@@ -1,6 +1,6 @@
 # 批次分析报告与数据、图表包
 
-`bsaxs report` 从已有批次导出生成逐帧描述统计、序列图和可浏览报告。它读取批次保存的图像、q 坐标、有效域、拟合记录与 profile 数组，不重新拟合，也不运行 `full2d`。`bsaxs package` 可在此基础上把现有结果、图表和导航页打成 ZIP，供离线查看或交付。
+`bsaxs report` 从已有批次导出生成逐帧描述统计、序列图、片层几何分析和可浏览报告。它读取批次保存的图像、q 坐标、有效域、拟合记录与 profile 数组，不重新拟合，也不运行 `full2d`。`bsaxs package` 可在此基础上把现有结果、图表和导航页打成 ZIP，供离线查看或交付。
 
 ## 对已有批次生成报告
 
@@ -26,13 +26,55 @@ bsaxs report results/sample \
 
 格式也可选 `tiff`。对已有报告运行 `--resume`：如果源文件、设置和报告版本都未改变，就复用已有文件；有变化或文件缺失时重新生成。`--force` 会强制重建报告。
 
-单个批次的报告写入 `results/sample/figures/analysis_report/`。入口为 `index.html`，`report_summary.json` 记录来源状态、分箱设置、逐帧状态、表格和图表路径。`README.json` 说明统计量定义。传入包含多个批次目录的父目录时，每个批次分别生成报告，并在父目录汇总为 `analysis_reports.html`、`analysis_report_summary.json`、`collection_parameters.csv` 和 `collection_measurements.csv`。两个 collection CSV 合并各批次对应的长表，并增加 `sample` 与 `export_prefix` 标识来源；逐帧测量表保留帧索引、帧 ID、运行状态和 q 单位，参数表保留原有帧信息、状态及参数单位。对该父目录运行 `bsaxs package` 时，这些汇总文件、各批次原生结果和 `figures/` 报告文件都会收入 `delivery.zip`。
+## 基于椭圆结果生成片层几何分析
+
+报告默认以已有椭圆拟合结果提供周期尺度，并以已观测 q 方位和支持信息确定片层面内方向。优先使用已接受的脊点方向；没有脊点时使用有效的径向瓣峰，图中分别标示这两类测量，径向峰及其模型比较另存为 `lamellar_radial_peaks.csv`。对观测方向 `β`，报告按对应的拟合分支计算条件方向周期 `2π/R(β)`；椭圆倾角 `theta` 不会被当作片层法向角。`Ln_from_minor_axis = 2π/b` 单独保留为短轴全局参考，不赋给每个观测方向。候选椭圆、边界解、缺失观测和失效帧会保留其原有状态；拟合分支或方向来源不明确时不补造该方向的周期。
+
+无需重新拟合，可以为已有批次重新生成片层报告：
+
+```bash
+bsaxs report results/sample --resume --lamellar-settings results/lamellar.toml
+```
+
+新批次可在分析后直接使用同一组参数生成报告：
+
+```bash
+bsaxs batch "data/sample/*.edf" -o results/sample --report \
+  --report-lamellar-settings results/lamellar.toml
+```
+
+参数文件接受 JSON 或 TOML；`lamellar`、`lamellar_settings`、`settings` 嵌套表均可。例如：
+
+```toml
+[lamellar]
+mode = "multi"
+period_source = "ellipse"
+layer_count = 8
+stack_count = 12
+thickness_ratio = 0.25
+width_ratio = 4.0
+depth_ratio = 4.0
+spread_deg = 0.0
+spacing_jitter_pct = 0.0
+position_jitter_pct = 24.0
+lateral_shift_ratio = 0.0
+out_of_plane_deg = 0.0
+seed = 0
+```
+
+未列出的绘制参数使用 `LamellarSettings` 当前默认值。`thickness_ratio`、`width_ratio`、`depth_ratio`、层数、堆栈数、方向分散和起伏等控制的是几何示意，不是 SAXS 椭圆直接测得的微观厚度、横向尺寸或取向分布。可以在一个设置文件中统一更改这些假设；CLI 会在启动批次拟合前校验该文件。
+
+每帧报告保存片层参数和方向来源到 `lamellar_analysis.json`；能构造出几何场景时，还会保存 `lamellar_geometry.npz`。长表和图展示可用的片层参数、候选状态、方向证据及其随帧变化。输出包括 `lamellar_parameters.csv`、`lamellar_directions.csv`、`lamellar_period_by_angle.csv`、`lamellar_radial_peaks.csv` 和 `lamellar_changes.csv`；样品集合另外生成 `collection_lamellar_parameters.csv`。方向表同时保留实测 q、对应模型 q、条件模型周期和残差。角度采样表中的 `observed_support` 表示该分支存在已保留的实测点，并不表示每个采样角度都被观测。序列图使用各分支实测方向的轴向均值和范围，完整点记录仍保留在逐帧 JSON 和方向表中。报告图片跟随 `--formats` 支持 PNG、SVG、PDF 和 TIFF，并随 `bsaxs package` 加入交付 ZIP。
+
+物理长度需要已有的物理 q 标定。若 q 仍是像素倒数或来源单位未知，片层长度保持相对单位。椭圆和二维观测方向只能约束当前参数化示意的输入，不能唯一重建真实显微形貌或三维片层结构；报告中的片层几何应与实测强度、拟合参数和绘制假设分别解释。
+
+单个批次的报告写入 `results/sample/figures/analysis_report/`。入口为 `index.html`，`report_summary.json` 记录来源状态、分箱设置、逐帧状态、表格和图表路径。`README.json` 说明统计量定义。传入包含多个批次目录的父目录时，每个批次分别生成报告，并在父目录汇总为 `analysis_reports.html`、`analysis_report_summary.json`、`collection_parameters.csv`、`collection_measurements.csv` 和 `collection_lamellar_parameters.csv`。这些 collection CSV 合并各批次对应的长表，并保留 `sample` 与 `export_prefix` 来源标识；逐帧测量表保留帧索引、帧 ID、运行状态和 q 单位，参数表保留原有帧信息、状态及参数单位。对该父目录运行 `bsaxs package` 时，这些汇总文件、各批次原生结果和 `figures/` 报告文件都会收入 `delivery.zip`。
 
 ## 智能体的实际工作顺序
 
 开始前运行 `bsaxs describe`，读取当前 CLI 命令和数据约定；再用 `bsaxs inspect` 检查本次实验的代表图像、PONI、mask 和 q 范围。根据当前数据明确追踪方法与 manifest 元数据；需要限制 q-window 时，在本次命令指定 `--q-window Q_MIN Q_MAX` 或使用本次 TOML 配置。报告分箱设置只控制汇总与绘图，不会替新批次选择实验 q-window，也不会从历史批次复制设置。
 
-之后按完整序列运行 `batch --stream --checkpoint ... --report --package`。先从 `figures/analysis_report/index.html` 查看帧顺序、观测图和序列变化，再按需要检索 CSV 长表及原生 `results.npz`；警告、缺口、覆盖率和候选状态仍对应原批次证据。报告或 ZIP 中断后，按上一节命令单独续做相应交付步骤。
+之后按完整序列运行 `batch --stream --checkpoint ... --report --package`。先从 `figures/analysis_report/index.html` 查看帧顺序、观测图、片层投影与序列变化，再按需要检索 CSV 长表及原生 `results.npz`；警告、缺口、覆盖率和候选状态仍对应原批次证据。报告或 ZIP 中断后，按上一节命令单独续做相应交付步骤。
 
 ## 与序列拟合和最终交付连用
 
@@ -81,6 +123,8 @@ bsaxs package results/sample --resume
 | `ellipse_candidates.csv` | 各椭圆候选解的字段和值 |
 | `array_catalog.csv` | 原生 `results.npz` 中逐帧数组的角色、键名、形状和数据类型 |
 | `normal_profiles.csv` | 已保存法向剖面的逐点 `offset_q`、`raw_intensity`、`fit_intensity` 和 `residual`（原始值减拟合值），按 `profile_index`、`point_id`、`sample_index` 对齐；并保留 `valid`、`model`、`reason`、`snr`、`normal_fwhm_q`、`localization_sigma_q`、`support_fraction`、`uncertainty_source`。无已保存 profile 的帧对应表格无记录 |
+
+片层几何长表另含 `lamellar_parameters.csv`（周期来源与几何参数及状态）、`lamellar_directions.csv`（观测方位和方向支持记录）、`lamellar_period_by_angle.csv`（按角度采样对应椭圆分支的条件周期 `2π/R(β)`，另标注实测方向支持；采样曲线属于拟合模型）和 `lamellar_changes.csv`（可比较的序列变化）。`Ln_from_minor_axis = 2π/b` 保留为独立短轴参考；分支匹配不明确时不填方向周期。这些表保留输入参数来源，不将厚度、宽度或深度假设标为拟合测量。
 
 逐帧目录还包含 `measurements.json`、`polar_measurements.npz` 和 `fit_details.json`。它们分别保存该帧统计摘要、二维 q-角度分箱数组和原有拟合详情。如果 `butterfly.profiles` 中保存了逐点法向剖面记录，会生成实测强度与已有局部拟合曲线图；有已保存 profile 残差时，另生成 residual 图。有 point/arc fit diagnostics 时，会生成 `frame####_fit_support` 图，显示脊点残差与距离、定位尺度、弧段残差、端点支持比例和支持计数。报告只绘制实际保存的数据，不为缺少 profile 或诊断的帧构造图。原生数组仍在批次的 `results.npz` 中；`array_catalog.csv` 和报告页面将帧与数组键对应起来。新增的原生 `frame_details.jsonl` 保留逐帧完整标量拟合、候选、观测支持、不确定度诊断及实际 profile 的数组引用。
 

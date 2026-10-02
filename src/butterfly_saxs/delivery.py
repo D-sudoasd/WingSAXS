@@ -42,6 +42,7 @@ _CONTENTS_KEYS = ("schema_version", "status", "counts", "samples", "files", "dep
 _COLLECTION_ARTIFACTS = {
     "analysis_reports": "analysis_reports.html",
     "analysis_report_summary": "analysis_report_summary.json",
+    "collection_lamellar_parameters": "collection_lamellar_parameters.csv",
     "collection_parameters": "collection_parameters.csv",
     "collection_measurements": "collection_measurements.csv",
 }

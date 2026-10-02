@@ -31,6 +31,31 @@ _NATIVE_SINGLE_HINTS = {
     "flags",
 }
 _NATIVE_SCHEMA_PREFIXES = ("lamellarsaxs2d.", "butterflysaxs.")
+_NATIVE_BATCH_SCHEMA_PREFIXES = ("lamellarsaxs2d.batch.", "butterflysaxs.batch.")
+_DETECTOR_ARRAY_FIELDS = frozenset(
+    {
+        "image",
+        "observed",
+        "data",
+        "I",
+        "qx",
+        "qy",
+        "q",
+        "valid_mask",
+        "model",
+        "residual",
+        "model_image",
+        "residual_image",
+        "finite_mask",
+        "fit_valid_mask",
+        "detector_valid_mask",
+        "external_valid_mask",
+        "q_window_mask",
+        "roi_exclusion_mask",
+        "weight_valid_mask",
+        "sampled_valid_mask",
+    }
+)
 
 
 def _native_json_mapping(value: Any) -> bool:
@@ -53,20 +78,30 @@ def _native_json_mapping(value: Any) -> bool:
     )
 
 
-def _native_batch_manifest(path: Path, value: Any, npz_path: Path | None) -> bool:
-    """Recognize the package's legacy batch manifest by its full companion set."""
+def _batch_prefix(path: Path) -> str | None:
+    """Return the native export prefix for a manifest companion name."""
 
-    if (
-        path.name != "manifest.json"
-        or not isinstance(value, Mapping)
-        or not isinstance(value.get("frames"), list)
-    ):
+    suffix = "manifest.json"
+    return path.name[: -len(suffix)] if path.name.endswith(suffix) else None
+
+
+def _native_batch_manifest(path: Path, value: Any, npz_path: Path | None) -> bool:
+    """Recognize a native batch manifest and its same-prefix companions."""
+
+    prefix = _batch_prefix(path)
+    if prefix is None or not isinstance(value, Mapping) or not isinstance(value.get("frames"), list):
         return False
-    if npz_path is None or npz_path.name != "results.npz" or not npz_path.is_file():
+    expected_npz = path.with_name(prefix + "results.npz")
+    if npz_path is None or npz_path != expected_npz or not npz_path.is_file():
         return False
-    ellipse_path = path.parent / "ellipse_fit.json"
-    provenance_path = path.parent / "provenance.json"
-    if not ellipse_path.is_file() or not provenance_path.is_file():
+    ellipse_path = path.with_name(prefix + "ellipse_fit.json")
+    provenance_path = path.with_name(prefix + "provenance.json")
+    if not ellipse_path.is_file():
+        return False
+    schema = str(value.get("schema_version", "") or "").casefold()
+    if schema.startswith(_NATIVE_BATCH_SCHEMA_PREFIXES):
+        return True
+    if not provenance_path.is_file():
         return False
     provenance = value.get("provenance")
     if not isinstance(provenance, Mapping):
@@ -94,6 +129,22 @@ def _npz_keys(path: Path) -> list[str]:
             return list(archive.files)
     except (OSError, ValueError) as exc:
         raise ValueError(f"invalid native NPZ bundle: {path}: {exc}") from exc
+
+
+def _npz_metadata(path: Path) -> dict[str, Any]:
+    """Read only the small native archive receipt, never detector arrays."""
+
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if "__metadata__" not in archive.files:
+                return {}
+            value = np.asarray(archive["__metadata__"])
+            if value.ndim != 0:
+                return {}
+            parsed = json.loads(str(value.item()))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid native NPZ metadata: {path}: {exc}") from exc
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
 def _first_key(keys: Sequence[str], names: Sequence[str]) -> str | None:
@@ -166,7 +217,8 @@ def _batch_npz_sources(
     result: list[dict[str, Any]] = []
     for index, item in enumerate(frames):
         frame = dict(item) if isinstance(item, Mapping) else {"frame_index": index}
-        frame_index = int(_read(frame, ("frame_index", "index"), index) or index)
+        raw_index = _read(frame, ("frame_index", "index"), None)
+        frame_index = index if raw_index is None else int(raw_index)
         prefix = f"frame_{frame_index:04d}__"
         key_map = {
             "observed": _first_key(
@@ -218,13 +270,28 @@ def _batch_npz_sources(
 
 def _resolve_native_pair(path: Path) -> tuple[Path | None, Path | None]:
     if path.is_dir():
-        manifest = path / "manifest.json"
-        if manifest.is_file():
-            npz = path / "results.npz"
-            return manifest, npz if npz.is_file() else None
+        native_batches: list[tuple[Path, Path]] = []
+        for manifest in sorted(path.glob("*manifest.json")):
+            npz = manifest.with_name(_batch_prefix(manifest) + "results.npz")
+            if not npz.is_file():
+                continue
+            try:
+                value = _load_json(manifest)
+            except ValueError:
+                continue
+            if _native_batch_manifest(manifest, value, npz):
+                native_batches.append((manifest, npz))
+        if len(native_batches) > 1:
+            choices = ", ".join(manifest.name for manifest, _ in native_batches)
+            raise ValueError(
+                f"Multiple native batch bundles were found in {path}: {choices}. "
+                "Open one manifest JSON explicitly."
+            )
+        if native_batches:
+            return native_batches[0]
         json_candidates = sorted(path.glob("*.json"))
         for candidate in json_candidates:
-            if candidate.name in {
+            if _batch_prefix(candidate) is not None or candidate.name in {
                 "provenance.json",
                 "frame_summary.json",
                 "ellipse_fit.json",
@@ -236,32 +303,59 @@ def _resolve_native_pair(path: Path) -> tuple[Path | None, Path | None]:
                 return candidate, npz
         return None, None
     if path.suffix.lower() == ".json":
-        npz = path.with_suffix(".npz")
+        prefix = _batch_prefix(path)
+        npz = path.with_name(prefix + "results.npz") if prefix is not None else path.with_suffix(".npz")
         return path, npz if npz.is_file() else None
     if path.suffix.lower() == ".npz":
-        json_path = path.with_suffix(".json")
+        manifest = (
+            path.with_name(path.name[: -len("results.npz")] + "manifest.json")
+            if path.name.endswith("results.npz")
+            else None
+        )
+        same_stem_json = path.with_suffix(".json")
+        json_path = manifest if manifest is not None and manifest.is_file() else same_stem_json
         return json_path if json_path.is_file() else None, path
     return None, None
 
 
-def _merge_batch_measurements(
-    sources: list[dict[str, Any]], manifest_path: Path
-) -> None:
-    """Attach exported lobe/ellipse summaries without touching detector arrays."""
+def _indexed_jsonl(path: Path) -> dict[int, dict[str, Any]]:
+    """Read compact per-frame records without opening any detector arrays."""
 
-    sidecar = manifest_path.parent / "ellipse_fit.json"
-    if not sidecar.is_file():
-        return
+    records: dict[int, dict[str, Any]] = {}
+    if not path.is_file():
+        return records
     try:
-        payload = _load_json(sidecar)
-    except ValueError:
-        return
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, Mapping):
+                    raise ValueError(f"expected a JSON object on line {line_number}")
+                if value.get("frame_index") is None:
+                    continue
+                records[int(value["frame_index"])] = dict(value)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid native frame details: {path}: {exc}") from exc
+    return records
+
+
+def _merge_batch_details(
+    sources: list[dict[str, Any]], manifest_path: Path, *, npz_path: Path | None
+) -> None:
+    """Attach frame details and legacy fit summaries while preserving identity."""
+
+    prefix = _batch_prefix(manifest_path) or ""
+    details = _indexed_jsonl(manifest_path.with_name(prefix + "frame_details.jsonl"))
+    sidecar = manifest_path.with_name(prefix + "ellipse_fit.json")
+    try:
+        payload = _load_json(sidecar) if sidecar.is_file() else {}
+    except ValueError as exc:
+        raise ValueError(f"invalid native ellipse-fit sidecar: {sidecar}: {exc}") from exc
     rows = payload.get("frames") if isinstance(payload, Mapping) else None
-    if not isinstance(rows, list):
-        return
-    by_index = {
-        int(row.get("frame_index")): row
-        for row in rows
+    sidecar_by_index = {
+        int(row["frame_index"]): dict(row)
+        for row in (rows if isinstance(rows, list) else ())
         if isinstance(row, Mapping) and row.get("frame_index") is not None
     }
     for source in sources:
@@ -269,18 +363,98 @@ def _merge_batch_measurements(
             index = int(source.get("frame_index"))
         except (TypeError, ValueError):
             continue
-        row = by_index.get(index)
-        if not row:
+        detail = details.get(index)
+        row = sidecar_by_index.get(index, {})
+        if detail is not None:
+            result = detail.get("result")
+            if isinstance(result, Mapping):
+                source.update(
+                    {
+                        key: value
+                        for key, value in result.items()
+                        if key not in _DETECTOR_ARRAY_FIELDS
+                    }
+                )
+                # Keep the complete compact frame record for consumers that
+                # need to inspect array descriptors or nested fit diagnostics.
+                source["native_result"] = dict(result)
+            # Frame-level execution status and provenance take precedence over
+            # nested result keys with the same name.
+            source.update({key: value for key, value in detail.items() if key != "result"})
+
+        frame = source.pop("_manifest_frame", None)
+        if isinstance(frame, Mapping):
+            for name in ("path", "frame_id", "frame", "dataset", "time", "order", "source"):
+                if name in frame:
+                    source[name] = frame[name]
+            if "metadata" in frame:
+                source["manifest_metadata"] = frame["metadata"]
+                source.setdefault("frame_metadata", frame["metadata"])
+            if "frame" in frame:
+                source.setdefault("frame_selector", frame["frame"])
+            if "dataset" in frame:
+                source.setdefault("dataset_selector", frame["dataset"])
+
+        if row:
+            for name in (
+                "ellipse_fit",
+                "lobe_radial_peaks",
+                "lobe_radial_profiles",
+                "lobe_angular",
+            ):
+                if row.get(name) is not None:
+                    target_name = "lobes" if name == "lobe_angular" else name
+                    source.setdefault(target_name, row[name])
+            if detail is None:
+                for name in ("status", "error", "diagnostic", "elapsed_s"):
+                    if row.get(name) is not None:
+                        source.setdefault(name, row[name])
+
+        settings = source.get("analysis_settings")
+        analysis = source.get("analysis")
+        if isinstance(settings, Mapping):
+            merged_analysis = dict(analysis) if isinstance(analysis, Mapping) else {}
+            merged_analysis.update(settings)
+            source["analysis"] = merged_analysis
+            if settings.get("draw_axis_deg") is not None:
+                source["draw_axis_deg"] = settings["draw_axis_deg"]
+        identity = source.get("source_identity")
+        merged_identity = dict(identity) if isinstance(identity, Mapping) else {}
+        for name in ("path", "frame_id", "frame", "frame_selector", "dataset", "dataset_selector", "time", "timestamp"):
+            if source.get(name) is not None:
+                merged_identity.setdefault(name, source[name])
+        if merged_identity:
+            source["source_identity"] = merged_identity
+
+
+def _with_missing_slots(
+    sources: list[dict[str, Any]], metadata: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Retain missing or not-yet-processed frame positions in the receipt."""
+
+    indices: set[int] = set()
+    try:
+        indices.update(int(index) for index in metadata.get("missing_frames", ()))
+        frame_count = max(0, int(metadata.get("frame_count", len(sources))))
+    except (TypeError, ValueError):
+        frame_count = len(sources)
+    expected_count = max(frame_count, max(indices, default=-1) + 1, len(sources))
+    by_index = {
+        int(source.get("frame_index", position)): source
+        for position, source in enumerate(sources)
+    }
+    for index in range(expected_count):
+        if index in by_index:
             continue
-        for name in (
-            "ellipse_fit",
-            "lobe_radial_peaks",
-            "lobe_radial_profiles",
-            "lobe_angular",
-        ):
-            if row.get(name) is not None:
-                target_name = "lobes" if name == "lobe_angular" else name
-                source.setdefault(target_name, row[name])
+        by_index[index] = {
+            "frame_index": index,
+            "frame_id": "",
+            "status": "not_run" if index in indices or index >= frame_count else "missing",
+            "error": "No frame record was written for this native batch position.",
+            "array_error": "No observed array is available for this frame position.",
+            "array_keys": {},
+        }
+    return [by_index[index] for index in sorted(by_index)]
 
 
 def load_lamellar_sources(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -297,25 +471,23 @@ def load_lamellar_sources(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
     if json_path is None and npz_path is None:
         raise ValueError(f"not a native LamellarSAXS2D result bundle: {target}")
     summary: Any = _load_json(json_path) if json_path is not None else None
+    native_batch = bool(
+        json_path is not None
+        and _native_batch_manifest(json_path, summary, npz_path)
+    )
     if summary is not None and not (
         _native_json_mapping(summary)
-        or _native_batch_manifest(json_path, summary, npz_path)
+        or native_batch
     ):
         raise ValueError(f"JSON is not a recognized native result bundle: {json_path}")
     if isinstance(summary, Mapping) and isinstance(summary.get("frames"), list):
         frames = list(summary["frames"])
-        # Exported batch manifest frames carry selectors; ellipse_fit.json and
-        # project-run records may carry the actual result under ``result``.
-        if json_path is not None and json_path.name == "manifest.json":
-            sources = (
-                _batch_npz_sources(frames, npz_path, json_path.parent)
-                if npz_path is not None
-                else [dict(frame) for frame in frames]
-            )
-            if npz_path is None:
-                for source in sources:
-                    source.setdefault("array_path", None)
-            _merge_batch_measurements(sources, json_path)
+        if native_batch and json_path is not None and npz_path is not None:
+            sources = _batch_npz_sources(frames, npz_path, json_path.parent)
+            for source, frame in zip(sources, frames, strict=True):
+                source["_manifest_frame"] = frame
+            _merge_batch_details(sources, json_path, npz_path=npz_path)
+            sources = _with_missing_slots(sources, _npz_metadata(npz_path))
             return [
                 _normalise_loaded_source(source, json_path.parent) for source in sources
             ]

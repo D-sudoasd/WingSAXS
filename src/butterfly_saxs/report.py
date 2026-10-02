@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import numpy as np
@@ -25,8 +25,12 @@ import numpy as np
 from .csv_utils import iter_csv_rows, safe_csv_cell
 from .serialization import json_safe
 
+if TYPE_CHECKING:
+    from .lamellar_models import LamellarSettings
+
 SCHEMA = "wingsaxs.analysis_report.v1"
-_VERSION = 1
+_VERSION = 2
+_SOURCE_MANIFEST_STATE_KEY = "__source_manifest__"
 
 
 def _number(value: Any) -> float | None:
@@ -294,6 +298,62 @@ def _parameter_trends(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
     return trends
 
 
+def _lamellar_trends(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the two fitted members and their evidence statuses separate."""
+    groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        groups[str(row.get("branch_id", ""))].append(row)
+    return [{"branch_id": branch, **trend}
+            for branch, group in groups.items() for trend in _parameter_trends(group)]
+
+
+def _lamellar_source(base: Mapping[str, Any], record: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten a native frame envelope without replacing its execution status."""
+    metadata = record.get("frame_metadata", {})
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    identity = {**metadata, **{key: record[key] for key in (
+        "frame_index", "frame_id", "path", "frame", "frame_selector", "dataset", "dataset_selector", "time") if key in record},
+        **{key: base[key] for key in ("frame_index", "frame_id", "time", "time_unit")}}
+    return {**{key: value for key, value in record.items() if key != "result"}, **result,
+            "source_identity": identity, "q_unit": base["q_unit"], "status": base["status"]}
+
+
+def _direction_summary(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Compact sequence plots; full observed points remain in frame JSON/CSV."""
+    groups: dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if _number(row.get("angle_deg")) is not None:
+            groups[row.get("branch_id")].append(row)
+    summaries = []
+    for branch, group in groups.items():
+        angles = np.asarray([float(row["angle_deg"]) for row in group])
+        vector = np.mean(np.exp(2j * np.deg2rad(angles)))
+        concentration = float(abs(vector))
+        mean = float(np.rad2deg(np.angle(vector)) / 2 % 180) if concentration > 1e-12 else None
+        deviations = (angles - mean + 90) % 180 - 90 if mean is not None else None
+        states = {str(row.get("status", "measured")) for row in group}
+        summaries.append({"branch_id": branch, "axial_mean_deg": mean,
+                          "angle_min_deg": float(mean + deviations.min()) if mean is not None else None,
+                          "angle_max_deg": float(mean + deviations.max()) if mean is not None else None,
+                          "count": len(group), "axial_resultant_length": concentration,
+                          "status": next(iter(states)) if len(states) == 1 else "mixed",
+                          "reason": None if mean is not None else "undefined_axial_mean"})
+    return summaries
+
+
+def _radial_peak_rows(base: Mapping[str, Any], peaks: Sequence[Mapping[str, Any]]) -> Iterator[dict[str, Any]]:
+    for peak in peaks:
+        for comparison in peak.get("comparisons", []) or [{}]:
+            yield {**base, **{key: value for key, value in peak.items() if key != "comparisons"},
+                   "comparison_branch_id": comparison.get("branch_id"),
+                   "model_q_radius": comparison.get("model_q_radius"),
+                   "observed_q": comparison.get("observed_q"),
+                   "observed_minus_model_q": comparison.get("observed_minus_model_q"),
+                   "comparison_q_unit": comparison.get("q_unit"),
+                   "comparison_status": comparison.get("status"),
+                   "comparison_reason": comparison.get("reason")}
+
+
 def _compact_profile(rows: Sequence[Mapping[str, Any]], *, radial: bool) -> dict[str, np.ndarray]:
     coordinates = ("q_min", "q_max", "q_center") if radial else ("angle_min_deg", "angle_max_deg", "angle_center_deg")
     return {name: np.asarray([row.get(name) for row in rows], dtype=float)
@@ -324,41 +384,144 @@ def _render_index(report: Mapping[str, Any]) -> str:
         figures = " · ".join(_link(path, Path(path).name) for path in frame.get("figures", {}).values())
         data = " · ".join(_link(path, label.replace("_", " ")) for label, path in frame.get("data", {}).items())
         image = next((path for path in frame.get("figures", {}).values() if path.endswith(".png")), None)
+        morphology_image = next((path for path in frame.get("figures", {}).values()
+                                 if "lamellar_structure" in path and path.endswith(".png")), None)
         note = html.escape(str(frame.get("error") or frame.get("diagnostic") or ""))
         frames.append(f'<details><summary>Frame {frame["frame_index"]}: {html.escape(str(frame.get("frame_id", "")))} — '
                       f'{html.escape(str(frame.get("status", "")))} / {html.escape(str(frame.get("report_status", "")))}</summary>'
                       f'<p>{note}</p><p>{data}</p><p>{figures}</p>' +
-                      (f'<img src="{quote(image, safe="/")}" loading="lazy" alt="Observed frame measurements">' if image else "") + '</details>')
+                      (f'<img src="{quote(image, safe="/")}" loading="lazy" alt="Observed frame measurements">' if image else "") +
+                      (f'<p>Lamellar scene: {html.escape(str(frame.get("lamellar_scene_status", "")))}</p>'
+                       f'<img src="{quote(morphology_image, safe="/")}" loading="lazy" alt="Ellipse-derived lamellar schematic">' if morphology_image else "") + '</details>')
     return _page("WingSAXS analysis report", '<p>Observed 2-D measurements and existing fit estimates. '
                  'Open the native data to inspect full detector arrays and fit records.</p>'
                  f'<section><h2>Data</h2><p>{source_links}</p><p>{tables}</p>'
                  '<p class="note">Empty bins and missing frames remain missing. Profile SEM describes within-bin pixel sampling; '
-                 'it is not a calibrated measurement uncertainty. Intensity and in-plane moments describe the supplied mask and q window.</p></section>'
+                 'it is not a calibrated measurement uncertainty. Intensity and in-plane moments describe the supplied mask and q window. '
+                 'Lamellar periods are conditional on calibrated q and an origin-centred ellipse. Scene dimensions and spatial arrangement '
+                 'are the declared drawing settings; directions come from retained observations.</p></section>'
                  f'<section><h2>Sequence</h2>{sequence}</section><section><h2>Frames ({len(frames)})</h2>{"".join(frames)}</section>')
 
 
-def _source_state(folder: Path, prefix: str) -> dict[str, list[int]]:
-    return {name: [path.stat().st_size, path.stat().st_mtime_ns] for name in (
+def _source_state(folder: Path, prefix: str) -> dict[str, list[Any]]:
+    state: dict[str, list[Any]] = {name: [path.stat().st_size, path.stat().st_mtime_ns] for name in (
         "frame_summary.csv", "parameters_long.csv", "results.npz", "frame_details.jsonl", "ellipse_fit.jsonl", "ellipse_fit.json", "ridge_points.csv", "provenance.json", "manifest.json")
         if (path := folder / f"{prefix}{name}").is_file()}
+    source_manifest = _source_manifest_path(folder, prefix)
+    if source_manifest is not None:
+        try:
+            info = source_manifest.stat()
+            state[_SOURCE_MANIFEST_STATE_KEY] = [
+                source_manifest.is_file(), info.st_size, info.st_mtime_ns
+            ]
+        except OSError:
+            state[_SOURCE_MANIFEST_STATE_KEY] = [False, None, None]
+    return state
+
+
+def _manifest_document(folder: Path, prefix: str) -> Mapping[str, Any]:
+    path = folder / f"{prefix}manifest.json"
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return value if isinstance(value, Mapping) else {}
+
+
+def _source_manifest_path(folder: Path, prefix: str) -> Path | None:
+    """Resolve an explicit source-manifest path recorded by the batch export."""
+
+    source = _manifest_document(folder, prefix).get("user_manifest")
+    if not isinstance(source, (str, os.PathLike)) or not str(source).strip():
+        return None
+    path = Path(source).expanduser()
+    return path if path.is_absolute() else (Path.cwd() / path).resolve(strict=False)
 
 
 def _manifest_time_units(folder: Path, prefix: str) -> list[str]:
-    path = folder / f"{prefix}manifest.json"
-    if not path.is_file():
+    manifest = _manifest_document(folder, prefix)
+
+    def time_unit(value: Any) -> str | None:
+        if not isinstance(value, Mapping):
+            return None
+        unit = value.get("time_unit")
+        metadata = value.get("metadata", {})
+        if unit is None and isinstance(metadata, Mapping):
+            unit = metadata.get("time_unit")
+        return None if unit is None or not str(unit).strip() else str(unit)
+
+    def frame_rows(value: Any) -> list[Any]:
+        if isinstance(value, Mapping):
+            for key in ("frames", "frame_manifest", "manifest", "data", "items"):
+                rows = value.get(key)
+                if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
+                    return list(rows)
+            # Match the supported path-to-metadata manifest form while leaving
+            # common metadata keys available to the caller below.
+            rows = []
+            for key, item in value.items():
+                if key in {"metadata", "time_unit"}:
+                    continue
+                if isinstance(item, Mapping):
+                    row = dict(item)
+                    row.setdefault("path", key)
+                    rows.append(row)
+                else:
+                    rows.append({"path": key})
+            return rows
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return list(value)
         return []
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    metadata = manifest.get("metadata", {})
-    common = manifest.get("time_unit") or (metadata.get("time_unit") if isinstance(metadata, Mapping) else None)
-    units = []
-    for frame in manifest.get("frames", []):
-        metadata = frame.get("metadata", {})
-        unit = frame.get("time_unit") or (metadata.get("time_unit") if isinstance(metadata, Mapping) else None) or common
-        units.append(str(unit or ""))
+
+    def order_key(value: Any, fallback: int) -> tuple[str, Any]:
+        raw = value.get("order") if isinstance(value, Mapping) else None
+        if raw is None:
+            raw = fallback
+        if isinstance(raw, bool):
+            return "text", str(raw)
+        try:
+            numeric = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return "text", str(raw)
+        return ("number", numeric) if math.isfinite(numeric) else ("text", str(raw))
+
+    output_frames = frame_rows(manifest.get("frames", []))
+    source_manifest = manifest.get("user_manifest")
+    if isinstance(source_manifest, (str, os.PathLike)):
+        source_path = _source_manifest_path(folder, prefix)
+        if source_path is not None and source_path.is_file():
+            try:
+                if source_path.suffix.casefold() == ".csv":
+                    with source_path.open(encoding="utf-8-sig", newline="") as handle:
+                        source_manifest = list(iter_csv_rows(handle))
+                else:
+                    source_manifest = json.loads(source_path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError, csv.Error, json.JSONDecodeError):
+                source_manifest = None
+        else:
+            source_manifest = None
+    source_frames = frame_rows(source_manifest)
+    source_by_order: dict[tuple[str, Any], Mapping[str, Any]] = {}
+    for index, frame in enumerate(source_frames):
+        if isinstance(frame, Mapping):
+            source_by_order.setdefault(order_key(frame, index), frame)
+
+    exported_common = time_unit(manifest)
+    source_common = time_unit(source_manifest)
+    common = exported_common or source_common
+    units: list[str] = []
+    for index, frame in enumerate(output_frames):
+        output_unit = time_unit(frame)
+        source_frame = source_by_order.get(order_key(frame, index))
+        source_unit = time_unit(source_frame)
+        units.append(output_unit or source_unit or common or "")
     return units
 
 
 def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Mapping[str, Any], progress: Callable[[str], Any] | None) -> dict[str, Any]:
+    from .lamellar import build_lamellar_scene
+    from .lamellar_analysis import analyze_lamellar_morphology
+    from .lamellar_export import _scene_arrays, _scene_payload
+    from .lamellar_report_figures import render_lamellar_report_frame, render_lamellar_sequence_report
     from .report_figures import render_frame_report, render_sequence_report
     from .report_measurements import measure_frame
 
@@ -393,6 +556,7 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
     parameters = _plot_parameter_rows(folder / f"{prefix}parameters_long.csv")
     time_units = _manifest_time_units(folder, prefix)
     base_columns = ("frame_index", "frame_id", "time", "time_unit", "status", "q_unit")
+    lamellar_base_columns = ("frame_index", "frame_id", "time", "time_unit", "frame_status", "q_unit")
     profile_columns = ("mean", "sum", "std", "sem", "count", "candidate_count", "coverage", "sem_kind")
     try:
         for name, columns in {
@@ -404,6 +568,17 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
             "ellipse_candidates": (*base_columns, "candidate_index", "selected_start_index", "field", "value", "value_type"),
             "normal_profiles": (*base_columns, "profile_index", "point_id", "sample_index", "offset_q", "raw_intensity", "fit_intensity", "residual",
                                 "valid", "model", "reason", "snr", "normal_fwhm_q", "localization_sigma_q", "support_fraction", "uncertainty_source"),
+            "lamellar_parameters": (*lamellar_base_columns, "branch_id", "parameter", "value", "candidate_value", "unit", "status", "source", "reason"),
+            "lamellar_directions": (*lamellar_base_columns, "branch_id", "point_index", "angle_deg", "qx", "qy", "q_radius",
+                                    "model_q_radius", "model_period_nm", "model_geometry_status", "model_q_unit", "comparison_q_unit",
+                                    "residual_q", "residual_q_unit", "comparison_reason", "observation_kind",
+                                    "support_count", "branch_support_count", "coverage", "support", "localization_sigma_q", "normal_fwhm_q",
+                                    "branch_id_source", "source_branch_id", "source_branch_id_source", "status", "source", "reason"),
+            "lamellar_period_by_angle": (*lamellar_base_columns, "branch_id", "angle_deg", "q_radius", "period_nm", "relative_period",
+                                         "status", "geometry_status", "observed_support", "support_count", "period_reason", "source", "reason"),
+            "lamellar_radial_peaks": (*lamellar_base_columns, "peak_index", "branch_id", "angle_deg", "q", "q_nm_inv", "status", "source", "reason",
+                                     "comparison_branch_id", "model_q_radius", "observed_q", "observed_minus_model_q", "comparison_q_unit",
+                                     "comparison_status", "comparison_reason"),
         }.items():
             tables[name] = _Table(stage / f"{name}.csv", columns)
         records = _detail_records(folder, prefix)
@@ -411,6 +586,8 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
         angular: list[Any] = []
         summaries = []
         frame_reports = []
+        lamellar_frames = []
+        lamellar_parameters = []
         # Units can change between input sources. Each group receives its own
         # q-bin grid and sequence plots, with no conversion inferred here.
         bounds: dict[str, list[float]] = {}
@@ -455,6 +632,31 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                 frame_folder.mkdir(parents=True)
                 _write_json(frame_folder / "fit_details.json", record)
                 frame_report["data"] = {"fit_details": (frame_folder / "fit_details.json").relative_to(stage).as_posix()}
+                plot_result = _restore_profile_arrays(_result_detail(record), archive, keys)
+                morphology_source = _lamellar_source(base, record, plot_result)
+                morphology = analyze_lamellar_morphology(morphology_source)
+                scene = build_lamellar_scene(morphology_source, settings["lamellar_settings"])
+                morphology["scene"] = _scene_payload(scene)
+                _write_json(frame_folder / "lamellar_analysis.json", morphology)
+                frame_report["data"]["lamellar_analysis"] = (frame_folder / "lamellar_analysis.json").relative_to(stage).as_posix()
+                frame_report["lamellar_status"] = morphology.get("status", morphology.get("source_status"))
+                frame_report["lamellar_scene_status"] = scene.status
+                if len(scene.centers):
+                    geometry_path = frame_folder / "lamellar_geometry.npz"
+                    np.savez_compressed(geometry_path, **_scene_arrays(scene))
+                    frame_report["data"]["lamellar_geometry"] = geometry_path.relative_to(stage).as_posix()
+                lamellar_base = {**{key: value for key, value in base.items() if key != "status"}, "frame_status": base["status"]}
+                parameter_rows = [{**lamellar_base, **row} for row in morphology["parameter_rows"]]
+                lamellar_parameters.extend(parameter_rows)
+                tables["lamellar_parameters"].write(parameter_rows)
+                tables["lamellar_directions"].write([{**lamellar_base, **row} for row in morphology["observed_directions"]])
+                tables["lamellar_period_by_angle"].write([{**lamellar_base, **row} for row in morphology["directional_rows"]])
+                tables["lamellar_radial_peaks"].write(_radial_peak_rows(lamellar_base, morphology["observed_radial_peaks"]))
+                lamellar_frames.append({**base, "lamellar_analysis": {
+                    **{key: morphology.get(key) for key in (
+                        "status", "source_status", "source_reason", "ellipse", "parameter_rows")},
+                    "observed_direction_summary": _direction_summary(morphology["observed_directions"] or morphology["observed_radial_peaks"])}})
+                image = qx = qy = mask = None
                 try:
                     image = _get_array(archive, keys, "image", "data")
                     if image is None:
@@ -462,7 +664,6 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                     qx, qy, mask = _coordinates(archive, keys)
                     measurement = measure_frame(image, qx, qy, valid_mask=mask, q_unit=unit,
                                                 q_edges=grids.get(unit), radial_bins=settings["radial_bins"], angular_bins=settings["angular_bins"])
-                    plot_result = _restore_profile_arrays(_result_detail(record), archive, keys)
                     plot_record = {**record, "result": plot_result}
                     tables["normal_profiles"].write(_normal_profile_rows(base, plot_result))
                     ridges = plot_result.get("ridges", [])
@@ -497,6 +698,17 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                         angular.append([])
                     frame_report["report_status"] = "incomplete"
                     frame_report["error"] = str(exc)
+                frame_report["lamellar_report_status"] = "unavailable"
+                if morphology["directional_rows"] or morphology["observed_directions"] or morphology["observed_radial_peaks"] or len(scene.centers):
+                    try:
+                        morphology_figures = render_lamellar_report_frame(frame_folder, analysis=morphology, scene=scene,
+                            observed=image, qx=qx, qy=qy, valid_mask=mask, title=f"Frame {position}: {base['frame_id']}",
+                            formats=settings["formats"], dpi=settings["dpi"])
+                        frame_report["figures"].update({key: path.relative_to(stage).as_posix() for key, path in morphology_figures.items()})
+                        frame_report["lamellar_report_status"] = "completed"
+                    except (ValueError, TypeError, FloatingPointError) as exc:
+                        frame_report["lamellar_report_status"] = "incomplete"
+                        frame_report["lamellar_error"] = str(exc)
                 frame_reports.append(frame_report)
         for table in tables.values():
             table.close()
@@ -504,29 +716,40 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
         sequence_folder.mkdir()
         figures = render_sequence_report(sequence_folder, summaries=summaries, radial_profiles=radial,
                                          angular_profiles=angular, parameter_rows=parameters, formats=settings["formats"], dpi=settings["dpi"])
+        figures.update(render_lamellar_sequence_report(sequence_folder, frames=lamellar_frames,
+            formats=settings["formats"], dpi=settings["dpi"]))
         summary_columns = list(dict.fromkeys(key for row in summaries for key in row)) or list(base_columns)
         with _Table(stage / "frame_measurements.csv", summary_columns) as table:
             table.write(summaries)
         trends = _parameter_trends(parameters)
         with _Table(stage / "parameter_changes.csv", list(trends[0]) if trends else ("parameter", "unit", "n_records", "n_finite")) as table:
             table.write(trends)
+        lamellar_changes = _lamellar_trends(lamellar_parameters)
+        with _Table(stage / "lamellar_changes.csv", list(lamellar_changes[0]) if lamellar_changes else
+                    ("branch_id", "parameter", "unit", "value_field", "n_records", "n_finite")) as table:
+            table.write(lamellar_changes)
         report = {"schema_version": SCHEMA, "method_version": _VERSION, "operation_status": "completed", "settings": dict(settings),
                   "source_state": state, "frames": frame_reports,
                   "native_array_status": {key: value for key, value in native_metadata.items() if key != "arrays"},
                   "counts": {"frames": len(frames), "reported": sum(row["report_status"] == "completed" for row in frame_reports),
                              "incomplete": sum(row["report_status"] != "completed" for row in frame_reports),
+                             "lamellar_scenes": sum(row["lamellar_scene_status"] not in {"unavailable", "stale"} for row in frame_reports),
+                             "lamellar_incomplete": sum(row["lamellar_report_status"] == "incomplete" for row in frame_reports),
                              "warning_frames": sum(row.get("status") not in {"ok", "success", "recovered"} or str(row.get("quality_status", "")).upper() in {"WARN", "WARNING", "FAIL", "FAILED"} for row in frame_reports)},
-                  "sources": {name: f"../../{prefix}{name}" for name in state},
-                  "tables": {name: table.path.name for name, table in tables.items()} | {"frame_measurements": "frame_measurements.csv", "parameter_changes": "parameter_changes.csv"},
+                  "sources": {name: f"../../{prefix}{name}" for name in state
+                              if name != _SOURCE_MANIFEST_STATE_KEY},
+                  "tables": {name: table.path.name for name, table in tables.items()} | {"frame_measurements": "frame_measurements.csv", "parameter_changes": "parameter_changes.csv", "lamellar_changes": "lamellar_changes.csv"},
                   "sequence_figures": {key: path.relative_to(stage).as_posix() for key, path in figures.items()}}
-        report["exit_code"] = 1 if report["counts"]["incomplete"] or report["counts"]["warning_frames"] or not frames else 0
+        report["exit_code"] = 1 if report["counts"]["incomplete"] or report["counts"]["lamellar_incomplete"] or report["counts"]["warning_frames"] or not frames else 0
         report["status"] = "ready_with_warnings" if report["exit_code"] else "ready"
         (stage / "index.html").write_text(_render_index(report), encoding="utf-8")
         _write_json(stage / "README.json", {"profile_sem": "Within-bin sample standard deviation / sqrt(pixel count); detector correlations and calibration uncertainty are not included.",
                                            "mask": "Stored analysis usable-pixel mask; q-window, excluded pixels and ROI are retained.",
                                            "moments": "Descriptive nonnegative-intensity-weighted in-plane moments, conditional on mask and q window.",
                                            "native_arrays": "array_catalog.csv maps frame identity to unchanged results.npz keys.",
-                                           "fit_details": "Existing fit records and candidates; reporting does not refit or run full2d."})
+                                           "fit_details": "Existing fit records and candidates; reporting does not refit or run full2d.",
+                                           "lamellar_analysis": "Ellipse-derived apparent periods and observed q-directions; these do not uniquely identify a microscopic structure.",
+                                           "lamellar_geometry": "Deterministic scene arrays use the declared layer dimensions, stack counts and drawing assumptions; those dimensions are not fitted measurements."})
         report["artifacts"] = sorted(path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_file()) + ["report_summary.json"]
         _write_json(stage / "report_summary.json", report)
         if _source_state(folder, prefix) != state:
@@ -554,8 +777,27 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
 
 def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "", force: bool = False, resume: bool = False,
                           radial_bins: int = 128, angular_bins: int = 72, formats: Sequence[str] = ("png", "svg", "pdf"),
-                          dpi: int = 180, progress: Callable[[str], Any] | None = None) -> dict[str, Any]:
+                          dpi: int = 180, lamellar_settings: Mapping[str, Any] | LamellarSettings | None = None,
+                          progress: Callable[[str], Any] | None = None) -> dict[str, Any]:
     """Report one batch or all sample batches under a parent output directory."""
+    from .lamellar_models import LamellarSettings
+
+    defaults = LamellarSettings(mode="multi", period_source="ellipse").to_dict()
+    if lamellar_settings is not None:
+        # A supplied partial mapping inherits the report's period source and
+        # organization; the standard class validates the resulting settings.
+        if isinstance(lamellar_settings, Mapping):
+            raw = lamellar_settings
+            for name in ("lamellar", "lamellar_settings", "settings"):
+                if isinstance(raw.get(name), Mapping):
+                    raw = raw[name]
+                    break
+            unknown = sorted(str(name) for name in raw if name not in defaults)
+            if unknown:
+                raise ValueError("Unknown lamellar settings: " + ", ".join(unknown))
+            defaults = LamellarSettings.from_mapping({**defaults, **raw}).to_dict()
+        else:
+            defaults = LamellarSettings.from_mapping(lamellar_settings).to_dict()
     for name, value in (("radial_bins", radial_bins), ("angular_bins", angular_bins)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 2:
             raise ValueError(f"{name} must be an integer >= 2")
@@ -575,13 +817,15 @@ def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "
                        if not any(part.startswith(".") or part == "figures" for part in path.relative_to(root).parts))
     if not summaries:
         raise FileNotFoundError(f"No frame_summary.csv batch exports found under {root}")
-    settings = {"radial_bins": radial_bins, "angular_bins": angular_bins, "formats": formats, "dpi": dpi}
+    settings = {"radial_bins": radial_bins, "angular_bins": angular_bins, "formats": formats, "dpi": dpi,
+                "lamellar_settings": defaults}
     reports = [_build_sample(path, force=force, resume=resume, settings=settings, progress=progress) for path in summaries]
     if len(reports) == 1:
         return reports[0]
     collection = root / "analysis_reports.html"
     collection_tables = {}
-    for table_name, source_name in (("collection_parameters", "parameters_long.csv"), ("collection_measurements", "frame_measurements.csv")):
+    for table_name, source_name in (("collection_parameters", "parameters_long.csv"), ("collection_measurements", "frame_measurements.csv"),
+                                    ("collection_lamellar_parameters", "lamellar_parameters.csv")):
         sources = []
         columns = ["sample", "export_prefix"]
         for path, report in zip(summaries, reports, strict=True):
@@ -613,7 +857,7 @@ def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "
         collection.write_text(document, encoding="utf-8")
     combined = {"schema_version": SCHEMA, "status": "ready_with_warnings" if any(report["exit_code"] for report in reports) else "ready",
             "operation_status": "completed", "exit_code": int(any(report["exit_code"] for report in reports)),
-            "counts": {"samples": len(reports), **{key: sum(report["counts"][key] for report in reports) for key in ("frames", "reported", "incomplete", "warning_frames")}},
+            "counts": {"samples": len(reports), **{key: sum(report["counts"][key] for report in reports) for key in ("frames", "reported", "incomplete", "warning_frames", "lamellar_scenes", "lamellar_incomplete")}},
             "samples": [{"sample": str(path.parent.relative_to(root)), "counts": report["counts"], "outputs": report["outputs"]} for path, report in zip(summaries, reports, strict=True)],
             "outputs": {"index": str(collection), "summary": str(root / "analysis_report_summary.json"),
                         **{key: str(root / value) for key, value in collection_tables.items()}}}

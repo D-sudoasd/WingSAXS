@@ -12,6 +12,7 @@ from butterfly_saxs.lamellar import (
     build_lamellar_scene,
     load_lamellar_sources,
 )
+from butterfly_saxs.lamellar_adapter import observed_direction_support
 
 
 def _radial_source(*, q_unit: str = "nm^-1") -> dict:
@@ -53,6 +54,19 @@ def _radial_source(*, q_unit: str = "nm^-1") -> dict:
                 "branch_id": 1,
             },
         ],
+    }
+
+
+def _ridge_point(angle_deg: float, *, branch_id: int | None = 0, q: float = 0.2) -> dict:
+    angle = np.deg2rad(angle_deg)
+    return {
+        "qx": float(q * np.cos(angle)),
+        "qy": float(q * np.sin(angle)),
+        "q_unit": "nm^-1",
+        "valid": True,
+        "accepted": True,
+        "branch_id": branch_id,
+        "status": "observed",
     }
 
 
@@ -367,8 +381,9 @@ def test_manual_position_grid_uses_largest_period_when_reference_is_smaller() ->
 def test_ellipse_scene_preserves_parameter_evidence_over_raw_solver_alias(status):
     source = _radial_source()
     source["ellipse_fit"] = {
-        "b": 0.1, "center": [0.0, 0.0], "q_unit": "nm^-1", "status": "ok",
-        "parameters": {"b": 0.1},
+        "a": 0.2, "b": 0.1, "theta_deg": 10.0,
+        "center": [0.0, 0.0], "q_unit": "nm^-1", "status": "ok",
+        "parameters": {"a": 0.2, "b": 0.1, "theta_deg": 10.0},
         "quantitative_parameters": {
             "b": {"value": 0.1, "candidate_value": 0.1, "status": status}
         },
@@ -377,7 +392,20 @@ def test_ellipse_scene_preserves_parameter_evidence_over_raw_solver_alias(status
         source, {"period_source": "ellipse", "layer_count": 1, "stack_count": 1}
     )
     assert scene.status == "candidate"
-    assert scene.metadata["populations"][0]["period"] == pytest.approx(2.0 * np.pi / 0.1)
+    radius = 0.2 * 0.1 / np.hypot(
+        0.1 * np.cos(np.deg2rad(20.0)),
+        0.2 * np.sin(np.deg2rad(20.0)),
+    )
+    assert scene.metadata["populations"][0]["period"] == pytest.approx(
+        2.0 * np.pi / radius
+    )
+    minor_axis = next(
+        row
+        for row in scene.metadata["parameter_sources"]
+        if row["name"] == "period_from_ellipse_minor_axis"
+    )
+    assert minor_axis["value"] is None
+    assert minor_axis["candidate_value"] == pytest.approx(2.0 * np.pi / 0.1)
 
 
 def test_ellipse_requires_origin_and_keeps_candidate_formal_value_null() -> None:
@@ -391,14 +419,19 @@ def test_ellipse_requires_origin_and_keeps_candidate_formal_value_null() -> None
 
     candidate = _radial_source()
     candidate["ellipse_fit"] = {
+        "a": 0.2,
         "b": {"candidate_value": 0.1, "status": "candidate"},
+        "theta_deg": 10.0,
         "center": [0.0, 0.0],
         "q_unit": "nm^-1",
+        "parameters": {"a": 0.2, "b": 0.1, "theta_deg": 10.0},
+        "quantitative_parameters": {"b": {"candidate_value": 0.1, "status": "candidate"}},
     }
     scene = build_lamellar_scene(
         candidate, {"period_source": "ellipse", "layer_count": 1, "stack_count": 1}
     )
     assert scene.status == "candidate"
+    assert scene.metadata["populations"][0]["period"] < 2.0 * np.pi / 0.1
     source_row = next(
         item
         for item in scene.metadata["parameter_sources"]
@@ -411,6 +444,250 @@ def test_ellipse_requires_origin_and_keeps_candidate_formal_value_null() -> None
     )
     assert b_row["value"] is None
     assert b_row["candidate_value"] == pytest.approx(0.1)
+
+
+def test_ellipse_only_scene_uses_accepted_observed_directions_and_directional_radius() -> None:
+    source = {
+        "q_unit": "nm^-1",
+        "draw_axis_deg": 90.0,
+        "ridges": [_ridge_point(30.0), _ridge_point(210.0)],
+        "ellipse_fit": {
+            "a": 0.2,
+            "b": 0.1,
+            "theta_deg": 10.0,
+            "reference_axis_deg": 0.0,
+            "center": [0.0, 0.0],
+            "q_unit": "nm^-1",
+            "parameters": {"a": 0.2, "b": 0.1, "theta_deg": 10.0},
+        },
+    }
+    scene = build_lamellar_scene(
+        source,
+        {"period_source": "ellipse", "selected_branch": 0, "layer_count": 1, "stack_count": 1},
+    )
+
+    angle = np.deg2rad(30.0 - 10.0)
+    radius = 0.2 * 0.1 / np.hypot(0.1 * np.cos(angle), 0.2 * np.sin(angle))
+    assert scene.status == "schematic"
+    assert scene.metadata["populations"][0]["period"] == pytest.approx(2.0 * np.pi / radius)
+    assert scene.metadata["populations"][0]["angle_deg"] == pytest.approx(30.0)
+    assert np.rad2deg(np.arctan2(scene.orientations[0, 1, 2], scene.orientations[0, 0, 2])) == pytest.approx(30.0)
+    assert not np.isclose(scene.metadata["populations"][0]["period"], 2.0 * np.pi / 0.1)
+
+
+def test_radial_fallback_direction_provenance_is_not_labelled_as_ridge_points() -> None:
+    source = _radial_source()
+    source["ellipse_fit"] = {
+        "a": 0.2,
+        "b": 0.1,
+        "theta_deg": 10.0,
+        "center": [0.0, 0.0],
+        "q_unit": "nm^-1",
+        "parameters": {"a": 0.2, "b": 0.1, "theta_deg": 10.0},
+    }
+
+    scene = build_lamellar_scene(
+        source, {"period_source": "ellipse", "layer_count": 1, "stack_count": 2}
+    )
+
+    support_row = next(
+        row
+        for row in scene.metadata["parameter_sources"]
+        if row["name"] == "observed_direction_support"
+    )
+    assert scene.status == "schematic"
+    assert {row["source"] for row in scene.metadata["direction_support"]} == {
+        "lobe_radial_peaks"
+    }
+    assert {population["orientation_source"] for population in scene.metadata["populations"]} == {
+        "retained_lobe_radial_peaks"
+    }
+    assert support_row["source"] == "retained_lobe_radial_peaks"
+    assert "ellipse_direction_from_radial_lobe_peaks" in scene.metadata["flags"]
+    assert "ellipse_direction_from_observed_ridge_points" not in scene.metadata["flags"]
+
+
+def test_observed_direction_support_restores_only_explicit_fit_labels_from_unresolved_source_ids() -> None:
+    points = [_ridge_point(30.0, branch_id=-1), _ridge_point(210.0, branch_id=-1)]
+    for point in points:
+        point["branch_assignment_source"] = "reference_quadrant"
+        point["metadata"] = {"quadrant_pair": "QI+QIII"}
+    source = {
+        "ridges": points,
+        "ellipse_fit": {
+            "branch_assignment_values": np.asarray([0, 1]),
+            "branch_assignment_indices": np.asarray([0, 1]),
+        },
+    }
+
+    rows = observed_direction_support(source)
+
+    assert [row["branch_id"] for row in rows] == [0, 1]
+    assert [row["source_branch_id"] for row in rows] == [-1, -1]
+    assert all(row["branch_id_source"] == "ellipse_fit.branch_assignment" for row in rows)
+    assert all(row["branch_assignment_source"] == "reference_quadrant" for row in rows)
+
+
+def test_observed_direction_support_does_not_promote_quadrant_or_truncate_branch_ids() -> None:
+    points = [_ridge_point(30.0, branch_id=None), _ridge_point(210.0, branch_id=3.7)]
+    points[0]["metadata"] = {"quadrant_pair": "QI+QIII"}
+    source = {"ridges": points}
+
+    rows = observed_direction_support(source)
+
+    assert [row["branch_id"] for row in rows] == [None, None]
+    assert [row["angle_deg"] for row in rows] == pytest.approx([30.0, -150.0])
+
+
+def test_ellipse_mode_keeps_a_coherent_unassigned_direction_without_fake_branches() -> None:
+    source = {
+        "q_unit": "nm^-1",
+        "ridges": [_ridge_point(0.0, branch_id=-1), _ridge_point(180.0, branch_id=-1)],
+        "ellipse_fit": {
+            "a": 0.2,
+            "b": 0.1,
+            "reference_axis_deg": 0.0,
+            "center": [0.0, 0.0],
+            "q_unit": "nm^-1",
+            "ellipses": [
+                {"a": 0.2, "b": 0.1, "angle_deg": 28.0, "center": [0.0, 0.0]},
+                {"a": 0.2, "b": 0.1, "angle_deg": -28.0, "center": [0.0, 0.0]},
+            ],
+        },
+    }
+
+    scene = build_lamellar_scene(
+        source, {"period_source": "ellipse", "layer_count": 1, "stack_count": 2}
+    )
+
+    assert scene.status == "schematic"
+    assert set(scene.branch_ids.tolist()) == {-1}
+    assert scene.metadata["populations"][0]["branch_label"] == "Observed direction"
+    assert scene.metadata["populations"][0]["fitted_member_branch_id"] is None
+
+
+def test_ambiguous_unassigned_ellipse_direction_does_not_discard_explicit_branch() -> None:
+    source = {
+        "q_unit": "nm^-1",
+        "ridges": [
+            _ridge_point(28.0, branch_id=0),
+            _ridge_point(208.0, branch_id=0),
+            _ridge_point(45.0, branch_id=-1),
+            _ridge_point(225.0, branch_id=-1),
+            _ridge_point(135.0, branch_id=-1),
+            _ridge_point(315.0, branch_id=-1),
+        ],
+        "ellipse_fit": {
+            "a": 0.2,
+            "b": 0.1,
+            "center": [0.0, 0.0],
+            "q_unit": "nm^-1",
+            "ellipses": [
+                {"a": 0.2, "b": 0.1, "angle_deg": 28.0, "center": [0.0, 0.0]},
+                {"a": 0.2, "b": 0.1, "angle_deg": 116.0, "center": [0.0, 0.0]},
+            ],
+        },
+    }
+
+    scene = build_lamellar_scene(
+        source, {"period_source": "ellipse", "layer_count": 1, "stack_count": 2}
+    )
+
+    assert scene.status == "schematic"
+    assert set(scene.branch_ids.tolist()) == {0}
+    assert "ambiguous_unassigned_direction_retained" in scene.metadata["flags"]
+    assert any(
+        item["branch_id"] == -1 and item["status"] == "unavailable"
+        for item in scene.metadata["populations"]
+    )
+
+
+def test_ellipse_directional_period_uses_explicit_member_angles_and_relative_pixel_q() -> None:
+    source = {
+        "q_unit": "pixel^-1",
+        "ridges": [
+            {**_ridge_point(28.0, branch_id=0), "q_unit": "pixel^-1"},
+            {**_ridge_point(208.0, branch_id=0), "q_unit": "pixel^-1"},
+        ],
+        "ellipse_fit": {
+            "a": 0.2,
+            "b": 0.1,
+            "theta_deg": 3.0,
+            "reference_axis_deg": 0.0,
+            "center": [0.0, 0.0],
+            "q_unit": "pixel^-1",
+            "ellipses": [
+                {"a": 0.2, "b": 0.1, "angle_deg": 28.0, "center": [0.0, 0.0]},
+                {"a": 0.2, "b": 0.1, "angle_deg": 116.0, "center": [0.0, 0.0]},
+            ],
+        },
+    }
+
+    scene = build_lamellar_scene(
+        source,
+        {"period_source": "ellipse", "selected_branch": 0, "reference_period": 10.0, "layer_count": 1, "stack_count": 1},
+    )
+
+    assert scene.status == "schematic"
+    assert scene.length_unit == "relative"
+    assert scene.metadata["populations"][0]["period"] == pytest.approx(10.0)
+    assert scene.metadata["populations"][0]["fitted_member_branch_id"] == 0
+    assert scene.metadata["populations"][0]["q_unit"] == "pixel^-1"
+    assert scene.metadata["parameter_sources"][-1]["unit"] == "pixel^-1"
+
+
+def test_single_explicit_ellipse_member_matches_only_its_observed_branch() -> None:
+    source = _radial_source()
+    source["ellipse_fit"] = {
+        "a": 0.2,
+        "b": 0.1,
+        "theta_deg": 10.0,
+        "center": [0.0, 0.0],
+        "q_unit": "nm^-1",
+        "ellipses": [
+            {
+                "branch_id": 1,
+                "a": 0.2,
+                "b": 0.1,
+                "angle_deg": 150.0,
+                "center": [0.0, 0.0],
+            }
+        ],
+    }
+
+    wrong_branch = build_lamellar_scene(
+        source,
+        {"period_source": "ellipse", "selected_branch": 0, "layer_count": 1, "stack_count": 1},
+    )
+    matching_branch = build_lamellar_scene(
+        source,
+        {"period_source": "ellipse", "selected_branch": 1, "layer_count": 1, "stack_count": 1},
+    )
+
+    assert wrong_branch.status == "unavailable"
+    assert "matches observed branch 0" in wrong_branch.message
+    assert wrong_branch.metadata["direction_support"]
+    assert matching_branch.status == "schematic"
+    assert matching_branch.metadata["populations"][1]["fitted_member_branch_id"] == 1
+    assert matching_branch.metadata["populations"][1]["period"] == pytest.approx(
+        2.0 * np.pi / 0.2
+    )
+
+
+def test_nested_zero_draw_axis_is_not_replaced_by_default() -> None:
+    scene = build_lamellar_scene(
+        {"observables": {"draw_axis_deg": 0.0}},
+        {
+            "period_source": "manual",
+            "manual_period": 1.0,
+            "manual_angle_deg": 30.0,
+            "layer_count": 1,
+            "stack_count": 1,
+        },
+    )
+
+    assert scene.metadata["draw_axis_deg"] == pytest.approx(0.0)
+    assert np.rad2deg(np.arctan2(scene.orientations[0, 1, 2], scene.orientations[0, 0, 2])) == pytest.approx(120.0)
 
 
 def test_scene_is_deterministic_without_mutating_source() -> None:
