@@ -215,7 +215,7 @@ def _save(
 def _reserve_figure_footer(figure: Figure, *, bottom: float = 0.045, top: float = 0.96) -> None:
     engine = figure.get_layout_engine()
     if engine is not None and hasattr(engine, "set"):
-        engine.set(rect=(0.015, bottom, 0.985, top))
+        engine.set(rect=(0.015, bottom, 0.97, top - bottom))
 
 
 def _normalization_note(label: str) -> str:

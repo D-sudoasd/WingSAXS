@@ -493,6 +493,20 @@ def test_parameter_labels_keep_radial_period_and_conditional_ellipse_spacing_dis
     assert _parameter_label("L_from_observed_radius_nm", "nm") == "Observed ring period 2π/q* (nm)"
 
 
+def test_profile_page_title_does_not_overlap_panel_titles(tmp_path):
+    from butterfly_saxs.report_figures import _local_profile_figure
+
+    profile = {"point_id": "ridge-017669f9dc460fb9", "model": "single_gaussian",
+               "offset_q": [-1.0, 0.0, 1.0], "raw_intensity": [1.0, 2.0, 1.0],
+               "fit_intensity": [1.0, 1.9, 1.0]}
+    figure = _local_profile_figure([profile] * 8, 0, 5, q_unit="pixel-q", title="Frame 0: fixture_0")
+    figure.canvas.draw()
+    page_title = figure._suptitle.get_window_extent()
+    assert all(axis.title.get_window_extent().y1 < page_title.y0 for axis in figure.axes)
+    figure.savefig(tmp_path / "profiles.png", dpi=100, bbox_inches="tight")
+    figure.clear()
+
+
 def test_log_normalization_is_labeled_explicitly():
     norm, label = _intensity_norm(np.geomspace(1e-4, 1.0, 100))
     assert norm.__class__.__name__ == "LogNorm"
