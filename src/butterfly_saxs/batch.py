@@ -20,12 +20,12 @@ import traceback as traceback_module
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from .cancellation import AnalysisCancelled
 from .csv_utils import read_csv_rows
+from .file_identity import file_version as _input_file_version, stream_digest
 from .settings import strict_int
 from .path_utils import IMAGE_SUFFIXES, filter_supported_image_paths
 from .serialization import json_safe as _canonical_json_safe
@@ -981,69 +981,6 @@ def _is_cancelled(cancel_event: Any) -> bool:
     return bool(getattr(cancel_event, "cancelled", False))
 
 
-@lru_cache(maxsize=1)
-def _windows_change_time_query() -> Callable[[Path], int]:
-    """Bind the stdlib Win32 reader once; retain no input handles or results."""
-
-    import ctypes
-    from ctypes import wintypes
-
-    class FileBasicInfo(ctypes.Structure):
-        _fields_ = [
-            ("CreationTime", ctypes.c_longlong),
-            ("LastAccessTime", ctypes.c_longlong),
-            ("LastWriteTime", ctypes.c_longlong),
-            ("ChangeTime", ctypes.c_longlong),
-            ("FileAttributes", wintypes.DWORD),
-        ]
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    create = kernel.CreateFileW
-    create.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    create.restype = wintypes.HANDLE
-    get_info = kernel.GetFileInformationByHandleEx
-    get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
-    get_info.restype = wintypes.BOOL
-    close = kernel.CloseHandle
-    close.argtypes = [wintypes.HANDLE]
-    close.restype = wintypes.BOOL
-
-    def read(path: Path) -> int:
-        # FILE_READ_ATTRIBUTES, share read/write/delete, OPEN_EXISTING.
-        handle = create(str(path), 0x80, 7, None, 3, 0, None)
-        if handle == ctypes.c_void_p(-1).value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            result = FileBasicInfo()
-            if not get_info(handle, 0, ctypes.byref(result), ctypes.sizeof(result)):
-                raise ctypes.WinError(ctypes.get_last_error())
-            return result.ChangeTime
-        finally:
-            close(handle)
-
-    return read
-
-
-def _input_file_version(path: Path, info: os.stat_result) -> tuple[int | None, ...]:
-    """A write-sensitive token; unavailable change time disables digest reuse."""
-
-    change_time = info.st_ctime_ns
-    if os.name == "nt":
-        # Supported Windows Pythons expose creation time as st_ctime, which
-        # cannot detect an equal-size rewrite followed by restoring mtime.
-        try:
-            change_time = _windows_change_time_query()(path) or None
-        except OSError:
-            change_time = None
-    return (
-        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
-        info.st_dev, info.st_ino, change_time,
-    )
-
-
 def input_fingerprint(
     refs: Iterable[FrameRef],
     *,
@@ -1065,6 +1002,15 @@ def input_fingerprint(
     unavailable: list[str] = []
     total = len(items)
     file_digests: dict[tuple[Any, ...], str] = {}
+
+    def check_cancel() -> None:
+        if _is_cancelled(cancel_event):
+            raise AnalysisCancelled("batch cancelled while hashing inputs")
+
+    def read_digest(path: Path) -> str:
+        with path.open("rb") as handle:
+            return stream_digest(handle, check_cancel=check_cancel)[1]
+
     for index, ref in enumerate(items):
         if _is_cancelled(cancel_event):
             raise AnalysisCancelled("batch cancelled while hashing inputs")
@@ -1089,13 +1035,16 @@ def input_fingerprint(
                 version = (canonical_path, *file_version)
                 content_digest = file_digests.get(version) if file_version[-1] is not None else None
                 if content_digest is None:
-                    digest = hashlib.sha256()
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            if _is_cancelled(cancel_event):
-                                raise AnalysisCancelled("batch cancelled while hashing inputs")
-                            digest.update(chunk)
+                    content_digest = read_digest(path)
                     after = _input_file_version(path, path.stat())
+                    cacheable = file_version[-1] is not None and after[-1] is not None
+                    if not cacheable:
+                        # Without a write-sensitive token the first digest
+                        # alone cannot prove that content stayed stable.
+                        check_cancel()
+                        if read_digest(path) != content_digest:
+                            raise ValueError(f"input changed while hashing; retry with stable inputs: {path}")
+                        after = _input_file_version(path, path.stat())
                     if (
                         after[:-1] != file_version[:-1]
                         or (
@@ -1104,8 +1053,7 @@ def input_fingerprint(
                         )
                     ):
                         raise ValueError(f"input changed while hashing; retry with stable inputs: {path}")
-                    content_digest = digest.hexdigest()
-                    if file_version[-1] is not None and after[-1] is not None:
+                    if cacheable:
                         file_digests[version] = content_digest
                 stat.update(
                     {

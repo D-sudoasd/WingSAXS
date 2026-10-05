@@ -486,22 +486,38 @@ def test_reuse_crc_damage_is_blocked_without_recompression(sample: Path):
     assert image.read_bytes() == damaged
 
 
-def test_reuse_detects_source_change_after_its_hash(sample: Path, monkeypatch):
+@pytest.mark.parametrize("coarse_metadata", [False, True])
+def test_reuse_detects_source_change_during_archive_verification(sample: Path, monkeypatch, coarse_metadata: bool):
+    import os
+    import butterfly_saxs.delivery_pairs as pairs
     from butterfly_saxs.delivery_pairs import reuse_image_archive
 
     _write(sample, "plot.png", b"original")
     rows = _inventory(sample, "plot.png")
     image = _zip(sample.parent / "IMAGE.zip", {"plot.png": b"original"})
     original = zipfile.ZipFile.open
+    before = (sample / "plot.png").stat()
+    if coarse_metadata:
+        signature = (*pairs._file_signature(sample / "plot.png")[:-1], None)
+        real_signature = pairs._file_signature
+        monkeypatch.setattr(pairs, "_file_signature", lambda path: (
+            signature if path == sample / "plot.png" else real_signature(path)
+        ))
 
     def change_source(archive, *args, **kwargs):
         _write(sample, "plot.png", b"modified")
+        os.utime(sample / "plot.png", ns=(before.st_atime_ns, before.st_mtime_ns))
         return original(archive, *args, **kwargs)
 
     monkeypatch.setattr(zipfile.ZipFile, "open", change_source)
     result = reuse_image_archive(sample, image, rows)
     assert result["status"] == "blocked"
-    assert _reasons(result) == {"source_changed_during_verification"}
+    if coarse_metadata:
+        assert _reasons(result) == {"source_hash_mismatch"}
+    else:
+        assert _reasons(result) <= {"source_changed_during_verification", "source_hash_mismatch"}
+        assert result["issues"]
+    assert result["content_hashes_verified"] is False
 
 
 def test_reuse_never_creates_missing_archive(sample: Path):

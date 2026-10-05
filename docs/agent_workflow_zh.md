@@ -14,9 +14,9 @@
 | --- | --- | --- |
 | 命令发现、JSON 提示、参数路由 | `cli.py`、`cli_contract.py` | `tests/test_cli_agent_contract.py`；涉及执行参数再选 `tests/test_pipeline_cli.py` 中的相关用例 |
 | 图像/NPZ、帧和数据集选择、掩膜 | `io.py`、`pipeline._read_frame_bundle` | `tests/test_io_geometry.py`、`tests/test_npz_frame_maps.py`、`tests/test_p2_io_batch_contracts.py` |
-| batch、哈希、checkpoint、resume | `batch.py`，相应 CLI/service 调用者 | `tests/test_batch_export.py`、`tests/test_unattended_batch.py`；元数据问题加对应 time-metadata 测试 |
+| batch、哈希、checkpoint、resume | `batch.py`、`file_identity.py`，相应 CLI/service 调用者 | `tests/test_batch_export.py`、`tests/test_unattended_batch.py`；元数据问题加对应 time-metadata 测试 |
 | 轨迹或椭圆拟合 | 出问题的算法模块及其调用者 | 对应算法测试；按需要增加 CLI/service 数值用例、掩膜/弱信号/边界解回归 |
-| 已有结果的报告或打包 | `report.py`、`delivery.py`，具体绘图模块 | `tests/test_report_cli.py`、`tests/test_analysis_report.py` 或对应 delivery/绘图测试 |
+| 已有结果的报告或打包 | `report.py`、`delivery.py`、`delivery_pairs.py`，具体绘图模块 | `tests/test_report_cli.py`、`tests/test_analysis_report.py` 或对应 delivery/绘图测试 |
 | service 或 GUI 交互 | `service.py`、相关 `ui/` 控件/worker | 对应 service/UI 测试；只涉及控件时不重新拟合实验数据 |
 | 文档或说明修改 | 目标文档及相关接口定义 | 检查链接、命令/字段是否与实现一致；无需全套数值测试 |
 
@@ -59,15 +59,18 @@ lint 只执行一次，Ruff 的语法检查取代六次额外 compileall。文�
 - NPZ 读取在同一 archive 中完成数据集选择、强度和 q-map 解析。只读取选定强度和
   实际存在的 q-map 字段；共享 2D q-map 和每帧 3D q-map 都保留原来的选择规则。
   `io.load_image(include_qmap=True)` 显式启用；普通 loader 的严格多数据集行为不变。
-- batch 输入身份在单次调用内按规范化路径、size/mtime、文件身份和变更时间复用 SHA-256。
+- batch 输入身份在单次调用内按规范化路径、size/mtime、文件身份和修改标识复用 SHA-256。
   同一容器的帧/数据集/顺序/时间等仍各自参与身份，不缓存拟合结果或 detector 值。
-  Windows 支持版本的 `st_ctime` 是创建时间，使用 Win32 `FILE_BASIC_INFO.ChangeTime`
-  判断调用内的等长、恢复 mtime 改写；取不到变更时间时逐次读内容，不复用摘要。
-  读取期间文件元数据或身份变化会报错；每次新调用及 resume 都重新读取内容，因此同大小、
+  Windows 的 `st_ctime` 是创建时间，`ChangeTime` 也可能在快速改写间重复，因此用
+  非零文件更新序列号（USN）检测修改，只读取系统已有记录，不创建或维护日志。
+  文件系统/API 不提供可靠标识时，每个 selector 再读一次确认摘要一致，不复用摘要。
+  读取期间内容、元数据或文件身份变化会报错；每次新调用及 resume 都重新读取内容，因此同大小、
   同 mtime 的跨调用改写仍使旧 checkpoint 失效。没有磁盘缓存或额外 manifest 要维护。
 
-Windows 时间语义见 [Python stat 文档](https://docs.python.org/3.13/library/os.html#os.stat_result)
-和 [FILE_BASIC_INFO 定义](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_basic_info)。
+Windows 时间语义见 [Python stat 文档](https://docs.python.org/3.13/library/os.html#os.stat_result)，
+文件修改序号见 [FSCTL_READ_FILE_USN_DATA](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_read_file_usn_data)。
+ZIP 复用在核验成员后读取当前源文件的 SHA-256；粗时间戳不能掩盖源内容与计划不符。
+每个源文件仍只哈希一次，CRC、成员集合和整个 ZIP 的摘要检查均保留。
 
 独立读取可以在一个 `functions.exec` 中用 `Promise.allSettled` 批量调用工具并逐项
 检查结果。依赖前一步的编辑、批准、验证和收尾保持顺序；不为了并行再重复发现项目。
@@ -84,7 +87,7 @@ Windows 时间语义见 [Python stat 文档](https://docs.python.org/3.13/librar
 | --- | --- | --- | --- |
 | `inspect` 带 q-map 的 NPZ | 3 次 archive 打开 | 1 次 | 完整科学 JSON 相同 |
 | `analyze` 同一 NPZ | 3 次 archive 打开 | 1 次 | 完整结果（含数组摘要）相同 |
-| 16 个 selector 的容器身份 | 16 次哈希读取，67,110,912 B | 1 次，4,194,432 B | checkpoint 输入哈希相同；每个 selector 的身份仍参与 |
+| 16 个 selector 的容器身份（有可靠修改标识） | 16 次哈希读取，67,110,912 B | 1 次，4,194,432 B | checkpoint 输入哈希相同；每个 selector 的身份仍参与 |
 | 取得 batch 命令契约 | 基线完整清单 9,723 B | `describe batch` 2,734 B | batch 契约、退出码和科学边界保留；输出减少 71.9% |
 | 一次运行时代码 CI | 6 次全量 lint + 6 次 compileall | 1 次 lint | 六组完整 pytest、依赖/CLI smoke 与 wheel smoke 保留 |
 
@@ -109,7 +112,10 @@ agent 消息、41 次 followup、34 次等待）、16 次全量 Ruff、5 次全�
 fixture、软件图形后端不支持 Qt 3D），用时 888.49 s。最终补充命令目录覆盖后，
 重跑相关目录/发现测试 6 passed；共享数值与 I/O 未再修改，不重复完整回归。
 
-最终 review-pro 审查修复了 Windows 调用内恢复 mtime 的缓存失效，以及 describe
-未知命令的退出码契约。batch/resume/CLI 回归 67 passed，增加读取期间等长改写和
-变更时间不可用时不复用的检查。修复后重放同一 16 帧容器，三次测量均为哈希读取
-16→1、输入身份完全相同，中位耗时 57.59→10.35 ms；Win32 额外操作只读取元数据。
+最终 review-pro 审查修复了 Windows 调用内恢复 mtime 的缓存失效、ZIP 核验期间
+源文件变化的漏检，以及 describe 未知命令的退出码契约。跨平台 CI 暴露的粗时间戳
+问题改由 USN/内容确认处理；回归直接模拟不可用标识及不变元数据，未依赖延时或
+跳过检查。batch/resume/CLI/交付回归 127 passed。修复后在本机有非零 USN 的
+同一 16 帧容器上重放，三次均为哈希读取 16→1、输入身份完全相同，中位耗时
+54.86→8.16 ms；读取字节减少 93.75%。共享摘要/版本实现仅供这两处调用，不增加
+磁盘缓存、日志维护或 agent 状态框架。

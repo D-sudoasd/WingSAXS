@@ -14,7 +14,6 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
-import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -25,6 +24,7 @@ from urllib.parse import unquote, urlsplit
 import zipfile
 
 from .delivery_dependencies import _HTML_SUFFIXES, _References, local_path_problem
+from .file_identity import file_version, stream_digest as _stream_digest
 
 
 @dataclass(frozen=True)
@@ -438,18 +438,8 @@ def check_archive_pair(
     return _finish(report)
 
 
-def _file_signature(path: Path) -> tuple[int, int, int, int, int]:
-    info = path.stat()
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
-
-
-def _stream_digest(handle: Any) -> tuple[int, str]:
-    digest = hashlib.sha256()
-    size = 0
-    for block in iter(lambda: handle.read(1024 * 1024), b""):
-        size += len(block)
-        digest.update(block)
-    return size, digest.hexdigest()
+def _file_signature(path: Path) -> tuple[int | None, ...]:
+    return file_version(path, path.stat())
 
 
 def reuse_image_archive(
@@ -466,9 +456,11 @@ def reuse_image_archive(
     rewritten or deleted. Success returns the usual archive record with
     ``status='reused'`` and ``content_hashes_verified=True``. DATA is not opened.
 
-    Keep sources frozen during finalization. Stat checks detect ordinary changes
-    during verification; they are not a filesystem lock or proof against hostile
-    concurrent rewrites. Existing writers remain responsible for new archives.
+    Source bytes are checked after the archived members, so a source changed
+    while inspecting the ZIP cannot pass on timestamps alone. Keep sources
+    frozen during finalization: version checks are not a filesystem lock or
+    proof against hostile concurrent rewrites. Existing writers remain
+    responsible for new archives.
     """
     root = _root(sample_root)
     sample_id = _sample_name(root.name)
@@ -488,7 +480,7 @@ def reuse_image_archive(
     if report["issues"]:
         return report
 
-    signatures: dict[str, tuple[int, int, int, int, int]] = {}
+    signatures: dict[str, tuple[int | None, ...]] = {}
     for name, expected in inventory.items():
         if _local_member(root, name, report) is None:
             continue
@@ -498,15 +490,7 @@ def reuse_image_archive(
             if before[2] != expected["size_bytes"]:
                 _issue(report, name, name, "size_mismatch")
                 continue
-            with source.open("rb") as handle:
-                size, digest = _stream_digest(handle)
-            if before != _file_signature(source) or local_path_problem(root, source):
-                _issue(report, name, name, "source_changed_during_verification")
-            elif size != expected["size_bytes"] or digest != expected["sha256"]:
-                _issue(report, name, name, "source_hash_mismatch")
-            else:
-                signatures[name] = before
-                report["source_hash_checks"] += 1
+            signatures[name] = before
         except (OSError, ValueError):
             _issue(report, name, name, "unreadable_file")
     if report["issues"]:
@@ -546,6 +530,25 @@ def reuse_image_archive(
                     _issue(report, str(path), name, "archive_hash_mismatch")
                 else:
                     report["member_hash_checks"] += 1
+        if report["issues"]:
+            return report
+        for name, expected in inventory.items():
+            source = root / name
+            try:
+                signature = _file_signature(source)
+                with source.open("rb") as handle:
+                    source_size, source_digest = _stream_digest(handle)
+                if (
+                    signatures[name] != signature or signature != _file_signature(source)
+                    or local_path_problem(root, source)
+                ):
+                    _issue(report, name, name, "source_changed_during_verification")
+                elif source_size != expected["size_bytes"] or source_digest != expected["sha256"]:
+                    _issue(report, name, name, "source_hash_mismatch")
+                else:
+                    report["source_hash_checks"] += 1
+            except (OSError, ValueError):
+                _issue(report, name, name, "unreadable_file")
         if report["issues"]:
             return report
         with path.open("rb") as handle:
