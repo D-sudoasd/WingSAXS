@@ -82,6 +82,7 @@ def test_describe_one_command_retains_its_contract_without_unrelated_details(cap
 
 
 def test_describe_unknown_command_emits_json_error(capsys) -> None:
+    assert set(agent_manifest("describe")["commands"][0]["exit_codes"]) == {"0", "2"}
     assert main(["describe", "unknown"]) == 2
     error = json.loads(capsys.readouterr().out)
     assert error["schema_version"] == CLI_ERROR_SCHEMA

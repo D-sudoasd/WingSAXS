@@ -344,7 +344,7 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
                 "name": "describe",
                 "purpose": "Print the catalog, or use describe COMMAND for only that command's contract.",
                 "stdout": AGENT_MANIFEST_SCHEMA,
-                "exit_codes": {"0": EXIT_CODES["0"]},
+                "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
             },
             {
                 "name": "doctor",

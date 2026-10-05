@@ -845,6 +845,38 @@ def test_input_fingerprint_invalidates_changed_container_inside_call(
     assert reads == [path, path]
 
 
+def test_input_fingerprint_invalidates_same_stat_rewrite_inside_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    from butterfly_saxs.batch import input_fingerprint
+
+    path = tmp_path / "stack.npy"
+    path.write_bytes(b"first detector bytes")
+    before = path.stat()
+    refs = [FrameRef(path, frame=0), FrameRef(path, frame=1)]
+    stable = input_fingerprint(refs, require_content_hash=True)
+    original_open = Path.open
+    reads = []
+
+    def counted_open(source, *args, **kwargs):
+        if source == path and args == ("rb",):
+            reads.append(source)
+        return original_open(source, *args, **kwargs)
+
+    def progress(payload):
+        if payload["completed"] == 1:
+            path.write_bytes(b"other detector bytes")
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    changed = input_fingerprint(refs, progress=progress, require_content_hash=True)
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert reads == [path, path]
+    assert changed != stable
+
+
 def test_input_fingerprint_honors_cancellation_before_cached_selector(tmp_path: Path) -> None:
     from threading import Event
     from butterfly_saxs.batch import input_fingerprint
@@ -865,13 +897,16 @@ def test_input_fingerprint_honors_cancellation_before_cached_selector(tmp_path: 
         )
 
 
+@pytest.mark.parametrize("preserve_stat", [False, True])
 def test_input_fingerprint_rejects_input_changed_during_hashing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preserve_stat: bool,
 ) -> None:
+    import os
     from butterfly_saxs.batch import input_fingerprint
 
     path = tmp_path / "stack.npy"
     path.write_bytes(b"initial container")
+    before = path.stat()
     original_open = Path.open
 
     class ChangingReader:
@@ -882,7 +917,9 @@ def test_input_fingerprint_rejects_input_changed_during_hashing(
         def read(self, size):
             chunk = self.handle.read(size)
             if chunk:
-                path.write_bytes(b"new container with different size")
+                path.write_bytes(b"updated container" if preserve_stat else b"new container with different size")
+                if preserve_stat:
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
             return chunk
 
         def __exit__(self, *args):
@@ -896,6 +933,49 @@ def test_input_fingerprint_rejects_input_changed_during_hashing(
     monkeypatch.setattr(Path, "open", changing_open)
     with pytest.raises(ValueError, match="input changed while hashing"):
         input_fingerprint([FrameRef(path)], require_content_hash=True)
+
+
+def test_input_fingerprint_reads_afresh_when_change_time_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import butterfly_saxs.batch as batch
+
+    path = tmp_path / "stack.npy"
+    path.write_bytes(b"shared container")
+    refs = [FrameRef(path, frame=index) for index in range(3)]
+    stable = batch.input_fingerprint(refs, require_content_hash=True)
+    original_open = Path.open
+    reads = []
+
+    def counted_open(source, *args, **kwargs):
+        if source == path and args == ("rb",):
+            reads.append(source)
+        return original_open(source, *args, **kwargs)
+
+    def unavailable_version(source, info):
+        return (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev, info.st_ino, None)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    monkeypatch.setattr(batch, "_input_file_version", unavailable_version)
+    assert batch.input_fingerprint(refs, require_content_hash=True) == stable
+    assert reads == [path, path, path]
+    path.unlink()  # No metadata or stream handle remains open.
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Win32 metadata reader")
+def test_input_file_version_handles_unavailable_windows_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import butterfly_saxs.batch as batch
+
+    path = tmp_path / "stack.npy"
+    path.write_bytes(b"container")
+
+    def unavailable_query(source):
+        raise OSError("metadata API unavailable")
+
+    monkeypatch.setattr(batch, "_windows_change_time_query", lambda: unavailable_query)
+    assert batch._input_file_version(path, path.stat())[-1] is None
 
 
 def test_run_batch_emits_hash_phase_before_analyzer(tmp_path: Path) -> None:

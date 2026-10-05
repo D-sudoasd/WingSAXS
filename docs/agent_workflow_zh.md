@@ -59,10 +59,15 @@ lint 只执行一次，Ruff 的语法检查取代六次额外 compileall。文�
 - NPZ 读取在同一 archive 中完成数据集选择、强度和 q-map 解析。只读取选定强度和
   实际存在的 q-map 字段；共享 2D q-map 和每帧 3D q-map 都保留原来的选择规则。
   `io.load_image(include_qmap=True)` 显式启用；普通 loader 的严格多数据集行为不变。
-- batch 输入身份在单次调用内按规范化路径与 size/mtime/ctime/文件身份复用 SHA-256。
+- batch 输入身份在单次调用内按规范化路径、size/mtime、文件身份和变更时间复用 SHA-256。
   同一容器的帧/数据集/顺序/时间等仍各自参与身份，不缓存拟合结果或 detector 值。
+  Windows 支持版本的 `st_ctime` 是创建时间，使用 Win32 `FILE_BASIC_INFO.ChangeTime`
+  判断调用内的等长、恢复 mtime 改写；取不到变更时间时逐次读内容，不复用摘要。
   读取期间文件元数据或身份变化会报错；每次新调用及 resume 都重新读取内容，因此同大小、
   同 mtime 的跨调用改写仍使旧 checkpoint 失效。没有磁盘缓存或额外 manifest 要维护。
+
+Windows 时间语义见 [Python stat 文档](https://docs.python.org/3.13/library/os.html#os.stat_result)
+和 [FILE_BASIC_INFO 定义](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_basic_info)。
 
 独立读取可以在一个 `functions.exec` 中用 `Promise.allSettled` 批量调用工具并逐项
 检查结果。依赖前一步的编辑、批准、验证和收尾保持顺序；不为了并行再重复发现项目。
@@ -103,3 +108,8 @@ agent 消息、41 次 followup、34 次等待）、16 次全量 Ruff、5 次全�
 验证：相关测试 144 passed；一次完整回归 1609 passed、12 skipped（未挂载历史
 fixture、软件图形后端不支持 Qt 3D），用时 888.49 s。最终补充命令目录覆盖后，
 重跑相关目录/发现测试 6 passed；共享数值与 I/O 未再修改，不重复完整回归。
+
+最终 review-pro 审查修复了 Windows 调用内恢复 mtime 的缓存失效，以及 describe
+未知命令的退出码契约。batch/resume/CLI 回归 67 passed，增加读取期间等长改写和
+变更时间不可用时不复用的检查。修复后重放同一 16 帧容器，三次测量均为哈希读取
+16→1、输入身份完全相同，中位耗时 57.59→10.35 ms；Win32 额外操作只读取元数据。
