@@ -795,6 +795,109 @@ def test_input_fingerprint_reports_progress_and_honors_cancel(tmp_path: Path) ->
     assert 1 in seen
 
 
+def test_input_fingerprint_hashes_container_once_per_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from butterfly_saxs.batch import input_fingerprint
+
+    path = tmp_path / "stack.npy"
+    np.save(path, np.arange(16 * 3 * 4).reshape(16, 3, 4))
+    refs = [FrameRef(path, frame=index, dataset="frames") for index in range(16)]
+    original_open = Path.open
+    reads = []
+
+    def counted_open(source, *args, **kwargs):
+        if source == path and args == ("rb",):
+            reads.append(source)
+        return original_open(source, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    first = input_fingerprint(refs, require_content_hash=True)
+    assert reads == [path]
+    assert input_fingerprint(refs, require_content_hash=True) == first
+    assert reads == [path, path]  # A new/resume call must read bytes afresh.
+    assert input_fingerprint(list(reversed(refs))) != first
+    assert input_fingerprint([FrameRef(path, frame=index, dataset="other") for index in range(16)]) != first
+
+
+def test_input_fingerprint_invalidates_changed_container_inside_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from butterfly_saxs.batch import input_fingerprint
+
+    path = tmp_path / "stack.npy"
+    path.write_bytes(b"before")
+    refs = [FrameRef(path, frame=0), FrameRef(path, frame=1)]
+    original_open = Path.open
+    reads = []
+
+    def counted_open(source, *args, **kwargs):
+        if source == path and args == ("rb",):
+            reads.append(source)
+        return original_open(source, *args, **kwargs)
+
+    def progress(payload):
+        if payload["completed"] == 1:
+            path.write_bytes(b"changed container")
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    input_fingerprint(refs, progress=progress)
+    assert reads == [path, path]
+
+
+def test_input_fingerprint_honors_cancellation_before_cached_selector(tmp_path: Path) -> None:
+    from threading import Event
+    from butterfly_saxs.batch import input_fingerprint
+    from butterfly_saxs.cancellation import AnalysisCancelled
+
+    path = tmp_path / "stack.npy"
+    path.write_bytes(b"shared container")
+    cancelled = Event()
+
+    def progress(payload):
+        if payload["completed"] == 1:
+            cancelled.set()
+
+    with pytest.raises(AnalysisCancelled, match="hashing inputs"):
+        input_fingerprint(
+            [FrameRef(path, frame=0), FrameRef(path, frame=1)],
+            progress=progress, cancel_event=cancelled,
+        )
+
+
+def test_input_fingerprint_rejects_input_changed_during_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from butterfly_saxs.batch import input_fingerprint
+
+    path = tmp_path / "stack.npy"
+    path.write_bytes(b"initial container")
+    original_open = Path.open
+
+    class ChangingReader:
+        def __enter__(self):
+            self.handle = original_open(path, "rb")
+            return self
+
+        def read(self, size):
+            chunk = self.handle.read(size)
+            if chunk:
+                path.write_bytes(b"new container with different size")
+            return chunk
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+    def changing_open(source, *args, **kwargs):
+        if source == path and args == ("rb",):
+            return ChangingReader()
+        return original_open(source, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", changing_open)
+    with pytest.raises(ValueError, match="input changed while hashing"):
+        input_fingerprint([FrameRef(path)], require_content_hash=True)
+
+
 def test_run_batch_emits_hash_phase_before_analyzer(tmp_path: Path) -> None:
     from butterfly_saxs.batch import run_batch
 

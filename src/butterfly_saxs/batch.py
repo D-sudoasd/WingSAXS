@@ -992,12 +992,15 @@ def input_fingerprint(
     Optional ``progress`` receives ``{phase, completed, total}`` before each
     file so a long in-situ series is not silent while hashing.  ``cancel_event``
     is checked between files and between 1 MiB chunks.
+    Multiple selectors of an unchanged container share one streamed digest
+    within this call. Every new call (including resume) reads content afresh.
     """
 
     items = list(refs)
     records: list[dict[str, Any]] = []
     unavailable: list[str] = []
     total = len(items)
+    file_digests: dict[tuple[Any, ...], str] = {}
     for index, ref in enumerate(items):
         if _is_cancelled(cancel_event):
             raise AnalysisCancelled("batch cancelled while hashing inputs")
@@ -1009,25 +1012,39 @@ def input_fingerprint(
                     "total": total,
                 }
             )
+        if _is_cancelled(cancel_event):
+            raise AnalysisCancelled("batch cancelled while hashing inputs")
         path = Path(ref.path)
+        canonical_path = _canonical_path(path)
         stat: dict[str, Any] = {"exists": path.exists()}
         if path.exists():
             try:
                 info = path.stat()
                 stat.update({"size": info.st_size, "mtime_ns": info.st_mtime_ns})
-                # Size/mtime alone can be unchanged by an in-place rewrite.
-                # Stream a SHA-256 digest in bounded chunks so a checkpoint
-                # cannot silently resume against different detector bytes.
-                digest = hashlib.sha256()
-                with path.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        if _is_cancelled(cancel_event):
-                            raise AnalysisCancelled("batch cancelled while hashing inputs")
-                        digest.update(chunk)
+                version = (
+                    canonical_path, info.st_size, info.st_mtime_ns,
+                    info.st_ctime_ns, info.st_dev, info.st_ino,
+                )
+                content_digest = file_digests.get(version)
+                if content_digest is None:
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            if _is_cancelled(cancel_event):
+                                raise AnalysisCancelled("batch cancelled while hashing inputs")
+                            digest.update(chunk)
+                    after = path.stat()
+                    if (
+                        after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+                        after.st_dev, after.st_ino,
+                    ) != version[1:]:
+                        raise ValueError(f"input changed while hashing; retry with stable inputs: {path}")
+                    content_digest = digest.hexdigest()
+                    file_digests[version] = content_digest
                 stat.update(
                     {
                         "content_hash_algorithm": "sha256",
-                        "content_sha256": digest.hexdigest(),
+                        "content_sha256": content_digest,
                     }
                 )
             except AnalysisCancelled:
@@ -1049,7 +1066,7 @@ def input_fingerprint(
         if require_content_hash and stat.get("content_sha256") is None:
             unavailable.append(str(path))
         ref_record = ref.to_dict()
-        ref_record["path"] = _canonical_path(path)
+        ref_record["path"] = canonical_path
         records.append({"ref": ref_record, "file": stat})
     if progress is not None:
         progress(

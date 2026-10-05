@@ -104,7 +104,7 @@ def cli_error_payload(
             "scientific_acceptance": False,
             "next": [
                 "Read error.code and error.message; do not retry with --force unless code is output_exists and the target is generated output.",
-                "Run `bsaxs describe` for commands, exit codes, and invariants.",
+                "If the command contract is unknown, run `bsaxs describe COMMAND` or `bsaxs COMMAND --help`; reuse it for unchanged installed code.",
                 "If the CLI cannot import, run `bsaxs-doctor --json` (or `bsaxs doctor --json`).",
             ],
         },
@@ -209,13 +209,13 @@ def agent_guidance(
         next_steps.append("Keep PONI, mask, q-window, and config identical across the series.")
     elif command == "synthetic":
         next_steps.append("Synthetic arrays are empirical fixtures with pixel-q unless a PONI is supplied later.")
-        next_steps.append("bsaxs inspect OUTPUT.npz && bsaxs analyze OUTPUT.npz --ridge-method butterfly_curvature")
+        next_steps.append("bsaxs analyze OUTPUT.npz --ridge-method butterfly_curvature; use inspect first only when its diagnostics inform the analysis settings.")
     elif command == "project":
         next_steps.append("Prefer `bsaxs batch` when you need streaming CSV/JSON/NPZ longitudinal exports.")
     elif command == "report":
         next_steps.append("Review the generated index, summary and figures alongside the source NPZ exports.")
     else:
-        next_steps.append("Run `bsaxs describe` for the supported command catalog.")
+        next_steps.append("If the required command is unknown, use `bsaxs describe`; otherwise reuse its known contract.")
 
     return {
         "scientific_acceptance": False,
@@ -256,10 +256,10 @@ def annotate_report(
     return annotated
 
 
-def agent_manifest() -> dict[str, Any]:
-    """Catalog an agent can parse before touching experimental data."""
+def agent_manifest(command: str | None = None) -> dict[str, Any]:
+    """Return the catalog, or one command's contract on demand."""
 
-    return {
+    report = {
         "schema_version": AGENT_MANIFEST_SCHEMA,
         "ok": True,
         "tool": tool_info(),
@@ -280,14 +280,15 @@ def agent_manifest() -> dict[str, Any]:
             "overwrite": False,
         },
         "recommended_agent_workflow": [
-            "bsaxs-doctor --json   # or: bsaxs doctor --json",
-            "bsaxs describe",
-            "bsaxs synthetic --shape 128x128 -o synthetic.npz",
-            "bsaxs inspect synthetic.npz",
-            "bsaxs analyze synthetic.npz --ridge-method butterfly_curvature "
+            "When the environment is new, dependencies changed, or imports fail: bsaxs doctor --json; reuse a successful check for the same environment.",
+            "When a command contract is unknown: bsaxs describe COMMAND (or bsaxs COMMAND --help); reuse the contract for unchanged installed code.",
+            "When a synthetic reproduction is needed: bsaxs synthetic --shape 128x128 -o synthetic.npz; a working real-data task does not require a synthetic rehearsal.",
+            "When frame diagnostics are needed to choose settings: bsaxs inspect INPUT; otherwise analyze the selected input directly.",
+            "For a single-frame measurement: bsaxs analyze INPUT --ridge-method butterfly_curvature "
             "--ellipse-preset standard --butterfly-stage evaluate --butterfly-resamples 0",
-            "bsaxs preflight PACKAGE --manifest MANIFEST --poni PONI --mask MASK -o results/preflight",
-            "bsaxs batch 'PACKAGE/images/*.edf' --unattended PACKAGE --manifest PACKAGE/manifest.csv --poni PACKAGE/geometry.poni --mask PACKAGE/mask.npy -o results/unattended_001 --stream --report --package",
+            "For an explicitly requested package audit: bsaxs preflight PACKAGE --manifest MANIFEST --poni PONI --mask MASK -o results/preflight; unattended batch already performs its own preflight.",
+            "For unattended fitting: bsaxs batch 'PACKAGE/images/*.edf' --unattended PACKAGE --manifest PACKAGE/manifest.csv --poni PACKAGE/geometry.poni --mask PACKAGE/mask.npy -o results/unattended_001 --stream --report --package",
+            "For an existing batch's figures or delivery: bsaxs report OUTPUT or bsaxs package OUTPUT; reuse exports without rerunning inspect, preflight or fitting.",
         ],
         "commands": [
             {
@@ -341,7 +342,7 @@ def agent_manifest() -> dict[str, Any]:
             },
             {
                 "name": "describe",
-                "purpose": "Print this machine-readable catalog.",
+                "purpose": "Print the catalog, or use describe COMMAND for only that command's contract.",
                 "stdout": AGENT_MANIFEST_SCHEMA,
                 "exit_codes": {"0": EXIT_CODES["0"]},
             },
@@ -391,6 +392,30 @@ def agent_manifest() -> dict[str, Any]:
                 "exit_codes": EXIT_CODES,
             },
             {
+                "name": "benchmark",
+                "purpose": "Generate the explicitly selected synthetic T1/T2 benchmark evidence; not a prerequisite for an existing-data task.",
+                "stdout": "JSON with suite and manifests",
+                "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
+            },
+            {
+                "name": "annotation-pack",
+                "purpose": "Prepare observed-frame annotation candidates for human review.",
+                "stdout": "JSON with output_directory, candidate_count, status and human_consensus",
+                "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
+            },
+            {
+                "name": "p3-status",
+                "purpose": "Evaluate selected P3 evidence and thresholds without granting scientific acceptance.",
+                "stdout": "P3 report with exit_code",
+                "exit_codes": EXIT_CODES,
+            },
+            {
+                "name": "p4-evaluate",
+                "purpose": "Run explicitly requested P4 engineering validation; scientific review remains separate.",
+                "stdout": "JSON with stage, engineering_status, scientific_status, p4_go_no_go and outputs",
+                "exit_codes": EXIT_CODES,
+            },
+            {
                 "name": "gui",
                 "purpose": "Open the workbench. Prefer bsaxs-gui on Windows pythonw.",
                 "stdout": "none",
@@ -399,12 +424,20 @@ def agent_manifest() -> dict[str, Any]:
         ],
         "documentation": {
             "agents": "AGENTS.md",
+            "agent_workflow": "docs/agent_workflow_zh.md",
             "user_guide": "docs/user_guide_zh.md",
             "first_run": "docs/first_run_zh.md",
             "result_schema": "docs/validation/result_schema_v1.md",
             "scientific_scope": "docs/scientific_basis_zh.md",
         },
     }
+    if command is not None:
+        selected = [item for item in report["commands"] if item["name"] == command]
+        if not selected:
+            raise ValueError(f"unknown catalog command {command!r}; use bsaxs describe for available commands")
+        report["commands"] = selected
+        report.pop("recommended_agent_workflow")
+    return report
 
 
 __all__ = [

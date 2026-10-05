@@ -2,14 +2,45 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'assets/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'assets/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install linter
+        run: python -m pip install -c constraints/validation-py311-313.txt ruff
+      - name: Lint
+        run: python -m ruff check src tests scripts
+
   tests:
     name: tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: lint
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -59,12 +90,6 @@ jobs:
 
       - name: Check dependencies
         run: python -m pip check
-
-      - name: Lint
-        run: python -m ruff check src tests scripts
-
-      - name: Compile
-        run: python -m compileall -q src tests scripts
 
       - name: Test
         env:

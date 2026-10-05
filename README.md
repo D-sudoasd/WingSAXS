@@ -131,7 +131,7 @@ Finish existing batch exports without fitting or drawing again: `bsaxs package r
 
 `bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_WingSAXS.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
 
-Agents (and any non-interactive operator) should start with `bsaxs describe` or a bare `bsaxs`. That prints a JSON catalog of commands, exit codes, and scientific invariants. Environment checks: `bsaxs doctor --json` (same as `bsaxs-doctor`). Failed commands emit a JSON error envelope on stdout and a human `错误：` line on stderr. See [AGENTS.md](AGENTS.md).
+Agents can load one unknown command's JSON contract with `bsaxs describe COMMAND`; bare `bsaxs` retains the full catalog. Reuse known contracts for unchanged installed code, and run `bsaxs doctor --json` for a new/changed environment or an import failure. Execute the operation the task needs: existing exports can be reported or packaged without fitting again, and unattended batch already runs preflight. Failed commands emit a JSON error envelope on stdout and a human `错误：` line on stderr. See [AGENTS.md](AGENTS.md) and [task routing and verification](docs/agent_workflow_zh.md).
 
 ## Names
 
@@ -198,6 +198,10 @@ annular 点的 `q_annulus` 是预设 q 环的采样坐标，不是径向反射�
 评估后可在「叠加图层」分别检查实测谱、观测轨迹、几何候选和全像素模型椭圆；峰位表区分原始最亮点 G 与受支持峰 P，选中行即可定位。导出同时包含干净叠加图、峰位图、局部放大、剖面及 CSV/NPZ 源数据。匹配差或参数不稳定时会保留明确提示，不能仅凭曲线看起来像蝴蝶判定拟合正确。详见[测量图与峰位导出](docs/butterfly_figures_zh.md)。
 
 ### 常用命令
+
+以下是按任务选择的入口，不是每次都要执行的前置链。未知命令用
+`bsaxs describe COMMAND`；环境和安装代码未变化时复用已有检查与命令契约。
+修改代码时的读取范围、验证起点和深度检查条件见[agent 工作流](docs/agent_workflow_zh.md)。
 
 ```bash
 bsaxs describe

@@ -69,6 +69,33 @@ def test_cli_help_includes_describe_and_doctor() -> None:
     assert {"describe", "doctor", "inspect", "analyze", "batch", "synthetic", "gui"} <= set(choices)
 
 
+def test_describe_one_command_retains_its_contract_without_unrelated_details(capsys) -> None:
+    full = agent_manifest()
+    assert main(["describe", "batch"]) == 0
+    selected = json.loads(capsys.readouterr().out)
+    assert selected == agent_manifest("batch")
+    assert selected["commands"] == [item for item in full["commands"] if item["name"] == "batch"]
+    assert selected["invariants"] == full["invariants"]
+    assert selected["exit_codes"] == full["exit_codes"]
+    assert "recommended_agent_workflow" not in selected
+    assert len(json.dumps(selected)) < len(json.dumps(full)) / 2
+
+
+def test_describe_unknown_command_emits_json_error(capsys) -> None:
+    assert main(["describe", "unknown"]) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert error["schema_version"] == CLI_ERROR_SCHEMA
+    assert "unknown catalog command" in error["error"]["message"]
+
+
+def test_scoped_catalog_covers_every_supported_cli_command() -> None:
+    choices = build_parser()._subparsers._group_actions[0].choices
+    assert {item["name"] for item in agent_manifest()["commands"]} == set(choices)
+    for command in choices:
+        selected = agent_manifest(command)
+        assert [item["name"] for item in selected["commands"]] == [command]
+
+
 def test_inspect_without_input_emits_json_error_envelope(capsys) -> None:
     assert main(["inspect"]) == 2
     captured = capsys.readouterr()

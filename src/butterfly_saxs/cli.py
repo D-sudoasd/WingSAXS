@@ -423,6 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=False)
 
     describe_parser = sub.add_parser("describe", help="打印机器可读的命令、退出码与科学边界清单")
+    describe_parser.add_argument("topic", nargs="?", help="只返回指定命令的契约，例如 describe batch")
     describe_parser.add_argument(
         "--text",
         action="store_true",
@@ -1552,7 +1553,7 @@ def _handle_p4_evaluate(args: argparse.Namespace) -> int:
 
 
 def _handle_describe(args: argparse.Namespace) -> int:
-    report = agent_manifest()
+    report = agent_manifest(getattr(args, "topic", None))
     if getattr(args, "text", False):
         tool = report["tool"]
         print(

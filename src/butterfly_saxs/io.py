@@ -58,6 +58,7 @@ class LoadedImage:
     frame: int | None = None
     dataset: str | None = None
     valid_mask: np.ndarray | None = None
+    qmap: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.data = np.asarray(self.data)
@@ -169,6 +170,7 @@ def load_image(
     mask: Any | None = None,
     mask_frame: int | None = None,
     mask_dataset: str | None = None,
+    include_qmap: bool = False,
 ) -> LoadedImage:
     """Read one two-dimensional detector frame.
 
@@ -196,6 +198,10 @@ def load_image(
         Dataset/key selector for a path-valued mask.  It is independent from
         the image ``dataset`` selector and is required for an ambiguous mask
         source.  When omitted, a mask never inherits the image selector.
+    include_qmap:
+        Read reserved NPZ q-map fields beside the selected intensity in the
+        same archive access. Only this mode excludes q-map keys when choosing
+        a sole intensity dataset; multiple intensity datasets remain ambiguous.
     """
 
     source = Path(path).expanduser()
@@ -220,6 +226,7 @@ def load_image(
             f"supported: {', '.join(sorted(_IMAGE_SUFFIXES))}"
         )
 
+    qmap = None
     if kind == "fabio":
         array, metadata, selected_frame = _read_fabio(source, frame=frame)
         selected_dataset = None
@@ -253,8 +260,8 @@ def load_image(
         )
         selected_dataset = None
     elif kind == "npz":
-        array, metadata, selected_frame, selected_dataset = _read_npz(
-            source, frame=frame, dataset=dataset
+        array, metadata, selected_frame, selected_dataset, qmap = _read_npz(
+            source, frame=frame, dataset=dataset, include_qmap=include_qmap
         )
     elif kind == "csv":
         if dataset is not None:
@@ -326,6 +333,7 @@ def load_image(
         frame=selected_frame,
         dataset=selected_dataset,
         valid_mask=combined_mask,
+        qmap=qmap,
     )
 
 
@@ -487,7 +495,8 @@ def _read_npz(
     *,
     frame: int | None,
     dataset: str | None,
-) -> tuple[np.ndarray, dict[str, Any], int | None, str]:
+    include_qmap: bool,
+) -> tuple[np.ndarray, dict[str, Any], int | None, str, dict[str, Any] | None]:
     if dataset is not None and not dataset:
         raise DatasetSelectionError("NPZ dataset/key cannot be empty")
     try:
@@ -496,12 +505,17 @@ def _read_npz(
         raise DataIOError(f"could not read NPZ source {source}: {exc}") from exc
     try:
         keys = list(archive.files)
+        qmap_keys = {"qx", "qy", "q", "theta", "chi", "mask", "valid_mask", "q_unit"}
         if dataset is None:
-            if len(keys) != 1:
+            candidates = (
+                [key for key in keys if key not in qmap_keys]
+                if include_qmap and len(keys) > 1 else keys
+            )
+            if len(candidates) != 1:
                 raise DatasetSelectionError(
                     f"NPZ source {source} has datasets {keys!r}; select dataset='...'"
                 )
-            selected_dataset = keys[0]
+            selected_dataset = candidates[0]
         else:
             selected_dataset = dataset
             if selected_dataset not in keys:
@@ -514,9 +528,53 @@ def _read_npz(
             array, frame=frame, source=source, source_kind="NPZ"
         )
         metadata = {"format": "npz", "datasets": keys}
-        return array, metadata, selected_frame, selected_dataset
+        qmap: dict[str, Any] = {}
+        if include_qmap:
+            for key in qmap_keys - {"q_unit"}:
+                if key in keys:
+                    qmap[key] = _select_npz_qmap_field(
+                        archive[key], key=key, frame=selected_frame, image_shape=array.shape
+                    )
+            if "q_unit" in keys:
+                raw_unit = np.asarray(archive["q_unit"])
+                if raw_unit.ndim != 0:
+                    raise DataShapeError("NPZ q_unit 必须是标量字符串")
+                qmap["q_unit"] = str(raw_unit.item())
+        return array, metadata, selected_frame, selected_dataset, qmap or None
     finally:
         archive.close()
+
+
+def _select_npz_qmap_field(
+    value: Any,
+    *,
+    key: str,
+    frame: int | None,
+    image_shape: tuple[int, int],
+) -> np.ndarray:
+    """Select a frame from an NPZ map while retaining shared 2-D maps."""
+
+    array = np.asarray(value)
+    if array.ndim != 3:
+        # The q-map validator handles malformed non-frame fields.
+        return array
+    if frame is None:
+        raise FrameSelectionError(
+            f"NPZ embedded qmap field {key!r} contains {array.shape[0]} frames; "
+            "select an explicit frame=..."
+        )
+    if frame >= array.shape[0]:
+        raise FrameSelectionError(
+            f"frame {frame} is outside NPZ embedded qmap field {key!r} "
+            f"with {array.shape[0]} frames"
+        )
+    selected = np.asarray(array[frame])
+    if selected.shape != image_shape:
+        raise DataShapeError(
+            f"selected NPZ qmap field {key!r} must have image shape "
+            f"{image_shape}; frame {frame} has shape {selected.shape}"
+        )
+    return selected
 
 
 def _read_tiff(
