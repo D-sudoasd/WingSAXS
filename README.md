@@ -24,10 +24,13 @@ WingSAXS reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), deriv
 
 | Observed evidence / 观测证据 | Reported quantities / 输出量 |
 | --- | --- |
-| q-ring profiles and observed petal trajectories<br>q 环剖面与实测花瓣轨迹 | First-order `q*` and ring period `L = 2π/q*`<br>一阶 `q*` 与环尺度 `L = 2π/q*` |
+| Radial reflection peak with calibrated q and an assigned reflection order<br>具有物理 q 标定与反射级次依据的径向反射峰 | First-order `q*` and ring period `L = 2π/q*`<br>一阶 `q*` 与环尺度 `L = 2π/q*` |
 | Occupied sides and supported branches<br>实际占据象限与有数据支持的分支 | Apparent `a`, `b/a`, and `θ`, with support and confidence<br>表观 `a`、`b/a`、`θ`，并附观测支持与可信度 |
 | Missing lobes and rings remain missing<br>缺失花瓣与 q 环保持缺失 | Conditional **Ln / Lz / L major** candidates<br>附条件的 **Ln / Lz / 长轴 L** 候选 |
 | Ring diagnosis and fit limitations<br>环诊断与拟合限制 | Finite boundary or extrapolated candidates remain inspectable; ring L and Ln stay distinct<br>有限边界值或外推候选仍可检查；环尺度 L 与 Ln 分列 |
+
+Fixed-q annular profiles locate angular lobe trajectories. Their `q_annulus` is a sampling coordinate, not a radial reflection `q*`, and must not be converted into a period.<br>
+固定 q 环剖面用于定位角向花瓣轨迹；`q_annulus` 是采样坐标，不是径向反射峰 `q*`，不能据此换算周期。
 
 A successful fit is not scientific acceptance. Pixel-q does not provide a physical period, and missing quadrants are never synthesized.<br>
 拟合成功不等于科学结论已获接受；像素 q 不能给出物理周期，也不会补造缺失象限。
