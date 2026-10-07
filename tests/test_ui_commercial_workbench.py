@@ -76,6 +76,27 @@ def test_measurement_tables_and_batch_options_remain_reachable_at_supported_mini
     window.close()
 
 
+def test_butterfly_controls_fit_narrow_scroll_viewport_in_both_languages(qtbot):
+    from PySide6 import QtWidgets
+
+    window = MainWindow(auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    window.resize(980, 680)
+    window.show()
+    scroll = window.butterfly_workbench.findChild(QtWidgets.QScrollArea, "butterflyControlsScroll")
+    panel = scroll.widget()
+    for language in ("en", "zh_CN"):
+        window.set_language(language, persist=False)
+        qtbot.waitUntil(lambda: panel.width() <= scroll.viewport().width())
+        for widget in panel.findChildren(QtWidgets.QWidget):
+            if not widget.isVisible() or not isinstance(widget, (QtWidgets.QPushButton, QtWidgets.QComboBox, QtWidgets.QAbstractSpinBox)):
+                continue
+            left = widget.mapTo(scroll.viewport(), widget.rect().topLeft()).x()
+            right = widget.mapTo(scroll.viewport(), widget.rect().bottomRight()).x()
+            assert 0 <= left <= right < scroll.viewport().width(), widget.objectName()
+    window.close()
+
+
 def test_parent_close_waits_for_measurement_worker_and_discards_its_result(qtbot, monkeypatch):
     from butterfly_saxs.ui import azimuthal_page
 
