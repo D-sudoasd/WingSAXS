@@ -10,13 +10,14 @@ def _text(pair: tuple[str, str], language: str) -> str:
     return pair[1 if language == "en" else 0]
 
 
-def _set_help(control, text: str) -> None:
+def _set_help(control, text: str, *, preserve_accessible_description: bool = False) -> None:
     control.setToolTip(text)
     control.setWhatsThis(text)
     if isinstance(control, QtGui.QAction):
         control.setStatusTip(text)
     elif isinstance(control, QtWidgets.QWidget):
-        control.setAccessibleDescription(text)
+        if not preserve_accessible_description:
+            control.setAccessibleDescription(text)
         # Qt's embedded editor otherwise intercepts hovering over spin-box text.
         if isinstance(control, QtWidgets.QAbstractSpinBox):
             control.lineEdit().setToolTip(text)
@@ -63,7 +64,11 @@ def apply_help(root, language: str = "zh_CN") -> None:
                     text = _text(pair, language)
                     if name == "flags_label":
                         text += "\n" + control.text()
-                    _set_help(control, text)
+                    # Profile tables describe their actual columns, units and
+                    # empty state dynamically; generic hover help is separate.
+                    _set_help(control, text, preserve_accessible_description=(
+                        class_name == "_ProfilePanel" and name == "table"
+                    ))
             for name, options in catalog.OPTION_HELP.get(class_name, {}).items():
                 combo = _field(owner, name)
                 if not isinstance(combo, QtWidgets.QComboBox):

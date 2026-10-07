@@ -153,3 +153,25 @@ def test_help_refresh_preserves_the_actual_failure_reason(qtbot):
     window.set_language("en", persist=False)
     assert "mask_shape_mismatch" in window.flags_label.toolTip()
     window.close()
+
+
+def test_profile_table_dynamic_description_coexists_with_generic_help(qtbot):
+    window = MainWindow(engine=object(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    workbench = window.butterfly_workbench
+    for panel in (workbench.normal_profile, workbench.ellipse_diagnostic,
+                  workbench.peak_angular_profile, workbench.peak_radial_profile):
+        panel.set_series([0.1, 0.2], {"raw": [1.0, 2.0]},
+                         x_label="q (1/nm)", y_label="intensity")
+        description = panel.table.accessibleDescription()
+        assert "q (1/nm)" in description
+        apply_help(workbench, "en")
+        assert panel.table.accessibleDescription() == description
+        assert panel.table.toolTip()
+        assert panel.table.whatsThis() == panel.table.toolTip()
+        panel.clear()
+        empty_description = panel.table.accessibleDescription()
+        apply_help(workbench, "en")
+        assert panel.table.accessibleDescription() == empty_description
+        assert empty_description == "No profile values are available."
+    window.close()
