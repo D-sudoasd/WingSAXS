@@ -554,6 +554,7 @@ if QT_AVAILABLE:
             self._landmark_visibility_user_override = False
             self._suppress_landmark_visibility_tracking = False
             self._selected_profile_point_id: str | None = None
+            self._rail_user_visible: bool | None = None
             self._manual_review: dict[str, Any] = {
                 "manual_status": "unreviewed",
                 "reviewed_by": "",
@@ -580,6 +581,11 @@ if QT_AVAILABLE:
             self.status_label = QtWidgets.QLabel("Ready · trace", self)
             self.status_label.setObjectName("butterflyStatusLabel")
             header.addWidget(self.status_label)
+            self.rail_toggle = QtWidgets.QToolButton(self)
+            self.rail_toggle.setObjectName("butterflyRailToggle")
+            self.rail_toggle.setCheckable(True)
+            self.rail_toggle.toggled.connect(self._on_rail_toggled)
+            header.addWidget(self.rail_toggle)
             root.addLayout(header)
             self.quality_summary = ButterflyQualitySummary(self, language=self._language)
             root.addWidget(self.quality_summary)
@@ -598,6 +604,7 @@ if QT_AVAILABLE:
 
             splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
             splitter.setObjectName("butterflyMainSplitter")
+            splitter.setChildrenCollapsible(False)
             root.addWidget(splitter, 1)
 
             left = QtWidgets.QWidget(splitter)
@@ -605,6 +612,7 @@ if QT_AVAILABLE:
             left_layout.setContentsMargins(0, 0, 4, 0)
             frame_rail = QtWidgets.QWidget(left)
             frame_rail.setObjectName("butterflyFrameRail")
+            self.frame_rail = frame_rail
             frame_rail.setMinimumWidth(142)
             frame_rail.setMaximumWidth(190)
             frame_layout = QtWidgets.QVBoxLayout(frame_rail)
@@ -697,6 +705,7 @@ if QT_AVAILABLE:
             right_scroll.setObjectName("butterflyControlsScroll")
             right_scroll.setWidgetResizable(True)
             right_scroll.setMinimumWidth(340)
+            right_scroll.setMaximumWidth(440)
             right_scroll.setHorizontalScrollBarPolicy(
                 QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
             )
@@ -1080,6 +1089,7 @@ if QT_AVAILABLE:
             actions_layout.setSpacing(2)
             self.identify_button = QtWidgets.QPushButton("Identify arcs / 识别", actions_group)
             self.identify_button.setObjectName("butterflyIdentifyButton")
+            self.identify_button.setProperty("role", "primary")
             self.identify_button.setToolTip("Trace observed arcs using butterfly curvature")
             self.identify_button.clicked.connect(self.request_identify)
             actions_layout.addWidget(self.identify_button)
@@ -1147,6 +1157,22 @@ if QT_AVAILABLE:
             self._sync_trace_method_controls()
             self.set_language(self._language)
             self._sync_action_state()
+
+        def _on_rail_toggled(self, checked: bool) -> None:
+            self._rail_user_visible = bool(checked)
+            self.frame_rail.setVisible(checked)
+
+        def _update_rail_layout(self) -> None:
+            visible = self.width() >= 1180 if self._rail_user_visible is None else self._rail_user_visible
+            self.frame_rail.setVisible(visible)
+            blocker = QtCore.QSignalBlocker(self.rail_toggle)
+            self.rail_toggle.setChecked(visible)
+            del blocker
+
+        def resizeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+            super().resizeEvent(event)
+            if hasattr(self, "frame_rail"):
+                self._update_rail_layout()
 
         @property
         def butterfly_settings(self) -> dict[str, Any]:
@@ -1317,6 +1343,12 @@ if QT_AVAILABLE:
 
         def _render_trace_method_label(self) -> None:
             english = self._language.lower().startswith("en")
+            self.rail_toggle.setText("Frames / points" if english else "帧与测量点")
+            self.rail_toggle.setToolTip(
+                "Show or hide frame and measured-point lists; the analysis stays unchanged."
+                if english else "展开或收起帧与测量点列表，不改变分析结果。"
+            )
+            self.rail_toggle.setAccessibleName(self.rail_toggle.text())
             method = self._trace_method()
             if method == _TRACE_METHOD_ANNULAR_PEAK:
                 text = "Annular I(χ) four-lobe tracks" if english else "环积分 I(χ) 四瓣轨迹"
@@ -2517,10 +2549,10 @@ if QT_AVAILABLE:
             correction_form.labelForField(self.seed_side_combo).setText(
                 "Seed side" if english else "种子侧边"
             )
-            self.identify_button.setText("Identify arcs" if english else "识别弧线 / Identify")
-            self.evaluate_button.setText("Evaluate" if english else "评估 / Evaluate")
-            self.apply_batch_button.setText("Apply to batch" if english else "应用到批处理 / Apply")
-            self.cancel_button.setText("Cancel" if english else "取消 / Cancel")
+            self.identify_button.setText("Identify arcs" if english else "识别弧线")
+            self.evaluate_button.setText("Evaluate" if english else "评估结果")
+            self.apply_batch_button.setText("Apply to batch" if english else "应用到批处理")
+            self.cancel_button.setText("Cancel" if english else "取消")
             self.export_button.setText("Export evidence" if english else "导出分析证据")
             self.figure_export_button.setText(self._tr("button.butterfly_figure"))
             self.figure_export_button.setToolTip(self._tr("tooltip.butterfly_figure"))
@@ -2544,6 +2576,9 @@ if QT_AVAILABLE:
             self._render_page_status()
             self._retranslate_q_star_source_cells()
             self._sync_action_state()
+            from .help import apply_help
+
+            apply_help(self, self._language)
 
         def _retranslate_q_star_source_cells(self) -> None:
             for row in range(self.quantity_table.rowCount()):
@@ -2857,6 +2892,10 @@ if QT_AVAILABLE:
             self.clear_result()
             self.analysisChanged.emit({"butterfly": self.butterfly_settings})
             self._sync_action_state()
+
+            from .help import refresh_evaluation_help
+
+            refresh_evaluation_help(self, self._language)
 
         def set_q_window(self, q_window: Sequence[Any] | None = None) -> None:
             if q_window is None:
@@ -4256,9 +4295,11 @@ if QT_AVAILABLE:
         def _open_numeric_edit_dialog(self) -> None:
             english = self._language.lower().startswith("en")
             dialog = QtWidgets.QDialog(self)
+            dialog.setObjectName("butterflyNumericDialog")
             dialog.setWindowTitle("Keyboard edit" if english else "键盘编辑")
             form = QtWidgets.QFormLayout(dialog)
             mode = QtWidgets.QComboBox(dialog)
+            mode.setObjectName("butterflyNumericMode")
             mode.addItem("Seed point" if english else "种子点", "seed")
             mode.addItem("Exclude polygon" if english else "排除多边形", "exclude_polygon")
             mode.addItem("Include polygon" if english else "包含多边形", "include_polygon")
@@ -4267,10 +4308,13 @@ if QT_AVAILABLE:
             form.addRow("Mode" if english else "模式", mode)
             qx_edit = QtWidgets.QLineEdit(dialog)
             qy_edit = QtWidgets.QLineEdit(dialog)
+            qx_edit.setObjectName("butterflyNumericQx")
+            qy_edit.setObjectName("butterflyNumericQy")
             form.addRow("qx" if english else "qx", qx_edit)
             form.addRow("qy" if english else "qy", qy_edit)
             points_edit = QtWidgets.QLineEdit(dialog)
-            points_edit.setPlaceholderText("qx,qy; qx,qy; qx,qy")
+            points_edit.setObjectName("butterflyNumericPoints")
+            points_edit.setPlaceholderText("qx,qy; qx,qy; …")
             form.addRow("Points" if english else "顶点", points_edit)
             buttons = QtWidgets.QDialogButtonBox(
                 QtWidgets.QDialogButtonBox.StandardButton.Ok
@@ -4280,6 +4324,11 @@ if QT_AVAILABLE:
             form.addRow(buttons)
             buttons.accepted.connect(dialog.accept)
             buttons.rejected.connect(dialog.reject)
+            buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setObjectName("butterflyNumericApply")
+            buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setObjectName("butterflyNumericCancel")
+            from .help import apply_help
+
+            apply_help(dialog, self._language)
             if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
                 return
             kind = str(mode.currentData())

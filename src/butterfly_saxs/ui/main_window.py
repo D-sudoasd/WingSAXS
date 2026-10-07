@@ -1115,6 +1115,21 @@ def _is_butterfly_trace_result(result: Any) -> bool:
 
 if QT_AVAILABLE:
 
+    class ElidedLabel(QtWidgets.QLabel):
+        """Keep full context available in help without widening the window."""
+
+        def paintEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+            del event
+            painter = QtGui.QPainter(self)
+            painter.setPen(self.palette().color(QtGui.QPalette.ColorRole.WindowText))
+            painter.drawText(
+                self.contentsRect(),
+                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                self.fontMetrics().elidedText(
+                    self.text(), QtCore.Qt.TextElideMode.ElideRight, self.contentsRect().width()
+                ),
+            )
+
     class CompactDoubleSpinBox(QtWidgets.QDoubleSpinBox):
         """Bounded-width numeric field that still accepts large scientific values."""
 
@@ -1326,6 +1341,13 @@ if QT_AVAILABLE:
                 serialize=_jsonable,
             )
             self._retranslate_ui()
+            from .theme import apply_theme, style_plot
+
+            apply_theme(self)
+            if _pg is not None:
+                for plot in self.findChildren(_pg.PlotWidget):
+                    style_plot(plot)
+            self._set_busy(False)
             self._set_status("status.ready")
 
         def _on_main_page_changed(self, index: int) -> None:
@@ -1340,6 +1362,8 @@ if QT_AVAILABLE:
                 getattr(self, "local_measurement_page", None),
                 getattr(self, "azimuthal_page", None),
                 getattr(self, "density2d_page", None),
+                getattr(self, "batch_page", None),
+                getattr(self, "evolution_page", None),
             ):
                 self.parameters_dock.hide()
             else:
@@ -1361,6 +1385,7 @@ if QT_AVAILABLE:
 
         def _sync_image_measurement_pages(self) -> None:
             """Supply independent image tools with current coordinates and usable pixels."""
+            self._refresh_workspace_context()
             if not hasattr(self, "local_measurement_page") or _np is None:
                 return
             pages = (self.local_measurement_page, self.azimuthal_page, self.density2d_page)
@@ -1416,6 +1441,7 @@ if QT_AVAILABLE:
             self.project_menu.addAction(self.legacy_saxs_action)
             self.open_image_action = QtGui.QAction("Open image…", self)
             self.open_image_action.setObjectName("openImageAction")
+            self.open_image_action.setShortcut(QtGui.QKeySequence("Ctrl+O"))
             self.open_image_action.triggered.connect(self.open_image)
             self.project_menu.addAction(self.open_image_action)
             self.open_poni_action = QtGui.QAction("Select PONI…", self)
@@ -1462,12 +1488,16 @@ if QT_AVAILABLE:
 
             self.file_toolbar = self.addToolBar("Project")
             self.file_toolbar.setObjectName("projectToolbar")
-            self.file_toolbar.addAction(self.open_project_action)
-            self.file_toolbar.addAction(self.save_project_action)
+            self.file_toolbar.setMovable(False)
+            self.open_project_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+O"))
+            self.save_project_action.setShortcut(QtGui.QKeySequence("Ctrl+S"))
             self.file_toolbar.addAction(self.open_image_action)
             self.file_toolbar.addAction(self.open_poni_action)
             self.file_toolbar.addAction(self.open_mask_action)
-            self.file_toolbar.addAction(self.clear_mask_action)
+            self.file_toolbar.addSeparator()
+            self.file_toolbar.addAction(self.open_project_action)
+            self.file_toolbar.addAction(self.save_project_action)
+            self.file_toolbar.addSeparator()
             self.file_toolbar.addAction(self.export_evidence_action)
 
         def open_legacy_saxs(self, _checked: bool = False) -> None:
@@ -1523,8 +1553,33 @@ if QT_AVAILABLE:
                 QtWidgets.QMessageBox.warning(self, "SAXSAnalyzer", str(exc))
 
         def _build_central_pages(self) -> None:
+            workspace = QtWidgets.QWidget(self)
+            workspace_layout = QtWidgets.QVBoxLayout(workspace)
+            workspace_layout.setContentsMargins(0, 0, 0, 0)
+            workspace_layout.setSpacing(0)
+            self.workspace_header = QtWidgets.QWidget(workspace)
+            self.workspace_header.setObjectName("workspaceHeader")
+            header_layout = QtWidgets.QHBoxLayout(self.workspace_header)
+            header_layout.setContentsMargins(12, 8, 12, 8)
+            self.workspace_context = ElidedLabel(self.workspace_header)
+            self.workspace_context.setObjectName("workspaceContext")
+            self.workspace_context.setMinimumWidth(0)
+            self.workspace_context.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred
+            )
+            header_layout.addWidget(self.workspace_context, 1)
+            self.workspace_open_button = QtWidgets.QPushButton(self.workspace_header)
+            self.workspace_open_button.setObjectName("workspaceOpenButton")
+            self.workspace_open_button.setProperty("role", "primary")
+            self.workspace_open_button.clicked.connect(self.open_image)
+            header_layout.addWidget(self.workspace_open_button)
+            workspace_layout.addWidget(self.workspace_header)
             self.pages = QtWidgets.QTabWidget(self)
             self.pages.setObjectName("mainPages")
+            self.pages.setDocumentMode(True)
+            self.pages.tabBar().setUsesScrollButtons(True)
+            self.pages.tabBar().setExpanding(False)
+            workspace_layout.addWidget(self.pages, 1)
             # The butterfly workflow is the default first page.  It delegates
             # computation to this window's existing GenerationGuard/worker
             # seam, so the established refinement API remains the authority
@@ -1562,7 +1617,27 @@ if QT_AVAILABLE:
 
             self.lamellar_page = LamellarPage(self.pages, language=self._language)
             self.pages.addTab(self.lamellar_page, "实空间片层")
-            self.setCentralWidget(self.pages)
+            self.setCentralWidget(workspace)
+
+        def _refresh_workspace_context(self) -> None:
+            english = self._language == "en"
+            self.workspace_open_button.setText(self.open_image_action.text())
+            self.workspace_open_button.setToolTip(self.open_image_action.toolTip())
+            if self._observed is None:
+                text = (
+                    "Open a 2D SAXS image to start analysis"
+                    if english else "打开二维 SAXS 图像，开始分析"
+                )
+                source = text
+            else:
+                source = str(self._source_path or ("In-memory frame" if english else "内存帧"))
+                height, width = _np.asarray(self._observed).shape
+                unit = self._active_q_unit()
+                frame = "" if self._frame is None else f" · frame {self._frame}"
+                text = f"{Path(source).name}{frame}  ·  {width} × {height} px  ·  q: {unit}"
+            self.workspace_context.setText(text)
+            self.workspace_context.setToolTip(source)
+            self.workspace_context.setAccessibleName(text)
 
         def _butterfly_page_analysis(self, settings: Any) -> dict[str, Any]:
             """Pass the user's selected ellipse preset through unchanged."""
@@ -2047,30 +2122,29 @@ if QT_AVAILABLE:
             self.parameter_table.verticalHeader().setDefaultSectionSize(24)
             layout.addWidget(self.parameter_table, 1)
 
-            controls = QtWidgets.QHBoxLayout()
+            controls = QtWidgets.QGridLayout()
             self.preview_button = QtWidgets.QPushButton("Preview")
             self.preview_button.setObjectName("previewButton")
             self.preview_button.setToolTip("根据当前参数生成模型预览（不改变参数）")
-            self.preview_button.setStyleSheet("QPushButton { background: #2d6cdf; color: white; font-weight: 600; }")
+            self.preview_button.setProperty("role", "primary")
             self.preview_button.clicked.connect(self.request_preview)
-            controls.addWidget(self.preview_button)
+            controls.addWidget(self.preview_button, 0, 0)
             self.optimize_button = QtWidgets.QPushButton("Optimize")
             self.optimize_button.setObjectName("optimizeButton")
             self.optimize_button.setToolTip("在后台精修可变参数")
-            self.optimize_button.setStyleSheet("QPushButton { background: #238636; color: white; font-weight: 600; }")
             self.optimize_button.clicked.connect(self.request_optimize)
-            controls.addWidget(self.optimize_button)
+            controls.addWidget(self.optimize_button, 0, 1)
             self.cancel_button = QtWidgets.QPushButton("Cancel")
             self.cancel_button.setObjectName("cancelButton")
             self.cancel_button.setToolTip("取消当前请求并使迟到结果失效")
             self.cancel_button.setShortcut(QtGui.QKeySequence("Esc"))
             self.cancel_button.clicked.connect(self.cancel_jobs)
-            controls.addWidget(self.cancel_button)
+            controls.addWidget(self.cancel_button, 1, 0)
             self.ignore_late_result_button = QtWidgets.QPushButton("Ignore late result")
             self.ignore_late_result_button.setObjectName("ignoreLateResultButton")
             self.ignore_late_result_button.setToolTip("仅使迟到结果失效，不改变当前数据")
             self.ignore_late_result_button.clicked.connect(self.ignore_late_result)
-            controls.addWidget(self.ignore_late_result_button)
+            controls.addWidget(self.ignore_late_result_button, 1, 1)
             self.cancel_button.setEnabled(False)
             self.ignore_late_result_button.setEnabled(False)
             layout.addLayout(controls)
@@ -2385,8 +2459,10 @@ if QT_AVAILABLE:
             self._set_profile_summary(self._tr("profile.summary_empty"))
             root.addWidget(self.profile_summary_label)
 
-            lower = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self.measurements_page)
-            lower.setObjectName("measurementTablesSplitter")
+            lower = QtWidgets.QTabWidget(self.measurements_page)
+            lower.setObjectName("measurementTableTabs")
+            lower.setDocumentMode(True)
+            self.measurement_table_tabs = lower
             lobe_panel = QtWidgets.QWidget(lower)
             lobe_layout = QtWidgets.QVBoxLayout(lobe_panel)
             self.lobe_panel_label = QtWidgets.QLabel("Four-lobe measurements", lobe_panel)
@@ -2399,7 +2475,7 @@ if QT_AVAILABLE:
             self.lobe_table.horizontalHeader().setStretchLastSection(True)
             self.lobe_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
             lobe_layout.addWidget(self.lobe_table, 1)
-            lower.addWidget(lobe_panel)
+            lower.addTab(lobe_panel, "Four-lobe measurements")
 
             ridge_panel = QtWidgets.QWidget(lower)
             ridge_layout = QtWidgets.QVBoxLayout(ridge_panel)
@@ -2411,7 +2487,7 @@ if QT_AVAILABLE:
             self.ridge_table.horizontalHeader().setStretchLastSection(True)
             self.ridge_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
             ridge_layout.addWidget(self.ridge_table, 1)
-            lower.addWidget(ridge_panel)
+            lower.addTab(ridge_panel, "Ridge")
 
             ellipse_panel = QtWidgets.QWidget(lower)
             ellipse_layout = QtWidgets.QVBoxLayout(ellipse_panel)
@@ -2426,7 +2502,7 @@ if QT_AVAILABLE:
             self.ellipse_table.horizontalHeader().setStretchLastSection(True)
             self.ellipse_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
             ellipse_layout.addWidget(self.ellipse_table, 1)
-            lower.addWidget(ellipse_panel)
+            lower.addTab(ellipse_panel, "Ellipse")
 
             radial_panel = QtWidgets.QWidget(lower)
             radial_layout = QtWidgets.QVBoxLayout(radial_panel)
@@ -2454,7 +2530,12 @@ if QT_AVAILABLE:
                 QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
             )
             radial_layout.addWidget(self.radial_table, 1)
-            lower.addWidget(radial_panel)
+            lower.addTab(radial_panel, "Radial peaks")
+            for table in (self.lobe_table, self.ridge_table, self.ellipse_table, self.radial_table):
+                table.setAlternatingRowColors(True)
+                table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+                table.verticalHeader().setVisible(False)
+                table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
             root.addWidget(lower, 2)
             self.pages.addTab(self.measurements_page, "Measurements / Profiles")
 
@@ -2862,6 +2943,7 @@ if QT_AVAILABLE:
             toolbar.addWidget(self.batch_clear_button)
             self.batch_run_button = QtWidgets.QPushButton("Run batch")
             self.batch_run_button.setObjectName("batchRunButton")
+            self.batch_run_button.setProperty("role", "primary")
             self.batch_run_button.clicked.connect(self.run_batch)
             toolbar.addWidget(self.batch_run_button)
             self.batch_cancel_button = QtWidgets.QPushButton("Cancel")
@@ -2940,7 +3022,17 @@ if QT_AVAILABLE:
             self.batch_output_edit.setObjectName("batchOutputEdit")
             self.batch_output_edit.setPlaceholderText("optional output directory")
             options.addRow("Output", self.batch_output_edit)
-            layout.addLayout(options)
+            options_panel = QtWidgets.QWidget(self.batch_page)
+            options_panel.setObjectName("batchOptionsPanel")
+            options_panel.setLayout(options)
+            self.batch_options_scroll = QtWidgets.QScrollArea(self.batch_page)
+            self.batch_options_scroll.setObjectName("batchOptionsScroll")
+            self.batch_options_scroll.setWidgetResizable(True)
+            self.batch_options_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.batch_options_scroll.setMinimumHeight(120)
+            self.batch_options_scroll.setMaximumHeight(250)
+            self.batch_options_scroll.setWidget(options_panel)
+            layout.addWidget(self.batch_options_scroll)
             self.batch_table = QtWidgets.QTableWidget(0, len(_BATCH_TABLE_HEADERS), self.batch_page)
             self.batch_table.setObjectName("batchTable")
             self.batch_table.setHorizontalHeaderLabels(
@@ -3002,8 +3094,12 @@ if QT_AVAILABLE:
 
         def _build_status_bar(self) -> None:
             status = self.statusBar()
-            self.status_message = QtWidgets.QLabel("Ready")
+            self.status_message = ElidedLabel("Ready")
             self.status_message.setObjectName("statusMessage")
+            self.status_message.setMinimumWidth(0)
+            self.status_message.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred
+            )
             status.addWidget(self.status_message, 1)
             self.rmse_label = QtWidgets.QLabel("RMSE: —")
             self.rmse_label.setObjectName("rmseLabel")
@@ -3011,8 +3107,10 @@ if QT_AVAILABLE:
             self.ndata_label = QtWidgets.QLabel("ndata: —")
             self.ndata_label.setObjectName("ndataLabel")
             status.addPermanentWidget(self.ndata_label)
-            self.flags_label = QtWidgets.QLabel("flags: —")
+            self.flags_label = ElidedLabel("flags: —")
             self.flags_label.setObjectName("flagsLabel")
+            self.flags_label.setMaximumWidth(260)
+            self.flags_label.setMinimumWidth(0)
             status.addPermanentWidget(self.flags_label)
             self.coverage_label = QtWidgets.QLabel("coverage: —")
             self.coverage_label.setObjectName("coverageLabel")
@@ -3324,6 +3422,7 @@ if QT_AVAILABLE:
             self.coverage_label.setText(
                 f"{self._tr('metric.coverage')}: {self._metric_display['coverage']}"
             )
+            self.flags_label.setToolTip(self.flags_label.text())
 
         def _render_status(self) -> None:
             values = dict(self._status_values)
@@ -3331,6 +3430,8 @@ if QT_AVAILABLE:
             if kind_key is not None:
                 values["kind"] = self._tr(str(kind_key))
             self.status_message.setText(self._tr(self._status_key, **values))
+            self.status_message.setToolTip(self.status_message.text())
+            self._refresh_workspace_context()
 
         def _boolean_table_item(self, value: Any) -> QtWidgets.QTableWidgetItem:
             """Create a localized boolean item while retaining its raw value."""
@@ -3752,6 +3853,10 @@ if QT_AVAILABLE:
             self.ridge_panel_label.setText(self._tr("measurement.ridge"))
             self.ellipse_panel_label.setText(self._tr("measurement.ellipse"))
             self.radial_panel_label.setText(self._tr("measurement.radial"))
+            for index, key in enumerate((
+                "measurement.lobes", "measurement.ridge", "measurement.ellipse", "measurement.radial"
+            )):
+                self.measurement_table_tabs.setTabText(index, self._tr(key))
             if hasattr(self, "profile_tabs"):
                 for index, (title_key, tooltip_key) in enumerate(
                     (
@@ -3908,6 +4013,9 @@ if QT_AVAILABLE:
             self._apply_tooltips()
             self._render_status()
             self._render_metric_labels()
+            from .help import apply_help
+
+            apply_help(self, self._language)
 
         # ----- data and parameters ---------------------------------------------
 
@@ -5171,6 +5279,7 @@ if QT_AVAILABLE:
                 else:
                     self.butterfly_workbench.set_q_window(None)
             self._sync_image_measurement_pages()
+            self._set_busy(False)
             if mask_cleared_for_shape:
                 self._set_status(
                     "status.mask_shape_changed",
@@ -8185,10 +8294,11 @@ if QT_AVAILABLE:
             update_butterfly_status: bool = True,
             page_status_kind: str | None = None,
         ) -> None:
-            self.preview_button.setEnabled(not busy)
-            self.optimize_button.setEnabled(not busy)
-            self.measure_geometry_button.setEnabled(not busy)
-            self.refine_geometry_button.setEnabled(not busy)
+            ready = self._observed is not None and not busy
+            self.preview_button.setEnabled(ready)
+            self.optimize_button.setEnabled(ready)
+            self.measure_geometry_button.setEnabled(ready)
+            self.refine_geometry_button.setEnabled(ready)
             self.batch_run_button.setEnabled(not busy)
             self.batch_add_button.setEnabled(not busy)
             self.batch_add_folder_button.setEnabled(not busy)
@@ -8264,9 +8374,15 @@ if QT_AVAILABLE:
                     self._restore_busy_focus()
                     return
                 if result_ok is False:
+                    diagnostic_flags = _read(
+                        _read(self._last_result, ("metrics", "statistics", "summary"), {}),
+                        ("flags", "flag"),
+                        _read(self._last_result, ("flags", "flag"), []),
+                    )
+                    diagnostic_flags = [diagnostic_flags] if isinstance(diagnostic_flags, str) else list(diagnostic_flags or ())
                     self._set_status(
                         "status.job_failed",
-                        flags="result_failed",
+                        flags=", ".join(["result_failed", *(str(flag) for flag in diagnostic_flags)]),
                         kind_key=f"job.{kind}",
                     )
                     self._restore_busy_focus()
@@ -8341,8 +8457,10 @@ if QT_AVAILABLE:
             self._closing = True
             self.cancel_jobs()
             self.lamellar_page.shutdown()
+            for page in (self.azimuthal_page, self.density2d_page):
+                page.shutdown()
             self._thread_pool.clear()
-            if self._workers or self.lamellar_page.jobs_running():
+            if self._workers or self.lamellar_page.jobs_running() or self._measurement_jobs_running():
                 self._set_status("status.closing")
                 event.ignore()
                 QtCore.QTimer.singleShot(50, self._finish_close_when_idle)
@@ -8350,8 +8468,11 @@ if QT_AVAILABLE:
             self._thread_pool.waitForDone(1500)
             event.accept()
 
+        def _measurement_jobs_running(self) -> bool:
+            return any(page.jobs_running() for page in (self.azimuthal_page, self.density2d_page))
+
         def _finish_close_when_idle(self) -> None:
-            if self._workers or self.lamellar_page.jobs_running():
+            if self._workers or self.lamellar_page.jobs_running() or self._measurement_jobs_running():
                 QtCore.QTimer.singleShot(50, self._finish_close_when_idle)
                 return
             self._thread_pool.clear()

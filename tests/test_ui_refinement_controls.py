@@ -479,8 +479,8 @@ def test_batch_table_shows_ellipse_parameters_and_folder_controls(qtbot) -> None
     )
     assert window.batch_table.item(0, 8).text() == "≈174.5"
     assert "174.5" in window.batch_table.item(0, 8).toolTip()
-    assert "Ellipse-derived candidates" in window.batch_table.item(0, 8).toolTip()
-    assert "first-order period" in window.batch_table.item(0, 8).toolTip()
+    assert "Unconfirmed lengths calculated from the ellipse" in window.batch_table.item(0, 8).toolTip()
+    assert "spacing from the first ring" in window.batch_table.item(0, 8).toolTip()
     window._update_batch_rows(
         [
             {
@@ -527,10 +527,10 @@ def test_batch_table_shows_ellipse_parameters_and_folder_controls(qtbot) -> None
     assert window.batch_table.item(0, 4).text() == "—"
     assert window.batch_table.item(0, 5).text() == "—"
     assert window.batch_table.item(0, 6).text() == "—"
-    assert "no measured major-axis tilt" in window.batch_table.item(0, 6).toolTip()
+    assert "the fit does not establish this angle" in window.batch_table.item(0, 6).toolTip()
     assert window.batch_table.item(0, 8).text() == "—"
     assert window.batch_table.item(0, 10).text() == "68.3"
-    assert "first-order period" in window.batch_table.item(0, 8).toolTip()
+    assert "spacing from the first ring" in window.batch_table.item(0, 8).toolTip()
     window._clear_batch_frames()
     assert window.batch_frames == []
     window.close()

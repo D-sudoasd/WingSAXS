@@ -523,7 +523,17 @@ if QT_AVAILABLE:
                 return False
 
         def _set_message(self, message: str) -> None:
-            self._message.setText(str(message))
+            if message and str(message) == self.error_message:
+                self._message.setText(
+                    "三维显示暂不可用。请在支持图形加速的环境中重新打开；二维分析仍可使用。"
+                    if self._language == "zh"
+                    else "3D display is unavailable. Reopen in an environment with graphics acceleration; 2D analysis remains available."
+                )
+                self._message.setToolTip(str(message))
+                self._message.setAccessibleDescription(str(message))
+            else:
+                self._message.setText(str(message))
+                self._message.setToolTip("")
             if self._stack is not None:
                 self._stack.setCurrentWidget(self._message)
 

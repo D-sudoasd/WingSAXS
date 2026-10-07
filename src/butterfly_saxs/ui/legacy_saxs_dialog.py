@@ -191,6 +191,10 @@ if QT_AVAILABLE:
             self.load_image_button.setEnabled(self.can_load_image)
             self.export_button.setEnabled(self._inspection is not None)
 
+            from .help import apply_help
+
+            apply_help(self, self._language)
+
         def set_language(self, language: str) -> None:
             self._language = "en" if str(language).lower().startswith("en") else "zh_CN"
             self._retranslate_ui()

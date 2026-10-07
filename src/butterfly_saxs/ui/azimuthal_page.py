@@ -15,6 +15,13 @@ from ..azimuthal_analysis import (
     measure_azimuthal_profile,
 )
 from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets, require_qt
+from .workers import AnalysisWorker, GenerationGuard
+
+
+def _analyze_frame(parameters: dict[str, Any], payload: dict[str, Any]) -> tuple[Any, Any]:
+    """Measure and fit a plain frame snapshot without accessing Qt widgets."""
+    profile = measure_azimuthal_profile(**payload, **parameters["profile"])
+    return profile, fit_azimuthal_peaks(profile, **parameters["fit"])
 
 
 def _q_unit_key(value: Any) -> str:
@@ -62,8 +69,13 @@ if QT_AVAILABLE:
             self.source: str | None = None
             self.profile: AzimuthalProfile | None = None
             self.fit_result: AzimuthalFitResult | None = None
+            self._generation = GenerationGuard()
+            self._worker: AnalysisWorker | None = None
+            self._closed = False
+            self._thread_pool = QtCore.QThreadPool(self)
+            self._thread_pool.setMaxThreadCount(1)
             self._build_ui()
-            self._apply_language()
+            self.set_language(self.language)
             self._show_empty()
 
         def _build_ui(self) -> None:
@@ -84,7 +96,9 @@ if QT_AVAILABLE:
             self.description.setObjectName("azimuthalDescription")
             root.addWidget(self.description)
 
-            controls = QtWidgets.QGridLayout()
+            self.settings_group = QtWidgets.QGroupBox()
+            self.settings_group.setObjectName("azimuthalSettings")
+            controls = QtWidgets.QGridLayout(self.settings_group)
             controls.setHorizontalSpacing(8)
             controls.setVerticalSpacing(6)
             self.q_min_spin = self._double_spin()
@@ -128,14 +142,26 @@ if QT_AVAILABLE:
             for index, (key, widget) in enumerate(control_items):
                 row, col = divmod(index, 3)
                 label = QtWidgets.QLabel()
+                label.setWordWrap(True)
+                label.setBuddy(widget)
                 self._labels[key] = label
-                controls.addWidget(label, row, col * 2)
-                controls.addWidget(widget, row, col * 2 + 1)
-            root.addLayout(controls)
+                controls.addWidget(label, row * 2, col)
+                controls.addWidget(widget, row * 2 + 1, col)
+                controls.setColumnStretch(col, 1)
+                widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+            self.settings_scroll = QtWidgets.QScrollArea()
+            self.settings_scroll.setObjectName("azimuthalSettingsScroll")
+            self.settings_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.settings_scroll.setWidgetResizable(True)
+            self.settings_scroll.setMinimumHeight(85)
+            self.settings_scroll.setMaximumHeight(240)
+            self.settings_scroll.setWidget(self.settings_group)
+            root.addWidget(self.settings_scroll)
 
             actions = QtWidgets.QHBoxLayout()
             self.analyze_button = QtWidgets.QPushButton()
             self.analyze_button.setObjectName("azimuthalAnalyze")
+            self.analyze_button.setProperty("role", "primary")
             self.analyze_button.setEnabled(False)
             self.export_button = QtWidgets.QPushButton()
             self.export_button.setObjectName("azimuthalExport")
@@ -143,10 +169,27 @@ if QT_AVAILABLE:
             self.status_label = QtWidgets.QLabel()
             self.status_label.setObjectName("azimuthalStatus")
             self.status_label.setWordWrap(True)
+            self.status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+            self.status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.status_label.setMargin(4)
             actions.addWidget(self.analyze_button)
             actions.addWidget(self.export_button)
-            actions.addWidget(self.status_label, 1)
+            actions.addStretch(1)
             root.addLayout(actions)
+            self.progress = QtWidgets.QProgressBar()
+            self.progress.setObjectName("azimuthalProgress")
+            self.progress.setRange(0, 0)
+            self.progress.setTextVisible(False)
+            self.progress.setFixedHeight(4)
+            self.progress.hide()
+            root.addWidget(self.progress)
+            self.feedback_area = QtWidgets.QScrollArea()
+            self.feedback_area.setObjectName("azimuthalFeedback")
+            self.feedback_area.setWidgetResizable(True)
+            self.feedback_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.feedback_area.setFixedHeight(42)
+            self.feedback_area.setWidget(self.status_label)
+            root.addWidget(self.feedback_area)
 
             self.figure = Figure(figsize=(12.0, 6.5), constrained_layout=True)
             layout = self.figure.add_gridspec(
@@ -157,9 +200,10 @@ if QT_AVAILABLE:
             self.residual_axes = self.figure.add_subplot(layout[1, 1], sharex=self.profile_axes)
             self.canvas = FigureCanvasQTAgg(self.figure)
             self.canvas.setObjectName("azimuthalCanvas")
+            self.canvas.setMinimumHeight(240)
             root.addWidget(self.canvas, 1)
 
-            self.analyze_button.clicked.connect(self.analyze)
+            self.analyze_button.clicked.connect(self.start_analysis)
             self.export_button.clicked.connect(self._choose_export_path)
             self.model_combo.currentIndexChanged.connect(self._sync_fit_controls)
             for control, signal_name in (
@@ -199,6 +243,10 @@ if QT_AVAILABLE:
                 "initial_width": ("初始 FWHM (°)", "Initial FWHM (°)"),
                 "eta": ("pseudo-Voigt η", "pseudo-Voigt η"),
                 "analyze": ("分析环带", "Analyze annulus"),
+                "settings": ("环带与峰拟合设置", "Annulus and peak fit settings"),
+                "ready": ("二维图像和 q 坐标已就绪；设置环带后点击分析。", "Image and q coordinates ready; choose an annulus, then analyze."),
+                "running": ("正在提取角向强度并拟合峰…", "Measuring angular intensity and fitting peaks…"),
+                "changed_running": ("数据或设置已变化；等待当前计算结束后重新分析。", "Data or settings changed; analyze again when the current calculation finishes."),
                 "export": ("导出 CSV", "Export CSV"),
                 "no_data": ("请先加载二维图像并完成 q 标定。", "Load a 2-D image and q calibration to begin."),
                 "profile_title": ("环带角向强度", "Azimuthal intensity in q annulus"),
@@ -227,15 +275,32 @@ if QT_AVAILABLE:
         def _apply_language(self) -> None:
             self.heading.setText(self._tr("heading"))
             self.description.setText(self._tr("description"))
+            self.settings_group.setTitle(self._tr("settings"))
+            self.settings_scroll.setAccessibleName(self._tr("settings"))
+            self.progress.setAccessibleName(self._tr("running"))
             for key, label in self._labels.items():
                 label.setText(self._tr(key))
+                label.buddy().setAccessibleName(self._tr(key))
             self.analyze_button.setText(self._tr("analyze"))
             self.export_button.setText(self._tr("export"))
+            if self.jobs_running():
+                key = "changed_running" if self._worker and not self._generation.is_current(self._worker.generation) else "running"
+                self._set_feedback(self._tr(key), "running")
+            elif self.data is None:
+                self._set_feedback(self._tr("no_data"), "empty")
+            elif self.profile is None:
+                self._set_feedback(self._tr("ready"), "ready")
+            else:
+                self._present_result(self.profile, self.fit_result)
+                return
             self._draw()
 
         def set_language(self, language: str) -> None:
             self.language = str(language)
             self._apply_language()
+            from .help import apply_help
+
+            apply_help(self, self.language)
 
         def set_data(
             self,
@@ -249,6 +314,7 @@ if QT_AVAILABLE:
         ) -> None:
             """Set one frame; ``valid_mask=True`` marks usable detector pixels."""
 
+            self._generation.next()
             image = np.asarray(data, dtype=float)
             if image.ndim != 2 or image.size == 0:
                 self.invalidate(self._tr("analysis_error").format(error="data must be a non-empty 2-D image"))
@@ -311,14 +377,16 @@ if QT_AVAILABLE:
             self.q_max_spin.setValue(q_max)
             self.profile = None
             self.fit_result = None
-            self.analyze_button.setEnabled(True)
+            self.analyze_button.setEnabled(not self.jobs_running())
             self.export_button.setEnabled(False)
-            self.status_label.setText(self._tr("no_profile"))
+            running = self.jobs_running()
+            self._set_feedback(self._tr("changed_running") if running else self._tr("ready"), "running" if running else "ready")
             self._draw()
 
         def invalidate(self, message: str | None = None) -> None:
             """Clear current measurements after image, calibration, or mask changes."""
 
+            self._generation.next()
             self.data = None
             self.qx = None
             self.qy = None
@@ -330,7 +398,7 @@ if QT_AVAILABLE:
             self.fit_result = None
             self.analyze_button.setEnabled(False)
             self.export_button.setEnabled(False)
-            self.status_label.setText(message or self._tr("no_data"))
+            self._set_feedback(message or self._tr("no_data"), "empty")
             self._show_empty()
 
         def _sync_fit_controls(self, *_args: Any) -> None:
@@ -340,6 +408,9 @@ if QT_AVAILABLE:
         def _invalidate_measurement(self, *_args: Any) -> None:
             """Drop a result as soon as one of its analysis settings changes."""
 
+            self._generation.next()
+            if self.jobs_running():
+                self._set_feedback(self._tr("changed_running"), "running")
             if self.profile is None and self.fit_result is None:
                 if self.sender() in (self.q_min_spin, self.q_max_spin) and self.data is not None:
                     self._draw()
@@ -347,42 +418,128 @@ if QT_AVAILABLE:
             self.profile = None
             self.fit_result = None
             self.export_button.setEnabled(False)
-            self.status_label.setText(self._tr("no_profile"))
+            if not self.jobs_running():
+                self._set_feedback(self._tr("ready"), "ready")
             self._draw()
 
-        def analyze(self) -> AzimuthalFitResult | None:
-            if self.data is None or self.qx is None or self.qy is None or self.valid_mask is None:
-                return None
+        def _analysis_inputs(self, *, snapshot: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+            payload = {
+                "data": self.data, "qx": self.qx, "qy": self.qy,
+                "valid_mask": self.valid_mask, "q_unit": self.q_unit, "source": self.source,
+            }
+            if snapshot:
+                for key in ("data", "qx", "qy", "valid_mask"):
+                    payload[key] = np.array(payload[key], copy=True)
+            parameters = {
+                "profile": {
+                    "q_window": (self.q_min_spin.value(), self.q_max_spin.value()),
+                    "n_bins": self.bins_spin.value(), "statistic": "mean",
+                },
+                "fit": {
+                    "model": str(self.model_combo.currentData()),
+                    "max_peaks": self.max_peaks_spin.value(),
+                    "min_separation_deg": self.min_separation_spin.value(),
+                    "min_height_fraction": self.height_fraction_spin.value(),
+                    "initial_fwhm_deg": self.initial_width_spin.value(),
+                    "eta": self.eta_spin.value(),
+                },
+            }
+            return parameters, payload
+
+        def _set_feedback(self, text: str, state: str) -> None:
+            self.status_label.setText(text)
+            self.status_label.setProperty("state", state)
+            self.status_label.style().unpolish(self.status_label)
+            self.status_label.style().polish(self.status_label)
+
+        def _prepare_analysis(self) -> None:
             self.profile = None
             self.fit_result = None
             self.export_button.setEnabled(False)
-            self.status_label.setText(self._tr("no_profile"))
-            try:
-                q_window = (self.q_min_spin.value(), self.q_max_spin.value())
-                profile = measure_azimuthal_profile(
-                    self.data,
-                    qx=self.qx,
-                    qy=self.qy,
-                    q_window=q_window,
-                    valid_mask=self.valid_mask,
-                    q_unit=self.q_unit,
-                    n_bins=self.bins_spin.value(),
-                    statistic="mean",
-                    source=self.source,
-                )
-                fit_result = fit_azimuthal_peaks(
-                    profile,
-                    model=str(self.model_combo.currentData()),
-                    max_peaks=self.max_peaks_spin.value(),
-                    min_separation_deg=self.min_separation_spin.value(),
-                    min_height_fraction=self.height_fraction_spin.value(),
-                    initial_fwhm_deg=self.initial_width_spin.value(),
-                    eta=self.eta_spin.value(),
-                )
-            except (TypeError, ValueError, RuntimeError) as exc:
-                self.status_label.setText(self._tr("analysis_error").format(error=exc))
-                self._draw()
+            self.analyze_button.setEnabled(False)
+            self._set_feedback(self._tr("running"), "running")
+            self._draw()
+
+        def analyze(self) -> AzimuthalFitResult | None:
+            """Synchronous entry point for integrations; buttons use ``start_analysis``."""
+            if self.data is None or self.jobs_running():
                 return None
+            self._prepare_analysis()
+            try:
+                profile, fit_result = _analyze_frame(*self._analysis_inputs(snapshot=False))
+            except (TypeError, ValueError, RuntimeError) as exc:
+                self._set_feedback(self._tr("analysis_error").format(error=exc), "error")
+                return None
+            finally:
+                self.analyze_button.setEnabled(self.data is not None)
+            self._present_result(profile, fit_result)
+            self.profileChanged.emit(profile, fit_result)
+            return fit_result
+
+        def start_analysis(self) -> None:
+            """Run one immutable frame/settings snapshot without blocking the UI."""
+            if self.data is None or self.jobs_running():
+                return
+            self._closed = False
+            parameters, payload = self._analysis_inputs(snapshot=True)
+            self._prepare_analysis()
+            worker = AnalysisWorker(
+                _analyze_frame, generation=self._generation.next(), kind="azimuthal",
+                parameters=parameters, payload=payload,
+            )
+            worker.signals.finished.connect(self._analysis_finished, QtCore.Qt.ConnectionType.QueuedConnection)
+            worker.signals.error.connect(self._analysis_failed, QtCore.Qt.ConnectionType.QueuedConnection)
+            self._worker = worker
+            self.progress.show()
+            self._thread_pool.start(worker)
+
+        @QtCore.Slot(int, str, object)
+        def _analysis_finished(self, generation: int, _kind: str, result: Any) -> None:
+            self._worker = None
+            self.progress.hide()
+            if self._closed:
+                return
+            self.analyze_button.setEnabled(self.data is not None)
+            if not self._generation.is_current(generation):
+                if self.data is not None:
+                    self._set_feedback(self._tr("ready"), "ready")
+                return
+            self._present_result(*result)
+            self.profileChanged.emit(*result)
+
+        @QtCore.Slot(int, str, object)
+        def _analysis_failed(self, generation: int, _kind: str, error: Any) -> None:
+            self._worker = None
+            self.progress.hide()
+            if self._closed:
+                return
+            self.analyze_button.setEnabled(self.data is not None)
+            if self._generation.is_current(generation):
+                self._set_feedback(self._tr("analysis_error").format(error=error), "error")
+            elif self.data is not None:
+                self._set_feedback(self._tr("ready"), "ready")
+
+        def jobs_running(self) -> bool:
+            return self._worker is not None or self._thread_pool.activeThreadCount() > 0
+
+        def shutdown(self) -> None:
+            """Discard pending output; the owner can await ``jobs_running`` asynchronously."""
+            self._closed = True
+            self._generation.next()
+
+        def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+            self.shutdown()
+            if self.jobs_running():
+                event.ignore()
+                QtCore.QTimer.singleShot(50, self.close)
+                return
+            event.accept()
+
+        def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+            super().showEvent(event)
+            self.canvas.draw_idle()
+
+        def _present_result(self, profile: AzimuthalProfile, fit_result: AzimuthalFitResult) -> None:
             self.profile = profile
             self.fit_result = fit_result
             self.export_button.setEnabled(True)
@@ -404,10 +561,8 @@ if QT_AVAILABLE:
                 )
             else:
                 summary += "\n" + self._tr("fit_failed").format(message=fit_result.message)
-            self.status_label.setText(summary)
+            self._set_feedback(summary, "complete" if fit_result.success else "warning")
             self._draw()
-            self.profileChanged.emit(profile, fit_result)
-            return fit_result
 
         def _draw(self) -> None:
             if not hasattr(self, "profile_axes"):
@@ -574,7 +729,8 @@ if QT_AVAILABLE:
             for axes in (self.image_axes, self.profile_axes, self.residual_axes):
                 for label in (*axes.get_xticklabels(), *axes.get_yticklabels()):
                     label.set_fontproperties(font)
-            self.canvas.draw_idle()
+            if self.canvas.isVisible():
+                self.canvas.draw_idle()
 
         def _show_empty(self) -> None:
             self._draw()

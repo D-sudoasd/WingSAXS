@@ -306,6 +306,10 @@ if QT_AVAILABLE:
             for i in range(self.palette_combo.count()):
                 self.palette_combo.setItemText(i, tr(self.palette_combo.itemData(i), language))
 
+            from .help import apply_help
+
+            apply_help(self, language)
+
         def set_palette(self, palette: str) -> None:
             self.palette_combo.blockSignals(True)
             self.palette_combo.setCurrentIndex(max(0, self.palette_combo.findData(palette)))

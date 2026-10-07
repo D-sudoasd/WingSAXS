@@ -96,6 +96,10 @@ if QT_AVAILABLE:
             available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1366, 900)
             self.resize(min(1240, available.width() - 40), min(830, available.height() - 50))
 
+            from .help import apply_help
+
+            apply_help(self, getattr(parent, "language", "zh_CN"))
+
         def _build_ui(self):
             self.setStyleSheet(
                 "#publicationDialog { background: #eef1f3; }"

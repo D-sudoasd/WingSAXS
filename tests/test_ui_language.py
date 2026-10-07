@@ -310,7 +310,7 @@ def test_chinese_analysis_panel_uses_localized_public_labels(qtbot, tmp_path) ->
     assert window.ridge_method_combo.currentText() == "径向峰"
     assert window.ridge_method_combo.currentData() == "radial_peak"
     assert "ridge（" not in window.ridge_method_combo.toolTip()
-    assert "ridge 位置" in window.ridge_method_combo.toolTip()
+    assert "亮弧上的点" in window.ridge_method_combo.toolTip()
 
     assert window.roi_group.title() == "排除 ROI（像素）"
     assert window.roi_type_label.text() == "类型"

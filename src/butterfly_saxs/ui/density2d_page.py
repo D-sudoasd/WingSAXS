@@ -16,6 +16,12 @@ from ..density2d import (
 )
 from ..settings import canonical_q_unit
 from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets, require_qt
+from .workers import AnalysisWorker, GenerationGuard
+
+
+def _analyze_frame(parameters: dict[str, Any]) -> Any:
+    """Analyze a plain frame/settings snapshot without accessing widgets."""
+    return analyze_density2d(**parameters)
 
 if QT_AVAILABLE:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -41,11 +47,16 @@ if QT_AVAILABLE:
             self.source: str | None = None
             self.profile: Density2DProfile | None = None
             self.fits: tuple[Density2DFit, ...] = ()
+            self._generation = GenerationGuard()
+            self._worker: AnalysisWorker | None = None
+            self._closed = False
+            self._thread_pool = QtCore.QThreadPool(self)
+            self._thread_pool.setMaxThreadCount(1)
             self._window_is_explicit = False
             self._pending_q_window: tuple[float, float] | None = None
             self._pending_q_window_unit: str | None = None
             self._build_ui()
-            self._apply_language()
+            self.set_language(self.language)
             self._draw()
 
         def _build_ui(self) -> None:
@@ -66,7 +77,9 @@ if QT_AVAILABLE:
             self.description.setObjectName("density2dDescription")
             root.addWidget(self.description)
 
-            controls = QtWidgets.QGridLayout()
+            self.settings_group = QtWidgets.QGroupBox()
+            self.settings_group.setObjectName("density2dSettings")
+            controls = QtWidgets.QGridLayout(self.settings_group)
             controls.setHorizontalSpacing(8)
             controls.setVerticalSpacing(6)
             self.q_min_spin = self._double_spin()
@@ -99,29 +112,59 @@ if QT_AVAILABLE:
             for index, (key, widget) in enumerate(control_items):
                 row, column = divmod(index, 3)
                 label = QtWidgets.QLabel()
+                label.setWordWrap(True)
+                label.setBuddy(widget)
                 self._labels[key] = label
-                controls.addWidget(label, row, column * 2)
-                controls.addWidget(widget, row, column * 2 + 1)
+                controls.addWidget(label, row * 2, column)
+                controls.addWidget(widget, row * 2 + 1, column)
+                controls.setColumnStretch(column, 1)
+                widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
             model_label = QtWidgets.QLabel()
             self._labels["models"] = model_label
-            controls.addWidget(model_label, 2, 0)
-            controls.addWidget(self.power_law_check, 2, 1, 1, 2)
-            controls.addWidget(self.ornstein_zernike_check, 2, 3, 1, 3)
-            root.addLayout(controls)
+            controls.addWidget(model_label, 4, 0)
+            controls.addWidget(self.power_law_check, 4, 1)
+            controls.addWidget(self.ornstein_zernike_check, 4, 2)
+            self.settings_scroll = QtWidgets.QScrollArea()
+            self.settings_scroll.setObjectName("density2dSettingsScroll")
+            self.settings_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.settings_scroll.setWidgetResizable(True)
+            self.settings_scroll.setMinimumHeight(85)
+            self.settings_scroll.setMaximumHeight(210)
+            self.settings_scroll.setWidget(self.settings_group)
+            root.addWidget(self.settings_scroll)
 
             actions = QtWidgets.QHBoxLayout()
             self.analyze_button = QtWidgets.QPushButton()
             self.analyze_button.setObjectName("density2dAnalyze")
+            self.analyze_button.setProperty("role", "primary")
+            self.analyze_button.setEnabled(False)
             self.export_button = QtWidgets.QPushButton()
             self.export_button.setObjectName("density2dExport")
             self.export_button.setEnabled(False)
             self.status_label = QtWidgets.QLabel()
             self.status_label.setObjectName("density2dStatus")
             self.status_label.setWordWrap(True)
+            self.status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+            self.status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.status_label.setMargin(4)
             actions.addWidget(self.analyze_button)
             actions.addWidget(self.export_button)
-            actions.addWidget(self.status_label, 1)
+            actions.addStretch(1)
             root.addLayout(actions)
+            self.progress = QtWidgets.QProgressBar()
+            self.progress.setObjectName("density2dProgress")
+            self.progress.setRange(0, 0)
+            self.progress.setTextVisible(False)
+            self.progress.setFixedHeight(4)
+            self.progress.hide()
+            root.addWidget(self.progress)
+            self.feedback_area = QtWidgets.QScrollArea()
+            self.feedback_area.setObjectName("density2dFeedback")
+            self.feedback_area.setWidgetResizable(True)
+            self.feedback_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.feedback_area.setFixedHeight(42)
+            self.feedback_area.setWidget(self.status_label)
+            root.addWidget(self.feedback_area)
 
             self.figure = Figure(figsize=(10.2, 5.8), constrained_layout=True)
             grid = self.figure.add_gridspec(2, 2, width_ratios=(1.1, 1.5), height_ratios=(3.0, 1.2))
@@ -130,9 +173,10 @@ if QT_AVAILABLE:
             self.residual_axes = self.figure.add_subplot(grid[1, 1], sharex=self.profile_axes)
             self.canvas = FigureCanvasQTAgg(self.figure)
             self.canvas.setObjectName("density2dCanvas")
+            self.canvas.setMinimumHeight(240)
             root.addWidget(self.canvas, 1)
 
-            self.analyze_button.clicked.connect(self.analyze)
+            self.analyze_button.clicked.connect(self.start_analysis)
             self.export_button.clicked.connect(self._choose_export_path)
             self.azimuth_spin.valueChanged.connect(self._invalidate_analysis_result)
             self.half_width_spin.valueChanged.connect(self._invalidate_analysis_result)
@@ -173,6 +217,10 @@ if QT_AVAILABLE:
                 "power_law": ("幂律", "Power law"),
                 "ornstein_zernike": ("Ornstein–Zernike", "Ornstein–Zernike"),
                 "analyze": ("分析所选扇区", "Analyze selected sector"),
+                "settings": ("扇区与经验模型设置", "Sector and empirical model settings"),
+                "ready": ("二维图像和 q 坐标已就绪；设置扇区并选择模型后点击分析。", "Image and q coordinates ready; choose a sector and models, then analyze."),
+                "running": ("正在提取扇区强度并拟合经验模型…", "Measuring sector intensity and fitting empirical models…"),
+                "changed_running": ("数据或设置已变化；等待当前计算结束后重新分析。", "Data or settings changed; analyze again when the current calculation finishes."),
                 "export": ("导出 JSON + CSV", "Export JSON + CSV"),
                 "no_data": ("请先载入二维图像及其 q 坐标。", "Load a 2-D image and its q coordinates to begin."),
                 "region_title": ("图像与所选 q 扇区", "Image and selected q sector"),
@@ -211,17 +259,35 @@ if QT_AVAILABLE:
         def _apply_language(self) -> None:
             self.heading.setText(self._tr("heading"))
             self.description.setText(self._tr("description"))
+            self.settings_group.setTitle(self._tr("settings"))
+            self.settings_scroll.setAccessibleName(self._tr("settings"))
+            self.progress.setAccessibleName(self._tr("running"))
             for key, label in self._labels.items():
                 label.setText(self._tr(key))
+                if label.buddy() is not None:
+                    label.buddy().setAccessibleName(self._tr(key))
             self.power_law_check.setText(self._tr("power_law_check"))
             self.ornstein_zernike_check.setText(self._tr("ornstein_zernike_check"))
             self.analyze_button.setText(self._tr("analyze"))
             self.export_button.setText(self._tr("export"))
+            if self.jobs_running():
+                key = "changed_running" if self._worker and not self._generation.is_current(self._worker.generation) else "running"
+                self._set_feedback(self._tr(key), "running")
+            elif self.data is None:
+                self._set_feedback(self._tr("no_data"), "empty")
+            elif self.profile is None:
+                self._set_feedback(self._tr("ready"), "ready")
+            else:
+                self._present_result(self.profile, self.fits)
+                return
             self._draw()
 
         def set_language(self, language: str) -> None:
             self.language = str(language)
             self._apply_language()
+            from .help import apply_help
+
+            apply_help(self, self.language)
 
         def _on_window_changed(self, *_args: Any) -> None:
             if self.data is not None:
@@ -231,11 +297,14 @@ if QT_AVAILABLE:
         def _invalidate_analysis_result(self, *_args: Any) -> None:
             """Drop fitted outputs when a control changes their source settings."""
 
+            self._generation.next()
             if self.profile is not None or self.fits:
                 self.profile = None
                 self.fits = ()
                 self.export_button.setEnabled(False)
-                self.status_label.setText(self._tr("no_profile"))
+                self._set_feedback(self._tr("ready"), "ready")
+            if self.jobs_running():
+                self._set_feedback(self._tr("changed_running"), "running")
             self._draw()
 
         def set_data(
@@ -250,6 +319,7 @@ if QT_AVAILABLE:
         ) -> None:
             """Set one image; ``valid_mask=True`` marks usable detector pixels."""
 
+            self._generation.next()
             image = np.asarray(data, dtype=float)
             if image.ndim != 2 or image.size == 0:
                 self.invalidate(self._tr("analysis_error").format(error="data must be a non-empty 2-D image"))
@@ -308,6 +378,8 @@ if QT_AVAILABLE:
             self.q_max_spin.setRange(q_lower, q_upper)
             self.q_min_spin.setDecimals(10)
             self.q_max_spin.setDecimals(10)
+            self.q_min_spin.setSuffix(f" {self.q_unit}")
+            self.q_max_spin.setSuffix(f" {self.q_unit}")
             step = max(span / 100.0, np.finfo(float).eps)
             self.q_min_spin.setSingleStep(step)
             self.q_max_spin.setSingleStep(step)
@@ -327,14 +399,16 @@ if QT_AVAILABLE:
             self._window_is_explicit = previous_window is not None
             self._pending_q_window = None
             self._pending_q_window_unit = None
-            self.analyze_button.setEnabled(True)
+            self.analyze_button.setEnabled(not self.jobs_running())
             self.export_button.setEnabled(False)
-            self.status_label.setText(self._tr("no_profile"))
+            running = self.jobs_running()
+            self._set_feedback(self._tr("changed_running") if running else self._tr("ready"), "running" if running else "ready")
             self._draw()
 
         def invalidate(self, message: str | None = None) -> None:
             """Clear image measurements after image, calibration, or mask changes."""
 
+            self._generation.next()
             self.data = None
             self.qx = None
             self.qy = None
@@ -346,7 +420,7 @@ if QT_AVAILABLE:
             self._window_is_explicit = False
             self.analyze_button.setEnabled(False)
             self.export_button.setEnabled(False)
-            self.status_label.setText(message or self._tr("no_data"))
+            self._set_feedback(message or self._tr("no_data"), "empty")
             self._draw()
 
         def _selected_models(self) -> tuple[str, ...]:
@@ -357,51 +431,134 @@ if QT_AVAILABLE:
                 models.append("ornstein_zernike")
             return tuple(models)
 
-        def analyze(self) -> tuple[Density2DFit, ...] | None:
-            if self.data is None or self.qx is None or self.qy is None or self.valid_mask is None:
-                return None
-            models = self._selected_models()
-            if not models:
-                self.status_label.setText(self._tr("model_required"))
-                return None
+        def _analysis_inputs(self, *, snapshot: bool) -> dict[str, Any]:
+            parameters = {
+                "data": self.data, "qx": self.qx, "qy": self.qy, "valid_mask": self.valid_mask,
+                "q_window": (self.q_min_spin.value(), self.q_max_spin.value()),
+                "azimuth_center_deg": self.azimuth_spin.value(),
+                "azimuth_half_width_deg": self.half_width_spin.value(),
+                "n_q": self.n_q_spin.value(), "q_unit": self.q_unit,
+                "source": self.source, "models": self._selected_models(),
+            }
+            if snapshot:
+                for key in ("data", "qx", "qy", "valid_mask"):
+                    parameters[key] = np.array(parameters[key], copy=True)
+            return parameters
+
+        def _set_feedback(self, text: str, state: str) -> None:
+            self.status_label.setText(text)
+            self.status_label.setProperty("state", state)
+            self.status_label.style().unpolish(self.status_label)
+            self.status_label.style().polish(self.status_label)
+
+        def _prepare_analysis(self) -> None:
             self.profile = None
             self.fits = ()
             self.export_button.setEnabled(False)
-            self.status_label.setText(self._tr("no_profile"))
-            try:
-                result = analyze_density2d(
-                    self.data,
-                    qx=self.qx,
-                    qy=self.qy,
-                    q_window=(self.q_min_spin.value(), self.q_max_spin.value()),
-                    azimuth_center_deg=self.azimuth_spin.value(),
-                    azimuth_half_width_deg=self.half_width_spin.value(),
-                    n_q=self.n_q_spin.value(),
-                    valid_mask=self.valid_mask,
-                    q_unit=self.q_unit,
-                    source=self.source,
-                    models=models,
-                )
-            except (TypeError, ValueError, RuntimeError) as exc:
-                self.status_label.setText(self._tr("analysis_error").format(error=exc))
-                self._draw()
+            self.analyze_button.setEnabled(False)
+            self._set_feedback(self._tr("running"), "running")
+            self._draw()
+
+        def analyze(self) -> tuple[Density2DFit, ...] | None:
+            """Synchronous integration API; button-triggered fits run in a worker."""
+            if self.data is None or self.jobs_running():
                 return None
-            self.profile = result.profile
-            self.fits = result.fits
+            if not self._selected_models():
+                self._set_feedback(self._tr("model_required"), "error")
+                return None
+            self._prepare_analysis()
+            try:
+                result = _analyze_frame(self._analysis_inputs(snapshot=False))
+            except (TypeError, ValueError, RuntimeError) as exc:
+                self._set_feedback(self._tr("analysis_error").format(error=exc), "error")
+                return None
+            finally:
+                self.analyze_button.setEnabled(self.data is not None)
+            self._present_result(result.profile, result.fits)
+            self.profileChanged.emit(self.profile, self.fits)
+            return self.fits
+
+        def start_analysis(self) -> None:
+            if self.data is None or self.jobs_running():
+                return
+            if not self._selected_models():
+                self._set_feedback(self._tr("model_required"), "error")
+                return
+            self._closed = False
+            parameters = self._analysis_inputs(snapshot=True)
+            self._prepare_analysis()
+            worker = AnalysisWorker(
+                _analyze_frame, generation=self._generation.next(), kind="density2d", parameters=parameters,
+            )
+            worker.signals.finished.connect(self._analysis_finished, QtCore.Qt.ConnectionType.QueuedConnection)
+            worker.signals.error.connect(self._analysis_failed, QtCore.Qt.ConnectionType.QueuedConnection)
+            self._worker = worker
+            self.progress.show()
+            self._thread_pool.start(worker)
+
+        @QtCore.Slot(int, str, object)
+        def _analysis_finished(self, generation: int, _kind: str, result: Any) -> None:
+            self._worker = None
+            self.progress.hide()
+            if self._closed:
+                return
+            self.analyze_button.setEnabled(self.data is not None)
+            if not self._generation.is_current(generation):
+                if self.data is not None:
+                    self._set_feedback(self._tr("ready"), "ready")
+                return
+            self._present_result(result.profile, result.fits)
+            self.profileChanged.emit(self.profile, self.fits)
+
+        @QtCore.Slot(int, str, object)
+        def _analysis_failed(self, generation: int, _kind: str, error: Any) -> None:
+            self._worker = None
+            self.progress.hide()
+            if self._closed:
+                return
+            self.analyze_button.setEnabled(self.data is not None)
+            if self._generation.is_current(generation):
+                self._set_feedback(self._tr("analysis_error").format(error=error), "error")
+            elif self.data is not None:
+                self._set_feedback(self._tr("ready"), "ready")
+
+        def jobs_running(self) -> bool:
+            return self._worker is not None or self._thread_pool.activeThreadCount() > 0
+
+        def shutdown(self) -> None:
+            """Discard pending output and let the owner await completion without blocking."""
+            self._closed = True
+            self._generation.next()
+
+        def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+            self.shutdown()
+            if self.jobs_running():
+                event.ignore()
+                QtCore.QTimer.singleShot(50, self.close)
+                return
+            event.accept()
+
+        def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+            super().showEvent(event)
+            self.canvas.draw_idle()
+
+        def _present_result(self, profile: Density2DProfile, fits: tuple[Density2DFit, ...]) -> None:
+            self.profile = profile
+            self.fits = fits
             self.export_button.setEnabled(True)
-            geometry_bins = np.asarray(result.profile.geometry_counts) > 0
+            geometry_bins = np.asarray(profile.geometry_counts) > 0
             average_coverage = (
-                float(np.mean(result.profile.coverage[geometry_bins]))
+                float(np.mean(profile.coverage[geometry_bins]))
                 if np.any(geometry_bins) else 0.0
             )
             summary = self._tr("analyzed").format(
-                q0=result.profile.q_min,
-                q1=result.profile.q_max,
-                unit=result.profile.q_unit,
-                angle=result.profile.azimuth_center_deg,
-                width=result.profile.azimuth_half_width_deg,
-                bins=result.profile.n_supported_bins,
-                total=result.profile.q.size,
+                q0=profile.q_min,
+                q1=profile.q_max,
+                unit=profile.q_unit,
+                angle=profile.azimuth_center_deg,
+                width=profile.azimuth_half_width_deg,
+                bins=profile.n_supported_bins,
+                total=profile.q.size,
                 coverage=average_coverage,
             )
             details = [summary]
@@ -432,10 +589,9 @@ if QT_AVAILABLE:
                     details=fit_details,
                     rmse=float(fit.rmse or 0.0),
                 ))
-            self.status_label.setText("\n".join(details))
+            state = "complete" if all(fit.success for fit in self.fits) else "warning"
+            self._set_feedback("\n".join(details), state)
             self._draw()
-            self.profileChanged.emit(self.profile, self.fits)
-            return self.fits
 
         def _model_label(self, model_name: str) -> str:
             return self._tr("power_law_check") if model_name == "power_law" else self._tr("ornstein_zernike_check")
@@ -595,7 +751,8 @@ if QT_AVAILABLE:
                     ha="center", va="center", color="#687789", fontproperties=font,
                 )
                 self.residual_axes.axhline(0.0, color="#414b55", linewidth=0.8)
-            self.canvas.draw_idle()
+            if self.canvas.isVisible():
+                self.canvas.draw_idle()
 
         def _fit_legend(self, fit: Density2DFit) -> str:
             if fit.model_name == "power_law":

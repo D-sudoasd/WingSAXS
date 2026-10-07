@@ -187,7 +187,9 @@ if QT_AVAILABLE:
             heading.addWidget(self.clear_button)
             root.addLayout(heading)
 
-            controls = QtWidgets.QHBoxLayout()
+            controls = QtWidgets.QGridLayout()
+            controls.setHorizontalSpacing(16)
+            controls.setVerticalSpacing(4)
             self.mode_label = QtWidgets.QLabel()
             self.mode_combo = QtWidgets.QComboBox()
             self.mode_combo.setObjectName("localMeasurement_mode")
@@ -196,16 +198,12 @@ if QT_AVAILABLE:
             self.mode_combo.addItem("", "roi")
             self.mode_combo.currentIndexChanged.connect(self._mode_changed)
             self.mode_label.setBuddy(self.mode_combo)
-            controls.addWidget(self.mode_label)
-            controls.addWidget(self.mode_combo)
             self.patch_label = QtWidgets.QLabel()
             self.patch_radius = QtWidgets.QSpinBox()
             self.patch_radius.setObjectName("localMeasurement_patchRadius")
             self.patch_radius.setRange(0, 30)
             self.patch_radius.setValue(1)
             self.patch_label.setBuddy(self.patch_radius)
-            controls.addWidget(self.patch_label)
-            controls.addWidget(self.patch_radius)
             self.roi_width_label = QtWidgets.QLabel()
             self.roi_half_width = QtWidgets.QDoubleSpinBox()
             self.roi_half_width.setObjectName("localMeasurement_roiHalfWidth")
@@ -214,8 +212,6 @@ if QT_AVAILABLE:
             self.roi_half_width.setValue(3.0)
             self.roi_half_width.setDecimals(1)
             self.roi_width_label.setBuddy(self.roi_half_width)
-            controls.addWidget(self.roi_width_label)
-            controls.addWidget(self.roi_half_width)
             self.scale_label = QtWidgets.QLabel()
             self.scale_combo = QtWidgets.QComboBox()
             self.scale_combo.setObjectName("localMeasurement_scale")
@@ -223,9 +219,20 @@ if QT_AVAILABLE:
                 self.scale_combo.addItem("", mode)
             self.scale_combo.currentIndexChanged.connect(self._render_image)
             self.scale_label.setBuddy(self.scale_combo)
-            controls.addWidget(self.scale_label)
-            controls.addWidget(self.scale_combo)
-            controls.addStretch(1)
+            for column, (label, control) in enumerate((
+                (self.mode_label, self.mode_combo),
+                (self.patch_label, self.patch_radius),
+                (self.roi_width_label, self.roi_half_width),
+                (self.scale_label, self.scale_combo),
+            )):
+                label.setWordWrap(True)
+                control.setSizePolicy(
+                    QtWidgets.QSizePolicy.Policy.Expanding,
+                    QtWidgets.QSizePolicy.Policy.Fixed,
+                )
+                controls.addWidget(label, 0, column)
+                controls.addWidget(control, 1, column)
+                controls.setColumnStretch(column, 1)
             root.addLayout(controls)
 
             self.status = QtWidgets.QLabel()
@@ -252,6 +259,7 @@ if QT_AVAILABLE:
             splitter.addWidget(self.image_plot)
 
             side = QtWidgets.QWidget()
+            side.setMinimumWidth(300)
             side_layout = QtWidgets.QVBoxLayout(side)
             side_layout.setContentsMargins(8, 0, 0, 0)
             self.profile_title = QtWidgets.QLabel()
@@ -259,7 +267,7 @@ if QT_AVAILABLE:
             side_layout.addWidget(self.profile_title)
             self.profile_plot = pg.PlotWidget(background="#ffffff")
             self.profile_plot.setObjectName("localMeasurementProfile")
-            self.profile_plot.setMinimumHeight(190)
+            self.profile_plot.setMinimumHeight(170)
             self.profile_plot.showGrid(x=True, y=True, alpha=0.18)
             self.profile_plot.setLabel("bottom", "Path coordinate")
             self.profile_plot.setLabel("left", "Observed intensity")
@@ -270,6 +278,7 @@ if QT_AVAILABLE:
             side_layout.addWidget(self.measurements_title)
             self.table = QtWidgets.QTableWidget(0, 4)
             self.table.setObjectName("localMeasurementTable")
+            self.table.setMinimumHeight(110)
             self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
             self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -320,6 +329,11 @@ if QT_AVAILABLE:
             self.patch_label.setText(_tr("patch_radius", self.language))
             self.roi_width_label.setText(_tr("roi_width", self.language))
             self.scale_label.setText(_tr("scale", self.language))
+            for key, control in (
+                ("mode", self.mode_combo), ("patch_radius", self.patch_radius),
+                ("roi_width", self.roi_half_width), ("scale", self.scale_combo),
+            ):
+                control.setAccessibleName(_tr(key, self.language))
             for index, key in enumerate(("point", "line", "roi")):
                 self.mode_combo.setItemText(index, _tr(key, self.language))
             for index, key in enumerate(("linear", "log", "asinh")):
@@ -344,6 +358,9 @@ if QT_AVAILABLE:
                 self.details.setText(_tr("select_record", self.language))
             else:
                 self.status.setText(self._current_hint())
+            from .help import apply_help
+
+            apply_help(self, self.language)
 
         def set_data(
             self,

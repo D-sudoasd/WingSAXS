@@ -295,7 +295,7 @@ def test_parameter_table_headers_cells_unknown_fallback_and_unit_refresh(qtbot) 
         model.index(2, 0),
         QtCore.Qt.ItemDataRole.ToolTipRole,
     )
-    assert "不是唯一结构角" in theta_tip_zh
+    assert "仅凭这个图像角度不能确定三维结构" in theta_tip_zh
     assert "custom_peak_factor" in unknown_tip_zh
     assert "当前模型文档" in unknown_tip_zh
 
@@ -316,7 +316,7 @@ def test_parameter_table_headers_cells_unknown_fallback_and_unit_refresh(qtbot) 
         QtCore.Qt.ItemDataRole.ToolTipRole,
     )
     assert theta_tip_en != theta_tip_zh
-    assert "not a unique structural angle" in theta_tip_en
+    assert "this image angle alone cannot determine the 3D structure" in theta_tip_en
     assert "custom_peak_factor" in unknown_tip_en
     assert "active model documentation" in unknown_tip_en
     window.close()

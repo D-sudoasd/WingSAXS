@@ -9,6 +9,7 @@ from typing import Any
 from .i18n import translate, validate_language
 from .qspace import QSpaceView
 from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets
+from .theme import style_plot
 
 
 _VIEW_TITLE_KEYS = {
@@ -16,6 +17,23 @@ _VIEW_TITLE_KEYS = {
     "Model": "view.model",
     "Residual": "view.residual",
     "Overlay": "view.overlay",
+}
+
+# These strings belong to the image cards rather than the shared application
+# catalog. Keep both supported languages together for live language switching.
+_VIEW_TEXT = {
+    "en": {
+        "Observed": ("Detector intensity", "Open an image to inspect the observed detector intensity."),
+        "Model": ("Fitted intensity", "Run an intensity fit to compare the model with the observed image."),
+        "Residual": ("Observed − model", "An intensity fit provides signed residuals for evaluating agreement."),
+        "Overlay": ("Observed ridges and fitted geometry", "Open an image and trace its arcs to inspect ridges and ellipse fits."),
+    },
+    "zh_CN": {
+        "Observed": ("探测器强度", "打开图像，查看探测器观测强度。"),
+        "Model": ("拟合强度", "运行强度拟合，将模型与观测图像进行比较。"),
+        "Residual": ("观测 − 模型", "强度拟合后显示有正负号的残差，用于评估拟合一致性。"),
+        "Overlay": ("观测脊线与拟合几何", "打开图像并提取弧线，查看观测脊线与椭圆拟合。"),
+    },
 }
 
 try:  # pyqtgraph is optional even when PySide6 is available
@@ -279,21 +297,37 @@ if QT_AVAILABLE:
             self._roi_item: Any = None
             self.roi_specs: list[Any] = []
             self._roi_items: list[Any] = []
+            self._state_message: str | None = None
+            self.setProperty("surface", "card")
+            self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+            self.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
             layout = QtWidgets.QVBoxLayout(self)
-            layout.setContentsMargins(2, 2, 2, 2)
+            layout.setContentsMargins(10, 8, 10, 8)
+            layout.setSpacing(3)
             self.title_label = QtWidgets.QLabel(title)
             self.title_label.setObjectName("viewTitle")
             layout.addWidget(self.title_label)
+            self.subtitle_label = QtWidgets.QLabel(self)
+            self.subtitle_label.setObjectName("viewSubtitle")
+            self.subtitle_label.setWordWrap(True)
+            layout.addWidget(self.subtitle_label)
+            self.content = QtWidgets.QWidget(self)
+            self._content_layout = QtWidgets.QStackedLayout(self.content)
+            self._content_layout.setContentsMargins(0, 0, 0, 0)
             self.state_label = QtWidgets.QLabel(self)
             self.state_label.setObjectName("viewStateLabel")
             self.state_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.state_label.setWordWrap(True)
-            self.state_label.setVisible(False)
-            layout.addWidget(self.state_label)
+            self._content_layout.addWidget(self.state_label)
+            layout.addWidget(self.content, 1)
             if PLOT_AVAILABLE:
                 self.plot = _pg.PlotWidget()
                 self.plot.setObjectName(f"{title.lower()}Plot")
-                self.plot.showGrid(x=True, y=True, alpha=0.22)
+                self.plot.setMinimumSize(100, 90)
+                style_plot(self.plot)
                 self.plot.setAspectLocked(True)
                 self.plot.setLabel("bottom", "x (pixel)")
                 self.plot.setLabel("left", "y (pixel)")
@@ -326,14 +360,18 @@ if QT_AVAILABLE:
                     pass
                 self.plot.addItem(self.image_item)
                 if str(title).lower() == "overlay":
-                    self.plot.addLegend(offset=(8, 8))
-                layout.addWidget(self.plot, 1)
+                    self.plot.addLegend(
+                        offset=(8, 8), brush=(255, 255, 255, 225),
+                        pen=(203, 213, 225), labelTextColor="#172b46",
+                    )
+                self._content_layout.addWidget(self.plot)
             else:
                 self.plot = None
                 self.image_item = None
                 self.placeholder = QtWidgets.QLabel("pyqtgraph 不可用")
                 self.placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)  # type: ignore[name-defined]
-                layout.addWidget(self.placeholder, 1)
+                self._content_layout.addWidget(self.placeholder)
+                self._content_layout.setCurrentWidget(self.placeholder)
             self.set_language(self._language)
 
         @property
@@ -342,6 +380,10 @@ if QT_AVAILABLE:
 
         def set_language(self, language: str) -> None:
             self._language = validate_language(language)
+            subtitle, empty_text = _VIEW_TEXT[self._language].get(self.title, ("", ""))
+            self.subtitle_label.setText(subtitle)
+            self.subtitle_label.setVisible(bool(subtitle))
+            self.state_label.setText(self._state_message or empty_text)
             if self._title_key is not None:
                 self.title_label.setText(translate(self._language, self._title_key))
             if self.plot is not None:
@@ -386,8 +428,9 @@ if QT_AVAILABLE:
             self.image_extent = extent
             if self.image_item is None or self.image_data is None:
                 return
+            self._state_message = None
             self.state_label.clear()
-            self.state_label.setVisible(False)
+            self._content_layout.setCurrentWidget(self.plot)
             kwargs = {}
             if levels is not None:
                 kwargs["levels"] = levels
@@ -426,8 +469,11 @@ if QT_AVAILABLE:
             self.image_extent = None
             if self.image_item is not None:
                 self.image_item.clear()
-            self.state_label.setText(str(message or ""))
-            self.state_label.setVisible(bool(message))
+            self._state_message = str(message) if message else None
+            empty_text = _VIEW_TEXT[self._language].get(self.title, ("", ""))[1]
+            self.state_label.setText(self._state_message or empty_text)
+            if self.plot is not None:
+                self._content_layout.setCurrentWidget(self.state_label)
 
         def _remove_overlay_items(self) -> None:
             if self.plot is None:
@@ -683,6 +729,10 @@ if QT_AVAILABLE:
                 )
                 self.plot.addItem(curve)
                 self._overlay_items.append(curve)
+            if self.image_data is None and self._state_message is None:
+                self._content_layout.setCurrentWidget(
+                    self.plot if self._overlay_items else self.state_label
+                )
             # The image background and overlays must share the same coordinate
             # system.  Re-ranging after both are present avoids clipping a
             # ridge point when q maps are sparse or asymmetric.
@@ -717,7 +767,11 @@ if QT_AVAILABLE:
             self._display_percentile = 99.5
             self._active_q_window: tuple[float, float] | None = None
             layout = QtWidgets.QGridLayout(self)
-            layout.setContentsMargins(2, 2, 2, 2)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            for index in range(2):
+                layout.setRowStretch(index, 1)
+                layout.setColumnStretch(index, 1)
             self.observed = PatternView("Observed", self, language=self._language)
             self.model = PatternView("Model", self, language=self._language)
             self.residual = PatternView("Residual", self, language=self._language)

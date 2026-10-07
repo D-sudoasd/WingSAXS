@@ -74,6 +74,10 @@ if QT_AVAILABLE:
             self.resize(min(1180, max(760, available.width() - 40)), min(760, max(540, available.height() - 60)))
             self._calculate()
 
+            from .help import apply_help
+
+            apply_help(self, self._language)
+
         def _build_ui(self) -> None:
             self.setStyleSheet(
                 "#lamellarScatteringDialog { background: #f5f7f8; color: #253744; }"

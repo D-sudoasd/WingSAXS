@@ -761,6 +761,10 @@ if QT_AVAILABLE:
             self._render_snapshot_context()
             self._render_status()
 
+            from .help import apply_help
+
+            apply_help(self, self._language)
+
         def _q_unit_display(self) -> str:
             unit = self._q_unit.strip() or "unknown"
             if unit.lower() in {"unknown", "pixel-q", "pixel_q", "pixel", "px"}:

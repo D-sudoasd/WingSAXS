@@ -410,6 +410,10 @@ if QT_AVAILABLE:
             else:
                 self.status.setText(tr("empty" if self._fresh else "stale", language))
 
+            from .help import apply_help
+
+            apply_help(self, self.language)
+
         def set_source(self, source: Any, *, context_signature: str | None = None) -> None:
             self.set_series([source], context_signature=context_signature)
 
@@ -936,12 +940,14 @@ if QT_AVAILABLE:
             layout = QtWidgets.QVBoxLayout(dialog)
             metadata = self.current_scene.metadata if self.current_scene is not None else {"message": tr("empty", self.language)}
             tabs = QtWidgets.QTabWidget()
+            tabs.setObjectName("lamellarSourcesTabs")
             summary = QtWidgets.QWidget()
             summary_layout = QtWidgets.QVBoxLayout(summary)
             note = QtWidgets.QLabel(tr("source_note", self.language))
             note.setWordWrap(True)
             summary_layout.addWidget(note)
             table = QtWidgets.QTreeWidget()
+            table.setObjectName("lamellarSourcesTree")
             table.setRootIsDecorated(False)
             english = self.language.startswith("en")
             table.setHeaderLabels(["Parameter", "Value", "Unit", "Origin", "Status"] if english else ["参数", "数值", "单位", "来源", "状态"])
@@ -963,19 +969,25 @@ if QT_AVAILABLE:
             table.header().setStretchLastSection(True)
             summary_layout.addWidget(table, 1)
             assumptions = QtWidgets.QPlainTextEdit()
+            assumptions.setObjectName("lamellarSourcesManifest")
             assumptions.setReadOnly(True)
             assumptions.setPlainText("\n".join(str(value) for value in metadata.get("assumptions", [])))
             assumptions.setMaximumHeight(120)
             summary_layout.addWidget(assumptions)
             tabs.addTab(summary, "Parameters and assumptions" if english else "参数与假设")
             text = QtWidgets.QPlainTextEdit()
+            text.setObjectName("lamellarSourcesRecord")
             text.setReadOnly(True)
             text.setPlainText(json.dumps(json_safe(metadata), ensure_ascii=False, indent=2, allow_nan=False))
             tabs.addTab(text, "Detailed provenance" if english else "详细来源记录")
             layout.addWidget(tabs)
             buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+            buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Close).setObjectName("lamellarSourcesClose")
             buttons.rejected.connect(dialog.reject)
             layout.addWidget(buttons)
+            from .help import apply_help
+
+            apply_help(dialog, self.language)
             dialog.exec()
 
         def document(self) -> dict[str, Any]:

@@ -70,7 +70,7 @@ bsaxs-gui = "butterfly_saxs.ui.launcher:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"butterfly_saxs.ui" = ["qml/*.qml"]
+"butterfly_saxs.ui" = ["qml/*.qml", "icons/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
