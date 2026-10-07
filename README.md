@@ -23,6 +23,18 @@ Trace observed butterfly trajectories across 2D SAXS frames, inspect apparent el
 
 角向环采样坐标 `q_annulus` 与径向反射峰 `q*` 分开处理。缺失象限、环或失败帧保留缺失；经验几何与示意层片结构不能单独给出唯一三维重构。
 
+## 原理示意 / Principle schematic
+
+<p align="center">
+  <img src="assets/readme/principle.png" width="100%" alt="Annular angular trajectories versus independent radial peak diagnostics — conceptual schematic / 概念示意图">
+</p>
+
+*固定q环的角向剖面用于连接有支持的花瓣轨迹；固定方位径向剖面的q*另作反射峰诊断，二者不能混作周期依据。概念示意，非实验曲线或唯一三维重构。*
+
+*Fixed-q angular profiles connect supported lobe trajectories; fixed-azimuth radial profiles provide separate q* diagnostics. Sampling q and radial peaks are distinct. Conceptual schematic, not experimental curves or a unique 3D reconstruction.*
+
+[查看完整示意图 / View full-size schematic](assets/readme/principle.png)
+
 ## English
 
 WingSAXS reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), derives physical `q`, `χ`, `qx`, and `qy` from PONI geometry through pyFAI, and traces the butterfly arcs supported by the measured intensity.
