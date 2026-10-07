@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/readme/hero.png" width="100%" alt="WingSAXS: conceptual illustration of butterfly-pattern 2D SAXS analysis, with observed lobes and trajectories; 二维小角散射蝴蝶图样分析概念图">
+</p>
+
 # WingSAXS
 
 **从二维 SAXS 图像中提取有强度支持的蝴蝶轨迹，并跟踪原位序列中的演化。**
@@ -10,15 +14,12 @@ Trace observed butterfly trajectories across 2D SAXS frames, inspect apparent el
 
 ![仓库合成蝴蝶图样与经验双椭圆叠加：pixel-q示例，不提供物理周期](docs/assets/refinement-ui.png)
 
-```mermaid
-flowchart TD
-  A[二维帧、PONI 几何与掩膜] --> B[标定 q 与方位角]
-  B --> C[角向强度剖面与有支持的花瓣轨迹]
-  C --> D[逐帧拟合、支持信息与候选参数]
-  D --> E[CSV / JSON / NPZ 与序列报告]
-  B --> F[独立径向剖面检查]
-  F --> G[有级次依据的径向 q 峰与环尺度]
-```
+<picture>
+  <source media="(max-width: 600px)" srcset="assets/readme/diagrams/workflow-readme-md-1-mobile.svg">
+  <img src="assets/readme/diagrams/workflow-readme-md-1.svg" width="100%" alt="WingSAXS — workflow schematic / 流程示意图">
+</picture>
+
+<sub>[Editable diagram source / 可编辑图源](assets/readme/diagrams/workflow-readme-md-1.mmd)</sub>
 
 角向环采样坐标 `q_annulus` 与径向反射峰 `q*` 分开处理。缺失象限、环或失败帧保留缺失；经验几何与示意层片结构不能单独给出唯一三维重构。
 
