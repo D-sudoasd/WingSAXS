@@ -1,22 +1,26 @@
-<h1 align="center">
-  <img src="assets/readme/hero.png" width="100%" alt="WingSAXS: conceptual illustration of butterfly-pattern 2D SAXS analysis, with observed lobes and trajectories; 二维小角散射蝴蝶图样分析概念图">
-</h1>
+# WingSAXS
 
-<p align="center">
-  <strong>Trace observed butterfly trajectories across 2D SAXS images and follow their evolution through an in-situ series.</strong><br>
-  从二维 SAXS 图像中提取可观测蝴蝶轨迹，并跟踪其在原位序列中的演化。
-</p>
+**从二维 SAXS 图像中提取有强度支持的蝴蝶轨迹，并跟踪原位序列中的演化。**
 
-<p align="center">
-  <a href="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml"><img src="https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/WingSAXS-0.7.0-blue" alt="WingSAXS 0.7.0">
-  <img src="https://img.shields.io/badge/Python-3.11--3.13-blue" alt="Python 3.11 to 3.13">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
-</p>
+Trace observed butterfly trajectories across 2D SAXS frames, inspect apparent ellipse geometry and support, and export per-frame measurements and reusable sequence reports. Physical lengths require calibrated physical `q`.
 
-<p align="center">
-  <a href="#english">English</a> · <a href="#中文说明">中文说明</a> · <a href="#quick-start">Quick start</a> · <a href="#安装与启动">安装与启动</a> · <a href="#documentation">Documentation / 文档</a> · <a href="#scientific-scope">Scientific scope / 科学边界</a>
-</p>
+[Install / 安装](#install) · [Quick start](#quick-start) · [中文说明](#中文说明) · [工作台指南](docs/user_guide_zh.md) · [输出与科学定义](docs/scientific_basis_zh.md)
+
+[![CI](https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml/badge.svg)](https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml) [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11--3.13-3776AB)](pyproject.toml) [![MIT](https://img.shields.io/badge/License-MIT-455A64)](LICENSE)
+
+![仓库合成蝴蝶图样与经验双椭圆叠加：pixel-q示例，不提供物理周期](docs/assets/refinement-ui.png)
+
+```mermaid
+flowchart TD
+  A[二维帧、PONI 几何与掩膜] --> B[标定 q 与方位角]
+  B --> C[角向强度剖面与有支持的花瓣轨迹]
+  C --> D[逐帧拟合、支持信息与候选参数]
+  D --> E[CSV / JSON / NPZ 与序列报告]
+  B --> F[独立径向剖面检查]
+  F --> G[有级次依据的径向 q 峰与环尺度]
+```
+
+角向环采样坐标 `q_annulus` 与径向反射峰 `q*` 分开处理。缺失象限、环或失败帧保留缺失；经验几何与示意层片结构不能单独给出唯一三维重构。
 
 ## English
 
