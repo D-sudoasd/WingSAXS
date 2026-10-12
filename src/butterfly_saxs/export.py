@@ -401,6 +401,15 @@ def _quality_confidence(value: Any) -> tuple[Any, Any]:
     return confidence, reason
 
 
+def _eccentricity_from_ratio(value: Any) -> float | None:
+    """Keep a missing/non-finite ellipse estimate missing during export."""
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return math.sqrt(max(0., 1. - ratio ** 2)) if math.isfinite(ratio) else None
+
+
 def _parameters(value: Any) -> list[dict[str, Any]]:
     """Normalise parameter sources while retaining fit diagnostics.
 
@@ -552,14 +561,14 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
             candidate_value = check.get("candidate_value")
             if candidate_value is None:
                 candidate_value = row["value"]
-            if name in ("eccentricity", "ellipticity") and candidate_value is not None:
-                candidate_value = math.sqrt(max(0., 1. - float(candidate_value) ** 2))
+            if name in ("eccentricity", "ellipticity"):
+                candidate_value = _eccentricity_from_ratio(candidate_value)
             row["candidate_value"] = _scalar(candidate_value)
             row["identifiability_status"] = check.get("status", "undetermined")
             row["identifiability_reason"] = check.get("reason", "")
             quantitative_value = check.get("value")
-            if name in ("eccentricity", "ellipticity") and quantitative_value is not None:
-                quantitative_value = math.sqrt(max(0., 1. - float(quantitative_value) ** 2))
+            if name in ("eccentricity", "ellipticity"):
+                quantitative_value = _eccentricity_from_ratio(quantitative_value)
             check_status = str(check.get("status", "undetermined")).strip().casefold()
             value_is_finite = (
                 not isinstance(quantitative_value, bool)
