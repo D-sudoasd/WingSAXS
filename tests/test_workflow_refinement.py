@@ -215,7 +215,7 @@ def test_geometry_action_uses_ellipse_rmse_and_marks_model_unfitted(monkeypatch)
     assert "intensity_model_unfitted" in result["flags"]
 
 
-def test_geometry_action_withholds_axis_ratio_at_explicit_bound(monkeypatch) -> None:
+def test_geometry_action_retains_constrained_ellipse_at_explicit_bound(monkeypatch) -> None:
     service = ButterflyAnalysisService()
 
     def fake_preview(**kwargs):
@@ -240,10 +240,11 @@ def test_geometry_action_withholds_axis_ratio_at_explicit_bound(monkeypatch) -> 
 
     monkeypatch.setattr(service, "preview", fake_preview)
     result = service.measure_geometry()
-    assert result["geometry_parameters"]["a"] is None
-    assert result["geometry_parameters"]["b"] is None
-    assert result["geometry_parameters"]["axis_ratio"] is None
-    assert result["geometry_parameters"]["theta_deg"] is None
+    assert all(result["geometry_parameters"][name] is None for name in ("a", "b", "axis_ratio", "theta_deg"))
+    assert result["candidate_geometry_parameters"]["a"] == pytest.approx(0.11)
+    assert result["candidate_geometry_parameters"]["b"] == pytest.approx(0.0385)
+    assert result["candidate_geometry_parameters"]["theta_deg"] == pytest.approx(32.0)
+    assert result["candidate_geometry_parameters"]["axis_ratio"] == pytest.approx(0.35)
     assert "axis_ratio_at_bound" in service_module._batch_record_flags(
         result, result.get("metrics")
     )

@@ -8,7 +8,10 @@ from typing import Any
 
 import numpy as np
 
-from .butterfly_quality import classify_ellipse_publication
+from .butterfly_quality import (
+    classify_ellipse_publication,
+    ellipse_candidate_is_limited,
+)
 from .ellipse import EllipseGeometry
 from .serialization import json_safe
 
@@ -54,7 +57,21 @@ def _ellipse_state(
     quality = candidate.get("quality", result.get("quality", {}))
     if not isinstance(quality, Mapping):
         quality = {}
-    flags = candidate.get("flags", quality.get("flags", ()))
+    flags: list[str] = []
+    for source in (candidate, quality):
+        raw_flags = source.get("flags", ())
+        if isinstance(raw_flags, str):
+            flags.extend(part.strip() for part in raw_flags.split(",") if part.strip())
+        else:
+            flags.extend(str(item) for item in (raw_flags or ()) if item)
+    bound_flags = candidate.get("bound_flags", candidate.get("bound_status", {}))
+    if isinstance(bound_flags, Mapping):
+        active_bounds = [str(name) for name, active in bound_flags.items() if active is True]
+        if active_bounds:
+            flags.append("parameter_at_explicit_bound")
+        if bound_flags.get("axis_ratio"):
+            flags.append("axis_ratio_at_bound")
+    flags = list(dict.fromkeys(flags))
     ratio = _finite(candidate.get("axis_ratio", candidate.get("axes_ratio")))
     if ratio is None:
         a = _finite(candidate.get("a", candidate.get("semi_major")))
@@ -66,19 +83,42 @@ def _ellipse_state(
         axis_ratio=ratio,
         flags=flags,
     )
+    if _flag(candidate.get("success")) is False or status_text in {
+        "fail", "failed", "error", "invalid", "unconverged"
+    }:
+        return "candidate_unconverged", {
+            "reason": "solver_did_not_converge",
+            "candidate_label": "unsuccessful geometry candidate; diagnostic only",
+            "solver_status": status_text or "unknown",
+            "message": str(candidate.get("message", "")),
+            "quality_status": quality.get("status"),
+            "flags": json_safe(flags),
+        }
     if status_text in {"ring", "ring_only", "ring-only"} or publication_kind == "ring":
         return "ring_only_candidate", {
-            "reason": "candidate_geometry_is_ring_only_or_bound_limited",
-            "candidate_label": "ring-only / bound-limited; not quantitative",
+            "reason": "candidate_geometry_is_near_circular_or_ring_only",
+            "candidate_label": "near-circular ring candidate; ellipse axis is not identifiable",
             "quality_status": quality.get("status"),
             "flags": json_safe(flags),
         }
     if _flag(candidate.get("success")) is True:
+        limited = ellipse_candidate_is_limited(flags)
         return "candidate", {
-            "reason": "diagnostic_candidate_only",
-            "candidate_label": "candidate; not scientifically accepted",
+            "reason": (
+                "ellipse_candidate_has_bound_or_support_limitations"
+                if limited
+                else "diagnostic_candidate_only"
+            ),
+            "candidate_label": (
+                "constrained ellipse candidate; not scientifically accepted"
+                if limited
+                else "candidate ellipse; not scientifically accepted"
+            ),
+            "bound_or_support_limited": limited,
             "quality_status": quality.get("status"),
-            "scientific_status": quality.get("scientific_status", "NOT_ACCEPTED"),
+            "scientific_status": (
+                "NOT_ACCEPTED" if limited else quality.get("scientific_status", "NOT_ACCEPTED")
+            ),
             "flags": json_safe(flags),
         }
     return "candidate_unconverged", {

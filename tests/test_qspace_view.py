@@ -116,8 +116,8 @@ def test_qspace_window_and_arc_visibility_share_branch_state(qtbot):
     assert view._arc_is_extrapolated({"extrapolated": True, "supported": True})
 
 
-def test_qspace_overlay_uses_first_order_ring_when_shape_is_unpublished() -> None:
-    ring = {
+def test_qspace_overlay_keeps_limited_ellipse_and_uses_ring_for_near_circle() -> None:
+    limited_ellipse = {
         "quality": {"status": "WARN", "flags": ["axis_ratio_at_bound"]},
         "candidate_fit": {
             "a": 0.27,
@@ -140,9 +140,20 @@ def test_qspace_overlay_uses_first_order_ring_when_shape_is_unpublished() -> Non
             "q_star_from_arcs": 0.09296,
         },
     }
+    assert overlay_uses_first_order_ring(limited_ellipse) is False
+    assert overlay_ring_radius(limited_ellipse) == pytest.approx(0.09296)
+    ring = {
+        "quality": {"status": "WARN", "flags": ["near_circular_ellipse_axis_unidentifiable"]},
+        "candidate_fit": {
+            "a": 0.095,
+            "axis_ratio": 0.98,
+            "theta_deg": 32.0,
+            "q_star_from_arcs": 0.09296,
+        },
+    }
+    assert overlay_uses_first_order_ring(ellipse) is False
     assert overlay_uses_first_order_ring(ring) is True
     assert overlay_ring_radius(ring) == pytest.approx(0.09296)
-    assert overlay_uses_first_order_ring(ellipse) is False
     nested = {"butterfly": ring}
     assert overlay_uses_first_order_ring(nested) is True
     assert overlay_ring_radius(nested) == pytest.approx(0.09296)

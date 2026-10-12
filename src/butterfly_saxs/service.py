@@ -52,7 +52,7 @@ from .analysis_config import (
     validate_analysis_settings as _validated_analysis_settings,
 )
 from .serialization import json_safe as _canonical_json_safe
-from .butterfly_quality import classify_ellipse_publication
+from .butterfly_quality import classify_ellipse_publication, ellipse_candidate_is_limited
 
 DEFAULT_MEASUREMENT_SETTINGS = DEFAULT_ANALYSIS_SETTINGS
 
@@ -171,7 +171,11 @@ def _arc_side_summary(result: Mapping[str, Any] | None) -> str | None:
 
 
 _ENGINEERING_QUALITY_FLAGS = {
+    "axis_ratio_at_bound",
+    "annular_outer_window_truncated",
+    "parameter_at_explicit_bound",
     "major_axis_exceeds_observed_extent",
+    "minor_axis_not_resolved_against_localization",
     "axis_ratio_collapsed_to_line",
     "insufficient_occupied_sides",
 }
@@ -197,9 +201,12 @@ def _batch_record_flags(result: Mapping[str, Any] | None, metrics: Any) -> list[
             sources.append(butterfly.get("candidate_fit"))
             quality = butterfly.get("quality")
             if isinstance(quality, Mapping):
+                quality_flags = quality.get("flags") or ()
+                if isinstance(quality_flags, str):
+                    quality_flags = [part.strip() for part in quality_flags.split(",") if part.strip()]
                 tokens.extend(
                     str(item)
-                    for item in (quality.get("flags") or ())
+                    for item in quality_flags
                     if str(item) in _ENGINEERING_QUALITY_FLAGS
                 )
         for source in sources:
@@ -210,9 +217,12 @@ def _batch_record_flags(result: Mapping[str, Any] | None, metrics: Any) -> list[
                 tokens.extend(part.strip() for part in nested.split(",") if part.strip())
             elif nested:
                 tokens.extend(str(item) for item in nested if item)
-            bound_flags = source.get("bound_flags")
-            if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
-                tokens.append("axis_ratio_at_bound")
+            bound_flags = source.get("bound_flags", source.get("bound_status"))
+            if isinstance(bound_flags, Mapping):
+                if bound_flags.get("axis_ratio"):
+                    tokens.append("axis_ratio_at_bound")
+                if any(value is True for value in bound_flags.values()):
+                    tokens.append("parameter_at_explicit_bound")
     return sorted(set(tokens))
 
 
@@ -235,7 +245,7 @@ def _stash_unpublished_periods(
     bound_flags = ellipse.get("bound_flags") if isinstance(ellipse, Mapping) else {}
     if isinstance(candidate, Mapping) and candidate.get("bound_flags"):
         bound_flags = candidate.get("bound_flags")
-    if (isinstance(published_b, Mapping)
+    if (allow_candidates and isinstance(published_b, Mapping)
             and published_b.get("status") == "available"
             and published_b.get("value") is not None):
         return
@@ -326,23 +336,42 @@ def _copy_candidate_radial_comparison(
 
 
 def _ring_only_butterfly_shape(ellipse: Any, candidate: Any, butterfly: Any) -> bool:
-    """Use the shared publication rule at both service result boundaries."""
+    """Withhold quantitative shape fields for rings, failed or limited candidates."""
 
     ellipse = ellipse if isinstance(ellipse, Mapping) else {}
     candidate = candidate if isinstance(candidate, Mapping) else {}
     butterfly = butterfly if isinstance(butterfly, Mapping) else {}
     quality = butterfly.get("quality")
     quality = quality if isinstance(quality, Mapping) else {}
-    flags = [str(flag) for source in (ellipse, candidate, quality)
-             for flag in (source.get("flags") or ()) if flag]
     for source in (ellipse, candidate):
-        bounds = source.get("bound_flags")
-        if isinstance(bounds, Mapping) and bounds.get("axis_ratio"):
-            flags.append("axis_ratio_at_bound")
+        status = str(source.get("status", source.get("solver_status", ""))).lower()
+        if source.get("success") is False or status in {
+            "fail", "failed", "error", "invalid", "unconverged",
+        }:
+            return True
+    flags = []
+    for source in (ellipse, candidate, quality):
+        raw = source.get("flags") or ()
+        if isinstance(raw, str):
+            flags.extend(part.strip() for part in raw.split(",") if part.strip())
+        else:
+            flags.extend(str(flag) for flag in raw if flag)
+    for source in (ellipse, candidate):
+        bounds = source.get("bound_flags", source.get("bound_status"))
+        if isinstance(bounds, Mapping):
+            if bounds.get("axis_ratio"):
+                flags.append("axis_ratio_at_bound")
+            if any(value is True for value in bounds.values()):
+                flags.append("parameter_at_explicit_bound")
     ratio = candidate.get("axis_ratio")
     if ratio is None:
         ratio = ellipse.get("axis_ratio")
-    return classify_ellipse_publication(axis_ratio=ratio, flags=flags) == "ring"
+    return (
+        classify_ellipse_publication(
+            quality_status=quality.get("status"), axis_ratio=ratio, flags=flags,
+        ) in {"ring", "fail"}
+        or ellipse_candidate_is_limited(flags)
+    )
 
 
 def _ellipse_kind_for_record(result: Mapping[str, Any] | None) -> str:
@@ -350,12 +379,21 @@ def _ellipse_kind_for_record(result: Mapping[str, Any] | None) -> str:
     geometry = payload.get("geometry_parameters")
     if not isinstance(geometry, Mapping):
         geometry = {}
+    candidate_geometry = payload.get("candidate_geometry_parameters")
+    if not isinstance(candidate_geometry, Mapping):
+        candidate_geometry = {}
+    candidate = geometry.get("axis_ratio")
+    if candidate is None:
+        candidate = candidate_geometry.get("axis_ratio")
+    if candidate is None:
+        butterfly = payload.get("butterfly")
+        candidate = _read(_read(butterfly, ("candidate_fit",), {}), ("axis_ratio",), None)
     quality = _read(_read(payload.get("butterfly"), ("quality",), {}), ("status",), None)
     if quality is None:
         quality = payload.get("quality_status")
     return classify_ellipse_publication(
         quality_status=quality,
-        axis_ratio=geometry.get("axis_ratio"),
+        axis_ratio=candidate,
         flags=_batch_record_flags(payload, payload.get("metrics")),
     )
 

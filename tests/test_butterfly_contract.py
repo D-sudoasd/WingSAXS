@@ -75,9 +75,9 @@ def test_ellipse_publication_classifies_ring_vs_interior_fit() -> None:
             axis_ratio=0.35,
             flags=["axis_ratio_at_bound"],
         )
-        == "ring"
+        == "ellipse"
     )
-    assert unpublished_ellipse_shape(
+    assert not unpublished_ellipse_shape(
         quality_status="WARN",
         flags=["axis_ratio_at_bound"],
     )
@@ -133,7 +133,7 @@ def test_isotropic_ring_cannot_become_double_ellipse_with_standard_preset() -> N
     "near_circular_ellipse_axis_unidentifiable",
     "annular_outer_window_truncated",
 ])
-def test_service_preview_withholds_new_ring_only_shapes(monkeypatch, flag) -> None:
+def test_service_preview_preserves_limited_ellipse_but_withholds_near_circle(monkeypatch, flag) -> None:
     from butterfly_saxs.service import ButterflyAnalysisService
 
     service = ButterflyAnalysisService()
@@ -147,10 +147,16 @@ def test_service_preview_withholds_new_ring_only_shapes(monkeypatch, flag) -> No
         "parameters": {},
     })
     result = service.measure_geometry()
-    assert all(result["geometry_parameters"].get(name) is None
-               for name in ("a", "b", "axis_ratio", "theta_deg"))
-    assert all(name not in result["geometry_parameters"] for name in
-               ("semi_major", "semi_minor", "axes_ratio", "ellipse_axis_tilt_deg"))
+    if flag == "near_circular_ellipse_axis_unidentifiable":
+        assert all(result["geometry_parameters"].get(name) is None
+                   for name in ("a", "b", "axis_ratio", "theta_deg"))
+        assert all(name not in result["geometry_parameters"] for name in
+                   ("semi_major", "semi_minor", "axes_ratio", "ellipse_axis_tilt_deg"))
+    else:
+        assert result["geometry_parameters"]["a"] is None
+        assert result["candidate_geometry_parameters"]["axis_ratio"] == 0.3
+        assert classify_ellipse_publication(axis_ratio=0.3, flags=[flag]) == "ellipse"
+        assert flag in result["butterfly"]["quality"]["flags"]
     assert result["butterfly"]["candidate_fit"]["a"] == 1.0
     assert result["candidate_geometry_parameters"]["a"] == 1.0
     assert result["candidate_geometry_parameters"]["axis_ratio"] == 0.3
@@ -184,7 +190,7 @@ def test_two_occupied_sides_are_an_engineering_fail() -> None:
     assert "insufficient_occupied_sides" in result["quality"]["flags"]
 
 
-def test_axis_ratio_floor_is_a_ring_warning() -> None:
+def test_axis_ratio_floor_retains_a_limited_ellipse_candidate() -> None:
     points = [
         {
             "accepted": True,
@@ -210,7 +216,8 @@ def test_axis_ratio_floor_is_a_ring_warning() -> None:
     }
     result = evaluate_arc_evidence({"points": points}, candidate)
     assert result["quality"]["status"] == "WARN"
-    assert "axis_ratio_collapsed_to_line" in result["quality"]["flags"]
+    assert "axis_ratio_at_bound" in result["quality"]["flags"]
+    assert "axis_ratio_collapsed_to_line" not in result["quality"]["flags"]
     flagged = dict(candidate)
     flagged.pop("bound_flags")
     flagged["flags"] = ["axis_ratio_at_bound"]
@@ -218,12 +225,12 @@ def test_axis_ratio_floor_is_a_ring_warning() -> None:
     assert via_flag["quality"]["status"] == "WARN"
     assert classify_ellipse_publication(
         quality_status="WARN",
-        axis_ratio=None,
+        axis_ratio=0.005,
         flags=["axis_ratio_collapsed_to_line", "axis_ratio_at_bound"],
-    ) == "ring"
+    ) == "ellipse"
 
 
-def test_major_axis_beyond_observed_ridge_is_a_ring_warning() -> None:
+def test_major_axis_beyond_observed_ridge_remains_a_limited_ellipse_candidate() -> None:
     points = [
         {
             "accepted": True,
@@ -256,7 +263,7 @@ def test_major_axis_beyond_observed_ridge_is_a_ring_warning() -> None:
         quality_status="WARN",
         axis_ratio=0.087,
         flags=["major_axis_exceeds_observed_extent"],
-    ) == "ring"
+    ) == "ellipse"
     supported = evaluate_arc_evidence(
         {"points": points},
         {

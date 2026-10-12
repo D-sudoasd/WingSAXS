@@ -204,9 +204,12 @@ def _quality_flags(result: Mapping[str, Any]) -> list[str]:
     flags: list[str] = []
     for source in (result, quality, candidate):
         flags.extend(_text_values(source.get("flags")))
-    bound_flags = candidate.get("bound_flags")
-    if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
-        flags.append("axis_ratio_at_bound")
+    bound_flags = candidate.get("bound_flags", candidate.get("bound_status"))
+    if isinstance(bound_flags, Mapping):
+        if bound_flags.get("axis_ratio"):
+            flags.append("axis_ratio_at_bound")
+        if any(value is True for value in bound_flags.values()):
+            flags.append("parameter_at_explicit_bound")
     metrics = quality.get("metrics")
     if isinstance(metrics, Mapping):
         flags.extend(_text_values(metrics.get("flags")))
@@ -239,8 +242,9 @@ _REASON_TEXT: dict[str, tuple[str, str]] = {
         "首阶峰选择存在歧义",
         "first-order peak selection is ambiguous",
     ),
-    "axis_ratio_at_bound": ("轴比触及边界，按仅一阶环处理", "axis ratio at bound; ring only"),
-    "axis_ratio_collapsed_to_line": ("轴比塌缩，椭圆不可分辨", "axis ratio collapsed; ellipse unresolved"),
+    "axis_ratio_at_bound": ("轴比触及拟合边界；保留为受约束椭圆候选", "axis ratio at a fit bound; constrained ellipse candidate"),
+    "axis_ratio_collapsed_to_line": ("极扁轴比触及边界；形状显示为受约束椭圆候选", "very-flat axis ratio reached a bound; shown as a constrained ellipse candidate"),
+    "parameter_at_explicit_bound": ("拟合参数触及显式边界；椭圆保留为受限候选", "fit parameter reached an explicit bound; ellipse retained as a limited candidate"),
     "major_axis_exceeds_observed_extent": ("长轴超出观测范围", "major axis exceeds observed extent"),
     "annular_outer_window_truncated": ("花瓣延伸到分析 q 窗口边界，长轴端点未观测到", "petals reach the q-window boundary; major-axis tip unobserved"),
     "near_circular_ellipse_axis_unidentifiable": ("近圆形图样的椭圆轴方向不可辨识", "near-circular pattern has no identifiable ellipse direction"),
@@ -535,7 +539,7 @@ def build_butterfly_quality_summary(
     if visible_result and not calibrated:
         reasons.append("uncalibrated_pixel_q" if unit == "pixel-q" else "spacing_unavailable_unknown_q_unit")
         l_ring = None
-    bound_flags = candidate.get("bound_flags")
+    bound_flags = candidate.get("bound_flags", candidate.get("bound_status"))
     if (
         kind == "ring"
         and "axis_ratio_at_bound" not in reasons

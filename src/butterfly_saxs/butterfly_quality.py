@@ -17,6 +17,46 @@ NEAR_CIRCULAR_AXIS_RATIO_MIN = 0.95
 
 PARAMETERS = ("a", "b", "axis_ratio", "theta_deg")
 
+ELLIPSE_CANDIDATE_LIMITATION_FLAGS = frozenset(
+    {
+        "axis_ratio_at_bound",
+        "axis_ratio_collapsed_to_line",
+        "major_axis_exceeds_observed_extent",
+        "minor_axis_not_resolved_against_localization",
+        "annular_outer_window_truncated",
+        "parameter_at_explicit_bound",
+    }
+)
+
+
+def _flag_tokens(flags) -> list[str]:
+    if isinstance(flags, Mapping):
+        nested = flags.get("flags") or ()
+        if isinstance(nested, str):
+            tokens = [part.strip() for part in nested.split(",") if part.strip()]
+        else:
+            tokens = [str(item) for item in nested if item]
+        if flags.get("axis_ratio"):
+            tokens.append("axis_ratio_at_bound")
+        bounds = flags.get("bound_flags", flags.get("bound_status"))
+        if isinstance(bounds, Mapping) and any(value is True for value in bounds.values()):
+            tokens.append("parameter_at_explicit_bound")
+        return list(dict.fromkeys(tokens))
+    if isinstance(flags, str):
+        return [part.strip() for part in flags.split(",") if part.strip()]
+    return [str(item) for item in (flags or ()) if item]
+
+
+def ellipse_candidate_is_limited(flags=None) -> bool:
+    """Return whether geometry flags require a constrained-candidate label.
+
+    These diagnostics describe parameter bounds or incomplete q-space support.
+    They affect confidence in the ellipse, not whether a finite small ``b/a``
+    is an ellipse or a ring.
+    """
+
+    return bool(ELLIPSE_CANDIDATE_LIMITATION_FLAGS.intersection(_flag_tokens(flags)))
+
 
 def classify_ellipse_publication(
     *,
@@ -24,48 +64,31 @@ def classify_ellipse_publication(
     axis_ratio=None,
     flags=None,
 ) -> str:
-    """Say whether the published row is a ring period, an interior ellipse, or a fail.
+    """Classify shape without granting quantitative or scientific acceptance.
 
-    A cap/floor ``b/a`` is not a measured ellipticity.  Those frames still have
-    a first-order ring period; they are not a quantitative Wang ellipse.
+    This classifies the fitted shape. Bound/support flags remain diagnostics
+    for candidate status; they do not convert a finite ellipse into a ring.
     """
 
     quality = str(quality_status or "").strip().upper()
-    if isinstance(flags, Mapping):
-        flag_tokens = [str(item) for item in (flags.get("flags") or ()) if item]
-        if flags.get("axis_ratio"):
-            flag_tokens.append("axis_ratio_at_bound")
-    elif isinstance(flags, str):
-        flag_tokens = [part.strip() for part in flags.split(",") if part.strip()]
-    else:
-        flag_tokens = [str(item) for item in (flags or ()) if item]
-    flag_text = ",".join(flag_tokens)
+    flag_tokens = _flag_tokens(flags)
     ratio = _finite(axis_ratio)
-    # A ring can fail the four-side butterfly test. Preserve that shape
-    # diagnosis independently of the quality of a double-ellipse fit.
+    if ratio is not None and not 0.0 < ratio <= 1.0:
+        return "fail"
+    # A circular pattern may fail a four-side butterfly fit. Its shape and
+    # unavailable ellipse-axis direction remain distinguishable from that fit.
     if ((ratio is not None and ratio >= NEAR_CIRCULAR_AXIS_RATIO_MIN)
             or "near_circular_ellipse_axis_unidentifiable" in flag_tokens):
         return "ring"
     if quality in {"FAIL", "FAILED", "INVALID"}:
         return "fail"
-    if any(
-        token in flag_text
-        for token in (
-            "axis_ratio_at_bound",
-            "axis_ratio_collapsed_to_line",
-            "major_axis_exceeds_observed_extent",
-            "annular_outer_window_truncated",
-            "near_circular_ellipse_axis_unidentifiable",
-        )
-    ):
-        return "ring"
     if ratio is not None:
         return "ellipse"
     return "undetermined"
 
 
 def unpublished_ellipse_shape(*, quality_status=None, axis_ratio=None, flags=None) -> bool:
-    """True when the canvas/table should show a first-order ring, not an ellipse."""
+    """True only when near-circular degeneracy makes the ellipse axis unusable."""
 
     return classify_ellipse_publication(
         quality_status=quality_status,
@@ -181,16 +204,8 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
         common.append("near_circular_ellipse_axis_unidentifiable")
     bound_flags = candidate.get("bound_flags", {}) or {}
     flag_names = {str(item) for item in (candidate.get("flags") or ())}
-    line_collapsed = (
-        ratio is not None
-        and ratio <= 0.02
-        and (
-            bool(bound_flags.get("axis_ratio"))
-            or "axis_ratio_at_bound" in flag_names
-        )
-    )
-    if line_collapsed:
-        common.append("axis_ratio_collapsed_to_line")
+    if bool(bound_flags.get("axis_ratio")) or "axis_ratio_at_bound" in flag_names:
+        common.append("axis_ratio_at_bound")
     sigmas = np.asarray([v for p in points if (v := _finite(p.get("localization_sigma_q")))
                          is not None and v > 0], dtype=float)
     median_sigma = float(np.median(sigmas)) if sigmas.size else None
@@ -394,6 +409,7 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     seed_blockers = {
         "insufficient_occupied_sides", "insufficient_independent_side_support",
         "near_circular_ellipse_axis_unidentifiable", "axis_ratio_collapsed_to_line",
+        "axis_ratio_at_bound",
         "observed_support_infeasible", "ill_conditioned_geometry",
         "residual_exceeds_localization_scale", "annular_trajectory_support_limited",
     }

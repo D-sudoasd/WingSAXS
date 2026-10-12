@@ -15,7 +15,11 @@ import math
 from pathlib import Path
 from typing import Any
 
-from ..butterfly_quality import classify_ellipse_publication, unpublished_ellipse_shape
+from ..butterfly_quality import (
+    classify_ellipse_publication,
+    ellipse_candidate_is_limited,
+    unpublished_ellipse_shape,
+)
 from ..butterfly_settings import normalize_butterfly_settings
 from ..fit_overlays import fit_geometry_layers
 from ..settings import canonical_q_unit
@@ -127,6 +131,14 @@ def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
             if hasattr(source, name):
                 return getattr(source, name)
     return default
+
+
+def _flag_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [str(item) for item in value if item]
+    return []
 
 
 def _finite(value: Any) -> float | None:
@@ -3458,11 +3470,17 @@ if QT_AVAILABLE:
                 )
                 sides = f"{present}/4"
             english = self._language.lower().startswith("en")
-            bound_flags = candidate.get("bound_flags")
-            flag_names = [str(item) for item in (candidate.get("flags") or ()) if item]
-            flag_names.extend(str(item) for item in (quality.get("flags") or ()) if item)
-            if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
-                flag_names.append("axis_ratio_at_bound")
+            bound_flags = candidate.get("bound_flags", candidate.get("bound_status"))
+            flag_names = _flag_values(candidate.get("flags"))
+            flag_names.extend(_flag_values(quality.get("flags")))
+            if isinstance(bound_flags, Mapping):
+                if bound_flags.get("axis_ratio"):
+                    flag_names.append("axis_ratio_at_bound")
+                if any(value is True for value in bound_flags.values()):
+                    flag_names.append("parameter_at_explicit_bound")
+            ellipse_limited = ellipse_candidate_is_limited(
+                {"flags": flag_names, "bound_flags": bound_flags}
+            )
             kind = classify_ellipse_publication(
                 quality_status=quality.get("status"),
                 axis_ratio=candidate.get("axis_ratio"),
@@ -3477,6 +3495,8 @@ if QT_AVAILABLE:
                 reading = "ring only" if english else "仅一阶环"
             elif kind == "fail":
                 reading = "fail" if english else "失败"
+            elif ellipse_limited:
+                reading = "constrained ellipse candidate" if english else "受约束椭圆候选"
             else:
                 reading = "ellipse" if english else "椭圆"
             sector_result = self._is_sector_result()
@@ -3493,6 +3513,14 @@ if QT_AVAILABLE:
             ) if sector_result else ("L ring (nm)" if english else "环 L（nm）")
             sector_summary = result.get("measurement_summary")
             sector_summary = sector_summary if isinstance(sector_summary, Mapping) else {}
+            quality_display = quality.get("status")
+            if ellipse_limited and kind == "ellipse" and not annular_result:
+                qualifier = "constrained ellipse candidate" if english else "受约束椭圆候选"
+                quality_display = (
+                    f"{quality_display} · {qualifier}"
+                    if quality_display not in (None, "")
+                    else qualifier
+                )
             if sector_result:
                 # The selected-sector statistic is the authoritative radial
                 # readout for this method. Never populate it from the legacy
@@ -3547,7 +3575,7 @@ if QT_AVAILABLE:
                     quality.get("status"),
                     None,
                     None,
-                    ", ".join(str(item) for item in (quality.get("flags") or ()) if item),
+                    ", ".join(_flag_values(quality.get("flags"))),
                 ),
                 (
                     "track support" if english else "轨迹支持",
@@ -3574,18 +3602,18 @@ if QT_AVAILABLE:
                 (
                     "reading" if english else "判读",
                     reading,
-                    quality.get("status"),
+                    quality_display,
                     None,
                     None,
                     None,
                 ),
                 (
                     "quality" if english else "质量",
-                    quality.get("status"),
-                    quality.get("status"),
+                    quality_display,
+                    quality_display,
                     None,
                     None,
-                    ", ".join(str(item) for item in (quality.get("flags") or ()) if item),
+                    ", ".join(_flag_values(quality.get("flags"))),
                 ),
                 (
                     "arcs" if english else "弧",
@@ -3624,23 +3652,17 @@ if QT_AVAILABLE:
                 extra = []
                 quantitative = result.get("quantitative_parameters")
                 quantitative = quantitative if isinstance(quantitative, Mapping) else {}
-                shape_issue = unpublished_shape or kind in {"ring", "fail", "undetermined"}
+                shape_issue = (
+                    unpublished_shape
+                    or ellipse_limited
+                    or kind in {"ring", "fail", "undetermined"}
+                )
                 default_reason = (
                     "Candidate derived from the apparent ellipse; review the fit flags before interpretation."
                     if english
                     else "基于表观椭圆的候选值；解释前请结合拟合标记判读。"
                 )
-                quality_flags = [
-                    str(item)
-                    for item in (quality.get("flags") or ())
-                    if item
-                ]
-                candidate_flags = [
-                    str(item)
-                    for item in (candidate.get("flags") or ())
-                    if item
-                ]
-                flag_reason = ", ".join(dict.fromkeys(quality_flags + candidate_flags))
+                flag_reason = ", ".join(dict.fromkeys(flag_names))
                 if flag_reason:
                     default_reason = f"{default_reason} {flag_reason}"
                 if shape_issue:
@@ -3682,9 +3704,14 @@ if QT_AVAILABLE:
                         )
                         if parameter_value is not None:
                             value = parameter_value
-                        state = str(_read(parameter, ("status",), state) or state)
-                        confidence = str(_read(parameter, ("confidence",), confidence) or confidence)
-                        reason = str(_read(parameter, ("reason",), reason) or reason)
+                        if shape_issue:
+                            state = "candidate"
+                            confidence = "limited"
+                            reason = default_reason
+                        else:
+                            state = str(_read(parameter, ("status",), state) or state)
+                            confidence = str(_read(parameter, ("confidence",), confidence) or confidence)
+                            reason = str(_read(parameter, ("reason",), reason) or reason)
                     return value, state, confidence, reason
 
                 ln, ln_state, ln_confidence, ln_reason = candidate_parameter(

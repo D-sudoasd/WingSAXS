@@ -305,7 +305,7 @@ def test_evaluated_undetermined_keeps_reason_and_exposes_unvalidated_candidate(q
     window.close()
 
 
-def test_workbench_reads_runaway_major_axis_as_ring_only(qtbot, tmp_path):
+def test_workbench_retains_extrapolated_ellipse_as_limited_candidate(qtbot, tmp_path):
     window = MainWindow(engine=_ButterflyEngine(), auto_preview=False, language="zh_CN")
     qtbot.addWidget(window)
     window.butterfly_workbench.set_analysis_settings({"stage": "evaluate", "resamples": 0})
@@ -342,7 +342,7 @@ def test_workbench_reads_runaway_major_axis_as_ring_only(qtbot, tmp_path):
         for row in range(window.butterfly_workbench.quantity_table.rowCount())
     ]
     reading_row = labels.index("判读")
-    assert window.butterfly_workbench.quantity_table.item(reading_row, 1).text() == "仅一阶环"
+    assert window.butterfly_workbench.quantity_table.item(reading_row, 1).text() == "受约束椭圆候选"
     assert "Ln 候选（nm）" in labels
     assert "长轴 L 候选（nm）" in labels
     ln_row = labels.index("Ln 候选（nm）")
@@ -355,6 +355,59 @@ def test_workbench_reads_runaway_major_axis_as_ring_only(qtbot, tmp_path):
     shot = tmp_path / "workbench-ring-only.png"
     window.butterfly_workbench.save_screenshot(shot)
     assert shot.stat().st_size > 0
+    window.close()
+
+
+@pytest.mark.parametrize(
+    ("quality_flags", "bound_status"),
+    [
+        ([], {"a": True}),
+        ("minor_axis_not_resolved_against_localization", {}),
+    ],
+)
+def test_workbench_labels_legacy_and_string_limited_fits_as_candidates(
+    qtbot, quality_flags, bound_status
+):
+    window = MainWindow(engine=_ButterflyEngine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    window.butterfly_workbench.set_analysis_settings({"stage": "evaluate", "resamples": 0})
+    window.butterfly_workbench.set_result(
+        {
+            "quality": {"status": "PASS", "flags": quality_flags},
+            "quantitative_parameters": {
+                "Ln_from_minor_axis_nm": {
+                    "value": 83.0,
+                    "status": "available",
+                    "confidence": "empirical",
+                }
+            },
+            "candidate_fit": {
+                "success": True,
+                "status": "ok",
+                "a": 1.28,
+                "b": 0.01536,
+                "axis_ratio": 0.012,
+                "theta_deg": 40.0,
+                "bound_status": bound_status,
+                "Ln_from_minor_axis_nm": 83.0,
+                "q_star_from_arcs": 0.09296,
+            },
+        }
+    )
+
+    labels = [
+        window.butterfly_workbench.quantity_table.item(row, 0).text()
+        for row in range(window.butterfly_workbench.quantity_table.rowCount())
+    ]
+    reading_row = labels.index("reading")
+    quality_row = labels.index("quality")
+    ln_row = labels.index("Ln candidate (nm)")
+    assert window.butterfly_workbench.quantity_table.item(reading_row, 1).text() == "constrained ellipse candidate"
+    assert window.butterfly_workbench.quantity_table.item(quality_row, 1).text() == (
+        "PASS · constrained ellipse candidate"
+    )
+    assert window.butterfly_workbench.quantity_table.item(ln_row, 2).text() == "candidate · limited"
+    assert window.butterfly_workbench.quantity_table.item(ln_row, 3).text() == "83"
     window.close()
 
 

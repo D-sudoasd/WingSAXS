@@ -75,7 +75,7 @@ def _finite_pair(value: Any) -> tuple[float, float] | None:
 
 
 def overlay_uses_first_order_ring(payload: Mapping[str, Any] | None) -> bool:
-    """True when the canvas should stroke q* as a ring, not the capped ellipse."""
+    """True when a near-circular shape has no identifiable ellipse-axis overlay."""
 
     from ..butterfly_quality import unpublished_ellipse_shape
 

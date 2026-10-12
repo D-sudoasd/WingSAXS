@@ -479,7 +479,7 @@ def test_batch_table_shows_ellipse_parameters_and_folder_controls(qtbot) -> None
     )
     assert window.batch_table.item(0, 8).text() == "≈174.5"
     assert "174.5" in window.batch_table.item(0, 8).toolTip()
-    assert "Unconfirmed lengths calculated from the ellipse" in window.batch_table.item(0, 8).toolTip()
+    assert "Candidate lengths calculated from the ellipse" in window.batch_table.item(0, 8).toolTip()
     assert "spacing from the first ring" in window.batch_table.item(0, 8).toolTip()
     window._update_batch_rows(
         [
@@ -522,17 +522,53 @@ def test_batch_table_shows_ellipse_parameters_and_folder_controls(qtbot) -> None
             }
         ]
     )
-    assert window.batch_table.item(0, 2).text() == "WARN · ring"
-    assert window.batch_table.item(0, 3).text() == "—"
-    assert window.batch_table.item(0, 4).text() == "—"
-    assert window.batch_table.item(0, 5).text() == "—"
-    assert window.batch_table.item(0, 6).text() == "—"
-    assert "the fit does not establish this angle" in window.batch_table.item(0, 6).toolTip()
+    assert window.batch_table.item(0, 2).text() == "WARN · ellipse candidate"
+    assert window.batch_table.item(0, 3).text() == "≈0.11"
+    assert window.batch_table.item(0, 4).text() == "≈0.038"
+    assert window.batch_table.item(0, 5).text() == "≈0.35"
+    assert window.batch_table.item(0, 6).text() == "≈32"
+    assert "candidate" in window.batch_table.item(0, 6).toolTip()
     assert window.batch_table.item(0, 8).text() == "—"
     assert window.batch_table.item(0, 10).text() == "68.3"
     assert "spacing from the first ring" in window.batch_table.item(0, 8).toolTip()
     window._clear_batch_frames()
     assert window.batch_frames == []
+    window.close()
+
+
+def test_batch_pass_quality_stays_limited_for_legacy_bound_record(qtbot) -> None:
+    window = MainWindow(engine=_Engine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    window._update_batch_rows(
+        [
+            {
+                "frame": "limited-frame.tif",
+                "status": "ok",
+                "quality_status": "PASS",
+                "geometry_parameters": {
+                    "a": 1.28,
+                    "b": 0.01536,
+                    "axis_ratio": 0.012,
+                    "theta_deg": 40.0,
+                    "Ln_from_minor_axis_nm": 83.0,
+                    "bound_status": {"a": True},
+                },
+                "quantitative_parameters": {
+                    "Ln_from_minor_axis_nm": {
+                        "value": 83.0,
+                        "status": "available",
+                        "confidence": "empirical",
+                    }
+                },
+            }
+        ]
+    )
+
+    assert window.batch_table.item(0, 2).text() == "PASS · ellipse candidate · limited"
+    assert window.batch_table.item(0, 3).text() == "≈1.28"
+    assert window.batch_table.item(0, 5).text() == "≈0.012"
+    assert window.batch_table.item(0, 8).text() == "≈83"
+    assert "Candidate" in window.batch_table.item(0, 8).toolTip()
     window.close()
 
 
@@ -556,7 +592,7 @@ def test_workflow_guide_points_loaded_frames_at_butterfly_identify(qtbot) -> Non
     window.close()
 
 
-def test_apply_result_replaces_capped_ellipse_overlay_with_first_order_ring(qtbot) -> None:
+def test_apply_result_keeps_capped_ellipse_overlay_as_candidate(qtbot) -> None:
     from butterfly_saxs.ui.main_window import first_order_ring_overlay
 
     ring = first_order_ring_overlay(
@@ -575,10 +611,7 @@ def test_apply_result_replaces_capped_ellipse_overlay_with_first_order_ring(qtbo
             }
         }
     )
-    assert ring is not None
-    assert ring[0]["a"] == pytest.approx(0.09296)
-    assert ring[0]["b"] == pytest.approx(0.09296)
-    assert ring[0]["angle_deg"] == pytest.approx(0.0)
+    assert ring is None
     window = MainWindow(engine=_Engine(), auto_preview=False, language="en")
     qtbot.addWidget(window)
     window.set_observed_data(np.ones((4, 4), dtype=float))
@@ -600,8 +633,8 @@ def test_apply_result_replaces_capped_ellipse_overlay_with_first_order_ring(qtbo
         }
     )
     drawn = window._observed_fit_ellipses
-    assert drawn[0]["a"] == pytest.approx(0.09296)
-    assert drawn[0]["source"] == "first_order_ring"
+    assert drawn[0]["a"] == pytest.approx(0.27)
+    assert drawn[0].get("source") != "first_order_ring"
     window.close()
 
 
@@ -916,8 +949,38 @@ def test_batch_table_does_not_promote_radial_period_to_published_ln() -> None:
         }
     )
     assert nested["axis_ratio"] is None
-    assert bound["ellipse_kind"] == "ring"
-    assert nested["ellipse_kind"] == "ring"
+    assert bound["ellipse_kind"] == "ellipse"
+    assert nested["ellipse_kind"] == "ellipse"
+    assert bound["axis_ratio_candidate"] == pytest.approx(0.35)
+    assert bound["theta_deg_candidate"] == pytest.approx(32.0)
+    legacy_bound = _batch_record_geometry(
+        {
+            "quality_status": "WARN",
+            "geometry_parameters": {
+                "a": 1.28,
+                "b": 0.01536,
+                "axis_ratio": 0.012,
+                "theta_deg": 40.0,
+                "Ln_from_minor_axis_nm": 83.0,
+                "bound_status": {"a": True},
+            },
+        }
+    )
+    assert legacy_bound["ellipse_kind"] == "ellipse"
+    assert legacy_bound["ellipse_limited"] is True
+    assert legacy_bound["a"] is None
+    assert legacy_bound["a_candidate"] == pytest.approx(1.28)
+    assert legacy_bound["ln"] is None
+    assert legacy_bound["ln_candidate"] == pytest.approx(83.0)
+    quality_limited = _batch_record_geometry(
+        {
+            "quality_status": "WARN",
+            "geometry_parameters": {"a": 1.28, "b": 0.01536, "axis_ratio": 0.012},
+            "flags": "minor_axis_not_resolved_against_localization",
+        }
+    )
+    assert quality_limited["ellipse_limited"] is True
+    assert quality_limited["axis_ratio_candidate"] == pytest.approx(0.012)
     free = _batch_record_geometry(
         {
             "quality_status": "WARN",

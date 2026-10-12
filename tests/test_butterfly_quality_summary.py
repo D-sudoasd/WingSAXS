@@ -113,11 +113,11 @@ def test_summary_ring_only_and_poor_match_reasons_are_visible(qtbot) -> None:
     page.set_result(
         _result(flags=["analysis_choice_sensitivity_unassessed", "axis_ratio_at_bound"])
     )
-    # The bound flag is a ring-only classification even when a candidate ratio exists.
-    assert page.quality_summary.state.status_key == "ring_only"
+    # A fit bound limits the candidate; it does not change a finite ellipse into a ring.
+    assert page.quality_summary.state.status_key == "ellipse_candidate"
     assert "axis_ratio_at_bound" in page.quality_summary.state.reasons
     assert "#fff5d6" in page.quality_summary.styleSheet()
-    assert "观测弧迹/峰轨迹" in page.quality_summary.next_label.text()
+    assert "复核质量和支持后再导出" in page.quality_summary.next_label.text()
 
     near_circle = _result(flags=["near_circular_ellipse_axis_unidentifiable"])
     near_circle["candidate_fit"]["axis_ratio"] = 0.98
@@ -126,7 +126,7 @@ def test_summary_ring_only_and_poor_match_reasons_are_visible(qtbot) -> None:
     assert "近圆形" in page.quality_summary.reason_label.text()
 
     page.set_result(_result(flags=["annular_outer_window_truncated"]))
-    assert page.quality_summary.state.status_key == "ring_only"
+    assert page.quality_summary.state.status_key == "ellipse_candidate"
     assert "窗口边界" in page.quality_summary.reason_label.text()
 
     page.set_result(
@@ -149,6 +149,17 @@ def test_summary_ring_only_and_poor_match_reasons_are_visible(qtbot) -> None:
     assert "观测弧支持不连续" in page.quality_summary.reason_label.text()
     assert "部分拟合投影超出观测支持" in page.quality_summary.reason_label.text()
     page.close()
+
+
+def test_summary_legacy_bound_with_pass_remains_limited_candidate() -> None:
+    result = _result(quality_status="PASS", engineering_status="PASS")
+    result["candidate_fit"]["bound_status"] = {"a": True}
+
+    state = build_butterfly_quality_summary(result, stage="evaluate")
+
+    assert state.status_key == "ellipse_candidate"
+    assert state.engineering_status == "PASS"
+    assert "parameter_at_explicit_bound" in state.reasons
 
 
 def test_ambiguous_first_order_peak_reason_is_translated(qtbot) -> None:

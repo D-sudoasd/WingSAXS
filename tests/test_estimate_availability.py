@@ -77,6 +77,10 @@ def test_boundary_estimate_is_retained_without_certifying_it():
     assert ratio["status"] == "candidate"
     assert ratio["publication_status"] == "not_assessed"
     assert "parameter_at_explicit_bound" in ratio["reasons"]
+    assert result["quality"]["scientific_status"] == "NOT_ACCEPTED"
+    assert result["warm_start_eligible"] is False
+    assert all(row["publication_status"] == "not_assessed"
+               for row in result["quantitative_parameters"].values())
 
 
 def test_rejected_background_diagnostics_are_not_an_extra_manual_arc():

@@ -42,8 +42,14 @@ def assess_geometry_fit(result: Mapping[str, Any]) -> dict[str, Any]:
     ratio = _finite(metrics.get("residual_sigma_ratio")) if isinstance(metrics, Mapping) else None
     limit = _finite(limits.get("residual_sigma_ratio_max")) if isinstance(limits, Mapping) else None
     stage = str(result.get("measurement_status", "")).lower()
-    flags = list(quality.get("flags") or [])
-    bounds = candidate.get("bound_flags") or {}
+    flags = []
+    for source in (quality, candidate):
+        raw = source.get("flags") or ()
+        if isinstance(raw, str):
+            flags.extend(part.strip() for part in raw.split(",") if part.strip())
+        else:
+            flags.extend(raw)
+    bounds = candidate.get("bound_flags", candidate.get("bound_status")) or {}
     at_bound = any(value is True for value in bounds.values()) if isinstance(bounds, Mapping) else False
     if stage == "traced":
         status, reason = "not_evaluated", "trace_only"
@@ -61,7 +67,9 @@ def assess_geometry_fit(result: Mapping[str, Any]) -> dict[str, Any]:
         "rmse_q": _finite(candidate.get("rmse")),
         "median_localization_sigma_q": _finite(metrics.get("median_localization_sigma_q")) if isinstance(metrics, Mapping) else None,
         "solver_success": candidate.get("success"), "bound_flags": dict(bounds) if isinstance(bounds, Mapping) else {},
-        "scientific_status": quality.get("scientific_status", "NOT_ACCEPTED"),
+        # A diagnostic overlay cannot inherit scientific acceptance from an
+        # older result's label, regardless of its numerical solver status.
+        "scientific_status": "NOT_ACCEPTED",
         "scientific_acceptance": False,
     }
 

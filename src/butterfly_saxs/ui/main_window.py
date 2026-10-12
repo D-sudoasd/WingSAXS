@@ -40,6 +40,7 @@ from .qspace import overlay_ring_radius, overlay_uses_first_order_ring
 from .views import PLOT_AVAILABLE, ViewGrid, _disable_auto_si_prefix
 from .workers import AnalysisWorker, GenerationGuard
 from ..cancellation import AnalysisCancelled
+from ..butterfly_quality import ellipse_candidate_is_limited
 from ..service import DEFAULT_ANALYSIS_SETTINGS
 
 try:
@@ -648,7 +649,7 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
         flag_tokens.extend(part.strip() for part in flags.split(",") if part.strip())
     else:
         flag_tokens.extend(str(item) for item in (flags or ()) if item)
-    for source in sources:
+    for source in (*sources, *candidate_sources):
         if not isinstance(source, Mapping):
             continue
         nested = source.get("flags")
@@ -656,31 +657,20 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
             flag_tokens.extend(part.strip() for part in nested.split(",") if part.strip())
         elif nested:
             flag_tokens.extend(str(item) for item in nested if item)
-        bound_flags = source.get("bound_flags")
-        if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
-            flag_tokens.append("axis_ratio_at_bound")
+        bound_flags = source.get("bound_flags", source.get("bound_status"))
+        if isinstance(bound_flags, Mapping):
+            if bound_flags.get("axis_ratio"):
+                flag_tokens.append("axis_ratio_at_bound")
+            if any(value is True for value in bound_flags.values()):
+                flag_tokens.append("parameter_at_explicit_bound")
     flags_text = ", ".join(dict.fromkeys(flag_tokens))
-    unpublished_shape = any(
-        token in flags_text
-        for token in (
-            "axis_ratio_at_bound",
-            "axis_ratio_collapsed_to_line",
-            "major_axis_exceeds_observed_extent",
-            "annular_outer_window_truncated",
-            "near_circular_ellipse_axis_unidentifiable",
-        )
-    )
-    if unpublished_shape:
-        a = None
-        b = None
-        ratio = None
-        theta = None
     quality_text = str(quality).upper() if quality else None
     from ..butterfly_quality import classify_ellipse_publication
 
+    ellipse_limited = ellipse_candidate_is_limited(flag_tokens)
     ellipse_kind = classify_ellipse_publication(
         quality_status=quality_text,
-        axis_ratio=ratio,
+        axis_ratio=ratio if ratio is not None else ratio_candidate,
         flags=flag_tokens,
     )
     ln_metadata = _batch_parameter_metadata(
@@ -710,6 +700,7 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
             metadata.get("status", "").lower() in {"candidate", "unavailable"}
             or metadata.get("confidence", "").lower() in {"limited", "unavailable"}
             or metadata.get("publication_status", "").lower() == "not_assessed"
+            or ellipse_limited
             or ellipse_kind != "ellipse"
         )
         if candidate_only and value is not None:
@@ -732,6 +723,7 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
         ln_metadata.get("status", "").lower() in {"candidate", "unavailable"}
         or ln_metadata.get("confidence", "").lower() in {"limited", "unavailable"}
         or ln_metadata.get("publication_status", "").lower() == "not_assessed"
+        or ellipse_limited
         or ellipse_kind != "ellipse"
     )
     if ln_candidate_only and ln is not None:
@@ -742,6 +734,7 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
         lz_metadata.get("status", "").lower() in {"candidate", "unavailable"}
         or lz_metadata.get("confidence", "").lower() in {"limited", "unavailable"}
         or lz_metadata.get("publication_status", "").lower() == "not_assessed"
+        or ellipse_limited
         or ellipse_kind != "ellipse"
     )
     if lz_candidate_only and lz is not None:
@@ -788,6 +781,7 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
         "arcs": arcs,
         "quality": quality_text,
         "ellipse_kind": ellipse_kind,
+        "ellipse_limited": ellipse_limited,
         "ln": ln,
         "lz": lz,
         "ln_candidate": ln_candidate,
@@ -863,7 +857,7 @@ def model_ellipse_pair(parameters: Mapping[str, Any], *, reference_axis_deg: flo
 
 
 def first_order_ring_overlay(payload: Mapping[str, Any] | None) -> list[dict[str, Any]] | None:
-    """Replace a capped solver ellipse with a first-order ring at q*."""
+    """Show q* as a ring when near-circular axes are unidentifiable."""
 
     if not overlay_uses_first_order_ring(payload):
         return None
@@ -6672,6 +6666,13 @@ if QT_AVAILABLE:
             if kind == "ring" and quality == "WARN":
                 quality_text = self._tr("quality.warn_ring")
                 quality_tip = self._tr("tooltip.batch_quality_ring")
+            elif kind == "ellipse" and geometry.get("ellipse_limited"):
+                if quality == "WARN":
+                    quality_text = self._tr("quality.warn_ellipse_candidate")
+                else:
+                    prefix = f"{quality} · " if quality else ""
+                    quality_text = prefix + self._tr("quality.ellipse_candidate_limited")
+                quality_tip = self._tr("tooltip.batch_quality_ellipse_candidate")
             elif kind == "ellipse" and quality == "WARN":
                 quality_text = self._tr("quality.warn_ellipse")
                 quality_tip = self._tr("tooltip.batch_quality_ellipse")
@@ -7109,22 +7110,56 @@ if QT_AVAILABLE:
                 self._set_profile_summary(
                     f"{self.profile_summary_label.text()}\n{symmetry_summary}"
                 )
-            quality_flags = _sequence(_read(quality_payload, ("flags",), ()))
-            ellipse_flags = _sequence(_read(ellipse, ("flags",), ()))
+            def flag_values(value: Any) -> list[str]:
+                if isinstance(value, str):
+                    return [part.strip() for part in value.split(",") if part.strip()]
+                return [str(item) for item in _sequence(value) if item]
+
+            quality_flags = flag_values(_read(quality_payload, ("flags",), ()))
+            ellipse_flags = flag_values(_read(ellipse, ("flags",), ()))
             p4_flags = list(dict.fromkeys(str(item) for item in (*quality_flags, *ellipse_flags)))
             bound_flags = _read(ellipse, ("bound_flags", "bound_status"), {}) or {}
-            unpublished_shape = bool(
-                isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio")
-            ) or bool(
-                {
-                    "axis_ratio_at_bound",
-                    "axis_ratio_collapsed_to_line",
-                    "major_axis_exceeds_observed_extent",
-                    "annular_outer_window_truncated",
-                    "near_circular_ellipse_axis_unidentifiable",
-                }
-                & {str(item) for item in (*ellipse_flags, *p4_flags)}
+            ellipse_quality_status = _read(
+                quality_payload,
+                ("status", "engineering_status"),
+                _read(ellipse, ("quality_status", "status"), None),
             )
+            axis_ratio = _read(ellipse, ("axis_ratio", "axes_ratio"), None)
+            from ..butterfly_quality import classify_ellipse_publication, unpublished_ellipse_shape
+
+            unpublished_shape = unpublished_ellipse_shape(
+                quality_status=ellipse_quality_status,
+                axis_ratio=axis_ratio,
+                flags=p4_flags,
+            )
+            solver_failed = _read(ellipse, ("success",), None) is False or str(
+                ellipse_quality_status or ""
+            ).upper() in {"FAIL", "FAILED", "INVALID"}
+            ellipse_kind = classify_ellipse_publication(
+                quality_status=ellipse_quality_status,
+                axis_ratio=axis_ratio,
+                flags=p4_flags,
+            )
+            ellipse_limited = ellipse_candidate_is_limited(
+                {"flags": p4_flags, "bound_flags": bound_flags}
+            )
+            shape_candidate = (
+                ellipse_limited
+                or solver_failed
+                or ellipse_kind != "ellipse"
+            )
+            quality_status_value = _read(
+                ellipse,
+                ("quality_status", "status"),
+                _read(quality_payload, ("status",), None),
+            )
+            if ellipse_limited and ellipse_kind == "ellipse":
+                qualifier = self._tr("quality.ellipse_candidate_limited")
+                quality_status_value = (
+                    f"{quality_status_value} · {qualifier}"
+                    if quality_status_value not in (None, "")
+                    else qualifier
+                )
             ellipse_rows = (
                 ("ellipse.a", None if unpublished_shape else _read(ellipse, ("a",), None)),
                 ("ellipse.b", None if unpublished_shape else _read(ellipse, ("b",), None)),
@@ -7197,11 +7232,7 @@ if QT_AVAILABLE:
                 ),
                 (
                     "ellipse.quality_status",
-                    _read(
-                        ellipse,
-                        ("quality_status", "status"),
-                        _read(quality_payload, ("status",), None),
-                    ),
+                    quality_status_value,
                 ),
                 (
                     "ellipse.p4_flags",
@@ -7270,6 +7301,21 @@ if QT_AVAILABLE:
                     if key == "ellipse.quality" and value is not None
                     else QtWidgets.QTableWidgetItem(_format_metric(value))
                 )
+                if shape_candidate and value is not None and key in {
+                    "ellipse.a", "ellipse.b", "ellipse.axis_ratio",
+                    "ellipse.ellipticity", "ellipse.theta", "ellipse.ln",
+                    "ellipse.lz", "ellipse.l_major",
+                }:
+                    value_item.setText("≈" + _format_metric(value))
+                    tooltip_key = (
+                        "tooltip.ellipse_solver_diagnostic"
+                        if solver_failed
+                        else "tooltip.batch_quality_ellipse_candidate"
+                    )
+                    tooltip = self._tr(tooltip_key)
+                    if p4_flags:
+                        tooltip += "\n" + ", ".join(p4_flags)
+                    value_item.setToolTip(tooltip)
                 self.ellipse_table.setItem(row_index, 1, value_item)
 
         def _update_metrics(
