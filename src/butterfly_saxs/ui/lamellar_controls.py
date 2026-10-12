@@ -44,6 +44,8 @@ TEXT = {
     "blue_orange": ("蓝橙分支", "Blue / orange"),
     "grayscale": ("灰度出图", "Grayscale"),
     "lateral_shift_ratio": ("每层错移 / 周期", "Slip per layer / period"),
+    "stack_rotation_enabled": ("启用条件堆栈旋转", "Enable conditional stack rotation"),
+    "stack_rotation_deg": ("堆栈旋转 α (°)", "Stack rotation α (deg)"),
     "out_of_plane_deg": ("出平面角度 (°)", "Out-of-plane angle (°)"),
     "seed": ("随机种子", "Random seed"),
     "manual_period": ("设定周期", "Assumed period"),
@@ -58,6 +60,10 @@ TEXT = {
     "assumption_note": ("此处形貌是条件示意；厚度、宽度、堆栈排列和分散程度不由散射拟合唯一确定。", "This is a conditional schematic; scattering fits do not uniquely determine thickness, width, packet placement or spread."),
     "spacing_note": ("相邻片层间距围绕周期均匀随机起伏；最小间距不会小于片层厚度。这是形貌示意假设，不代表 q* 的拟合不确定度。", "Adjacent layer gaps vary uniformly around the period; the minimum gap cannot be smaller than layer thickness. This is a morphology assumption, not uncertainty in fitted q*."),
     "position_jitter_note": ("堆栈中心在网格单元内移动；位移不超过预留间隙，因此示意堆栈不会相互穿插。", "Packet centers move within their grid cells by at most the reserved clearance, so schematic packets do not interpenetrate."),
+    "stack_rotation_note": (
+        "由用户设置的条件几何假设；正值沿各分支法向倾斜同向，负值反向。该值不由椭圆拟合推断。",
+        "User-set conditional geometry assumption; positive follows each branch's normal tilt and negative opposes it. This value is not inferred from the ellipse fit.",
+    ),
     "scattering": ("投影 FFT", "Projected FFT"),
     "saxs": ("SAXS · 观测与拟合", "SAXS · observation and fit"),
     "two_d": ("二维 · 样品面内投影", "2D · in-plane projection"),
@@ -173,6 +179,29 @@ if QT_AVAILABLE:
             self._spin("spacing_jitter_pct", 0., 50., 1., form=advanced_form)
             self._spin("position_jitter_pct", 0., 100., 5., form=advanced_form)
             self._spin("lateral_shift_ratio", -5., 5., .05, form=advanced_form, decimals=2)
+            rotation_enabled = QtWidgets.QCheckBox()
+            rotation_enabled.setObjectName("lamellar_stack_rotation_enabled")
+            rotation_label = QtWidgets.QLabel(
+                tr("stack_rotation_enabled", self.language)
+            )
+            rotation_label.setBuddy(rotation_enabled)
+            advanced_form.addRow(rotation_label, rotation_enabled)
+            self.controls["stack_rotation_enabled"] = rotation_enabled
+            self.labels["stack_rotation_enabled"] = (
+                rotation_label,
+                "stack_rotation_enabled",
+            )
+            rotation_enabled.toggled.connect(self._set_stack_rotation_enabled)
+            rotation_enabled.toggled.connect(self._changed)
+            self._spin(
+                "stack_rotation_deg",
+                -89.9,
+                89.9,
+                1.0,
+                form=advanced_form,
+                decimals=1,
+            )
+            self.controls["stack_rotation_deg"].setEnabled(False)
             self._spin("out_of_plane_deg", -89., 89., 1., form=advanced_form)
             self._spin("seed", 0, 2147483647, 1, form=advanced_form, integer=True)
             self.palette_label = QtWidgets.QLabel()
@@ -227,6 +256,15 @@ if QT_AVAILABLE:
             self.advanced.setVisible(checked)
             self.advanced_toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow if checked else QtCore.Qt.ArrowType.RightArrow)
 
+        def _set_stack_rotation_enabled(self, enabled: bool) -> None:
+            self.controls["stack_rotation_deg"].setEnabled(enabled)
+            lateral = self.controls["lateral_shift_ratio"]
+            lateral.setEnabled(not enabled)
+            if enabled and lateral.value() != 0.0:
+                lateral.blockSignals(True)
+                lateral.setValue(0.0)
+                lateral.blockSignals(False)
+
         def set_settings(self, values: dict[str, Any]) -> None:
             self._loading = True
             try:
@@ -236,6 +274,8 @@ if QT_AVAILABLE:
                 self.controls["spacing_jitter_pct"].setRange(0.0, jitter_limit)
                 for key, widget in self.controls.items():
                     if key not in values:
+                        continue
+                    if key == "stack_rotation_deg" and values[key] is None:
                         continue
                     if isinstance(widget, QtWidgets.QComboBox):
                         widget.setCurrentIndex(max(0, widget.findData(values[key])))
@@ -248,13 +288,19 @@ if QT_AVAILABLE:
                     bool(values.get("manual_second_orientation", False))
                 )
                 self.controls["stack_count"].setEnabled(values.get("mode") == "multi")
+                rotation_enabled = values.get("stack_rotation_deg") is not None
+                self.controls["stack_rotation_enabled"].setChecked(rotation_enabled)
+                self._set_stack_rotation_enabled(rotation_enabled)
                 self._values = self._read_controls()
             finally:
                 self._loading = False
 
         def _read_controls(self) -> dict[str, Any]:
             values = dict(self._values)
+            values.pop("stack_rotation_enabled", None)
             for key, widget in self.controls.items():
+                if key == "stack_rotation_enabled":
+                    continue
                 values[key] = (
                     widget.currentData()
                     if isinstance(widget, QtWidgets.QComboBox)
@@ -262,6 +308,11 @@ if QT_AVAILABLE:
                     if isinstance(widget, QtWidgets.QCheckBox)
                     else widget.value()
                 )
+            values["stack_rotation_deg"] = (
+                self.controls["stack_rotation_deg"].value()
+                if self.controls["stack_rotation_enabled"].isChecked()
+                else None
+            )
             return values
 
         def _changed(self, *_: Any) -> None:
@@ -287,6 +338,9 @@ if QT_AVAILABLE:
             self.controls["position_jitter_pct"].setToolTip(
                 tr("position_jitter_pct", language) + "\n" + tr("position_jitter_note", language)
             )
+            rotation_note = tr("stack_rotation_note", language)
+            self.controls["stack_rotation_enabled"].setToolTip(rotation_note)
+            self.controls["stack_rotation_deg"].setToolTip(rotation_note)
             self.controls["manual_second_orientation"].setToolTip(
                 tr("manual_second_orientation", language)
                 + "\n"

@@ -37,6 +37,8 @@ class LamellarSettings:
     manual_unit: str = "relative"
     selected_branch: int = -1
     reference_period: float | None = None
+    # Appended to keep the established positional-constructor order intact.
+    stack_rotation_deg: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", str(self.mode).strip().lower())
@@ -79,6 +81,11 @@ class LamellarSettings:
         spacing_jitter = _finite(self.spacing_jitter_pct)
         position_jitter = _finite(self.position_jitter_pct)
         lateral = _finite(self.lateral_shift_ratio)
+        stack_rotation = (
+            None
+            if self.stack_rotation_deg is None
+            else _finite(self.stack_rotation_deg)
+        )
         tilt = _finite(self.out_of_plane_deg)
         angle = _finite(self.manual_angle_deg)
         second_angle = _finite(self.manual_second_angle_deg)
@@ -94,6 +101,14 @@ class LamellarSettings:
             raise ValueError("position_jitter_pct must be finite in [0, 100]")
         if lateral is None:
             raise ValueError("lateral_shift_ratio must be finite")
+        if self.stack_rotation_deg is not None and stack_rotation is None:
+            raise ValueError("stack_rotation_deg must be finite when provided")
+        if stack_rotation is not None and abs(stack_rotation) >= 90.0:
+            raise ValueError("stack_rotation_deg must be finite and strictly between -90 and 90 degrees")
+        if stack_rotation is not None and lateral != 0.0:
+            raise ValueError(
+                "stack_rotation_deg cannot be combined with nonzero lateral_shift_ratio"
+            )
         if tilt is None or abs(tilt) > 90.0:
             raise ValueError("out_of_plane_deg must be finite in [-90, 90]")
         if angle is None:
@@ -143,6 +158,9 @@ class LamellarSettings:
             "spacing_jitter_pct": float(self.spacing_jitter_pct),
             "position_jitter_pct": float(self.position_jitter_pct),
             "lateral_shift_ratio": float(self.lateral_shift_ratio),
+            "stack_rotation_deg": None
+            if self.stack_rotation_deg is None
+            else float(self.stack_rotation_deg),
             "out_of_plane_deg": float(self.out_of_plane_deg),
             "seed": int(self.seed),
             "manual_period": float(self.manual_period),

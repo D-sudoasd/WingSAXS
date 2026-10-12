@@ -50,6 +50,50 @@ _CORNER_SIGNS = np.asarray(
 )
 _BLUE = np.asarray((0.20, 0.45, 0.72, 0.82), dtype=float)
 _ORANGE = np.asarray((0.92, 0.47, 0.18, 0.82), dtype=float)
+_AXIAL_ZERO_TOL_DEG = 1e-8
+_STACK_ROTATION_COS_TOL = 1e-6
+
+
+def _axial_wrap_deg(angle_deg: float) -> float:
+    """Wrap an unoriented in-plane direction into [-90, 90) degrees."""
+
+    return float((float(angle_deg) + 90.0) % 180.0 - 90.0)
+
+
+def _stack_rotation_geometry(
+    angle_deg: float, draw_axis_deg: float, stack_rotation_deg: float
+) -> tuple[float, float, float, float]:
+    """Return source-normal tilt, signed alpha, relative angle, and shear ratio."""
+
+    phi = _axial_wrap_deg(float(angle_deg) - float(draw_axis_deg))
+    alpha = (
+        0.0
+        if abs(phi) <= _AXIAL_ZERO_TOL_DEG
+        else float(np.sign(phi) * float(stack_rotation_deg))
+    )
+    delta = _axial_wrap_deg(float(draw_axis_deg) + alpha - float(angle_deg))
+    if abs(float(np.cos(np.radians(delta)))) <= _STACK_ROTATION_COS_TOL:
+        raise ValueError(
+            "stack_rotation_deg makes the stack axis approach 90° from the lamellar normal; "
+            "a finite normal-period-preserving shear cannot represent this geometry"
+        )
+    shear_ratio = float(np.tan(np.radians(delta)))
+    return phi, alpha, delta, shear_ratio
+
+
+def _stack_rotation_parameter_record(value: float) -> dict[str, Any]:
+    return {
+        "name": "stack_rotation_deg",
+        "value": float(value),
+        "unit": "deg",
+        "source": "lamellar_settings",
+        "status": "assumed",
+        "interval": None,
+        "reason": (
+            "explicit conditional stack-rotation setting; its sign relative to each source "
+            "normal (measured q direction or manual setting) is applied geometrically and is not inferred from the ellipse"
+        ),
+    }
 
 
 def _axial_distance_deg(first: float, second: float) -> float:
@@ -626,6 +670,15 @@ def build_lamellar_scene(
             f"±{resolved.spacing_jitter_pct:g}% of the period; this is a schematic "
             "assumption, not fitted uncertainty."
         )
+    stack_rotation_source = (
+        _stack_rotation_parameter_record(float(resolved.stack_rotation_deg))
+        if resolved.stack_rotation_deg is not None
+        else None
+    )
+    if stack_rotation_source is not None:
+        assumptions.append(
+            "Stack rotation α is an explicit conditional model setting, signed relative to each source normal tilt (measured q direction or manual setting); it is not extracted from the fitted ellipse or refined against the measured intensity. Alpha defines the baseline source-plane geometry before optional orientation spread and out-of-plane tilt."
+        )
     flags: list[str] = []
     if execution_failure is not None and resolved.period_source != "manual":
         metadata = _metadata_base(
@@ -637,6 +690,9 @@ def build_lamellar_scene(
             draw_axis_deg=draw_axis,
             reference_period=resolved.reference_period or 1.0,
             assumptions=assumptions,
+            parameter_sources=(
+                [stack_rotation_source] if stack_rotation_source is not None else []
+            ),
             q_unit=q_unit,
             flags=("source_execution_failed",),
         )
@@ -651,6 +707,9 @@ def build_lamellar_scene(
             draw_axis_deg=draw_axis,
             reference_period=resolved.reference_period or 1.0,
             assumptions=assumptions,
+            parameter_sources=(
+                [stack_rotation_source] if stack_rotation_source is not None else []
+            ),
             q_unit=q_unit,
             flags=("stale_source",),
         )
@@ -663,6 +722,8 @@ def build_lamellar_scene(
     length_unit = "relative"
     ellipse_for_metadata = _ellipse_payload(root)
     parameter_sources.extend(_ellipse_parameter_records(ellipse_for_metadata))
+    if stack_rotation_source is not None:
+        parameter_sources.append(stack_rotation_source)
     if resolved.period_source == "manual":
         period = float(resolved.manual_period)
         angle = float(resolved.manual_angle_deg)
@@ -1033,6 +1094,41 @@ def build_lamellar_scene(
         population.get("status") == "unavailable" for population in populations
     ):
         flags.append("partial_ellipse_direction_support")
+    if resolved.stack_rotation_deg is not None:
+        for population in selected:
+            try:
+                phi, alpha, delta, shear_ratio = _stack_rotation_geometry(
+                    float(population["angle_deg"]),
+                    float(draw_axis),
+                    float(resolved.stack_rotation_deg),
+                )
+            except ValueError as exc:
+                metadata = _metadata_base(
+                    resolved, identity, status="unavailable", available=False,
+                    message=str(exc), draw_axis_deg=draw_axis,
+                    reference_period=resolved.reference_period or max(periods),
+                    assumptions=assumptions, parameter_sources=parameter_sources,
+                    populations=populations, q_unit=q_unit,
+                    flags=(*flags, "stack_rotation_singular_geometry"),
+                )
+                if direction_support is not None:
+                    metadata["direction_support"] = direction_support
+                    metadata["direction_diagnostics"] = direction_diagnostics
+                return _empty_scene(resolved, metadata)
+            population.update(
+                {
+                    "lamellar_normal_phi_deg": phi,
+                    "stack_rotation_alpha_deg": alpha,
+                    "stack_axis_angle_relative_to_draw_axis_deg": alpha,
+                    "stack_to_normal_angle_deg": delta,
+                    "lateral_shift_ratio": shear_ratio,
+                    "orientation_assumption": (
+                        "explicit manual normal with conditional stack rotation"
+                        if resolved.period_source == "manual"
+                        else "observed q-direction normal assumption with conditional stack rotation"
+                    ),
+                }
+            )
     layout_period = (
         float(resolved.reference_period)
         if resolved.reference_period is not None
@@ -1051,10 +1147,24 @@ def build_lamellar_scene(
     branch_ids: list[int] = []
     colors: list[np.ndarray] = []
     # Separate whole packets, including their stack length and optional slip.
-    packet_width = resolved.width_ratio + (n_layers - 1) * abs(
-        resolved.lateral_shift_ratio
+    maximum_shear = max(
+        (
+            abs(
+                float(
+                    population.get(
+                        "lateral_shift_ratio", resolved.lateral_shift_ratio
+                    )
+                )
+            )
+            for population in selected
+        ),
+        default=abs(resolved.lateral_shift_ratio),
     )
     max_gap_ratio = 1.0 + float(resolved.spacing_jitter_pct) / 100.0
+    shear_gap_ratio = max_gap_ratio if resolved.stack_rotation_deg is not None else 1.0
+    packet_width = (
+        resolved.width_ratio + (n_layers - 1) * maximum_shear * shear_gap_ratio
+    )
     packet_length = (n_layers - 1) * max_gap_ratio + resolved.thickness_ratio
     packet_diameter = float(
         np.linalg.norm((packet_width, resolved.depth_ratio, packet_length))
@@ -1175,13 +1285,32 @@ def build_lamellar_scene(
             layer_offsets -= float(np.mean(layer_offsets))
         else:
             layer_offsets = np.arange(n_layers, dtype=float) - (n_layers - 1) / 2.0
+        lateral_shift_ratio = float(
+            population.get("lateral_shift_ratio", resolved.lateral_shift_ratio)
+        )
+        if resolved.stack_rotation_deg is None:
+            shear_offsets = None
+        elif n_layers > 1:
+            shear_offsets = np.concatenate(
+                (
+                    np.zeros(1),
+                    np.cumsum(np.diff(layer_offsets) * lateral_shift_ratio),
+                )
+            )
+            shear_offsets -= float(np.mean(shear_offsets))
+        else:
+            shear_offsets = np.zeros(n_layers, dtype=float)
         for layer_index in range(n_layers):
             centred_index = float(layer_index) - (n_layers - 1) / 2.0
+            lateral_offset = (
+                centred_index * float(resolved.lateral_shift_ratio) * period
+                if shear_offsets is None
+                else float(shear_offsets[layer_index]) * period
+            )
             centre = (
                 base_center
                 + normal * (float(layer_offsets[layer_index]) * period)
-                + width_basis
-                * (centred_index * float(resolved.lateral_shift_ratio) * period)
+                + width_basis * lateral_offset
             )
             size = np.asarray(
                 (
