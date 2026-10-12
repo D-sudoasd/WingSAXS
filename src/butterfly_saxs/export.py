@@ -2089,53 +2089,28 @@ class StreamingBatchExporter:
                 and not self._touched_frames
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled)
             )
-            metadata_bytes = io.BytesIO()
-            np.lib.format.write_array(metadata_bytes, np.asarray(_json_text(metadata)), allow_pickle=False)
-            with self._npz.open("__metadata__.npy", "w") as handle:
-                handle.write(metadata_bytes.getvalue())
-            self._npz.close()
             if self._old_npz is not None and not no_op_resume:
-                # Rebuild the staged archive with verified old entries for
-                # resumed frames and new entries for frames that were rerun.
-                staged_npz = self._stage / self._targets["npz"].name
-                merged_npz = self._stage / (staged_npz.name + ".merged")
+                # Append retained entries to the still-open staging archive.
+                # New arrays were already compressed once by write(); reading
+                # them back into a second archive adds no scientific evidence.
                 merged_names: list[str] = []
-                with zipfile.ZipFile(merged_npz, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
-                    old_names = self._old_npz.namelist()
-                    for name in old_names:
-                        if name == "__metadata__.npy":
-                            continue
-                        match = re.match(r"frame_(\d+)__", name)
-                        if match and int(match.group(1)) in self._touched_frames:
-                            continue
-                        if not self._old_binding_verified:
-                            raise ValueError("Cannot retain unbound arrays from a previous NPZ; recover its producing commit marker before resuming.")
-                        if self._old_producer != current_producer:
-                            raise ValueError("Cannot retain arrays from a different calculation producer; rerun the affected frames.")
-                        with self._old_npz.open(name, "r") as source_handle:
-                            with output.open(name, "w") as target_handle:
-                                shutil.copyfileobj(source_handle, target_handle)
-                        merged_names.append(name)
-                    with zipfile.ZipFile(staged_npz, "r") as staged_input:
-                        for name in staged_input.namelist():
-                            if name == "__metadata__.npy":
-                                continue
-                            if name in merged_names:
-                                continue
-                            with staged_input.open(name, "r") as source_handle:
-                                with output.open(name, "w") as target_handle:
-                                    shutil.copyfileobj(source_handle, target_handle)
-                            merged_names.append(name)
-                    metadata["arrays"] = [name[:-4] for name in merged_names if name.endswith(".npy")]
-                    metadata_bytes = io.BytesIO()
-                    np.lib.format.write_array(
-                        metadata_bytes,
-                        np.asarray(_json_text(metadata)),
-                        allow_pickle=False,
-                    )
-                    with output.open("__metadata__.npy", "w") as handle:
-                        handle.write(metadata_bytes.getvalue())
-                os.replace(merged_npz, staged_npz)
+                for name in self._old_npz.namelist():
+                    if name == "__metadata__.npy":
+                        continue
+                    match = re.match(r"frame_(\d+)__", name)
+                    if match and int(match.group(1)) in self._touched_frames:
+                        continue
+                    if not self._old_binding_verified:
+                        raise ValueError("Cannot retain unbound arrays from a previous NPZ; recover its producing commit marker before resuming.")
+                    if self._old_producer != current_producer:
+                        raise ValueError("Cannot retain arrays from a different calculation producer; rerun the affected frames.")
+                    with self._old_npz.open(name, "r") as source_handle:
+                        with self._npz.open(name, "w") as target_handle:
+                            shutil.copyfileobj(source_handle, target_handle)
+                    merged_names.append(name)
+                # Keep the logical catalog order of the previous merge path;
+                # frame identity is encoded in member keys, not ZIP offsets.
+                metadata["arrays"] = [name[:-4] for name in merged_names if name.endswith(".npy")] + self._array_names
                 self._old_npz.close()
                 self._old_npz = None
             elif no_op_resume:
@@ -2144,6 +2119,11 @@ class StreamingBatchExporter:
                 # the publication transaction will retain that exact target.
                 self._old_npz.close()
                 self._old_npz = None
+            metadata_bytes = io.BytesIO()
+            np.lib.format.write_array(metadata_bytes, np.asarray(_json_text(metadata)), allow_pickle=False)
+            with self._npz.open("__metadata__.npy", "w") as handle:
+                handle.write(metadata_bytes.getvalue())
+            self._npz.close()
             for handle in self._handles.values():
                 handle.close()
             if self._details_handle is not None:

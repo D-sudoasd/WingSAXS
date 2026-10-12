@@ -555,3 +555,37 @@ def test_cancelled_unbound_resume_preserves_old_files_without_promoting_them(tmp
     assert {path.name: path.read_bytes() for path in output.iterdir()
             if path.is_file() and path.name != ".wingsaxs.lock"} == before
     assert all(row["result"] is not None for row in json.loads(checkpoint.read_text())["frames"])
+
+
+def test_interleaved_resume_compresses_each_new_member_once_and_keeps_all_keys(tmp_path, monkeypatch):
+    import zipfile
+
+    paths = _sources(tmp_path)
+    paths.append(tmp_path / "frame_2.dat")
+    paths[-1].write_bytes(b"2")
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    payload = json.loads(checkpoint.read_text())
+    payload["frames"][1].update(status="failed", error="RuntimeError: retry", traceback="injected exception")
+    checkpoint.write_text(json.dumps(payload))
+    original = zipfile.ZipFile.open
+    writes = []
+
+    def tracked(archive, name, mode="r", *args, **kwargs):
+        if mode == "w":
+            writes.append(name)
+        return original(archive, name, mode, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", tracked)
+    resumed, _ = _stream_run(paths, output, checkpoint, resume=True)
+    assert [item.resumed for item in resumed] == [True, False, True]
+    assert writes.count("frame_0001__image.npy") == 1
+    assert writes.count("__metadata__.npy") == 1
+    with zipfile.ZipFile(output / "results.npz") as archive:
+        assert len(archive.namelist()) == len(set(archive.namelist())) == 4
+    with np.load(output / "results.npz", allow_pickle=False) as archive:
+        for index in range(3):
+            np.testing.assert_array_equal(archive[f"frame_{index:04d}__image"], np.ones((3, 4)))
+        assert json.loads(str(archive["__metadata__"]))["arrays"] == [
+            "frame_0000__image", "frame_0002__image", "frame_0001__image"]
+
