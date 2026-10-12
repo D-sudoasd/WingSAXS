@@ -851,18 +851,28 @@ def _handle_report(args: argparse.Namespace) -> int:
 
 
 def _handle_batch(args: argparse.Namespace) -> int:
+    from .output_lock import output_lock
+
     if args.report_lamellar_settings and not args.report:
         raise PipelineError("--report-lamellar-settings requires --report")
-    # Parse and validate geometry before any frame loading or fitting so a
-    # malformed presentation recipe cannot waste a completed batch run.
     lamellar_settings = _load_lamellar_settings(args.report_lamellar_settings)
     if args.report:
         _validate_report_options(args.report_radial_bins, args.report_angular_bins)
+    config = _with_analysis(_config(args.config), _analysis_overrides(args))
+    output_dir = Path(args.output or (config.output_dir if config else "results"))
+    if args.unattended is not None:
+        package_root = Path(args.unattended).expanduser().resolve(strict=False)
+        output_root = output_dir.expanduser().resolve(strict=False)
+        if output_root == package_root or output_root.is_relative_to(package_root):
+            raise PipelineError("unattended output must be outside the raw package")
+    with output_lock(output_dir, create=True):
+        return _handle_batch_locked(args, config, lamellar_settings)
+
+
+def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None, lamellar_settings: Any) -> int:
     from . import batch as batch_module
     from . import export as export_module
 
-    config = _config(args.config)
-    config = _with_analysis(config, _analysis_overrides(args))
     analysis = config.analysis if config is not None else {}
     manifest = args.manifest or analysis.get("manifest")
     inputs = list(args.inputs)
@@ -938,7 +948,8 @@ def _handle_batch(args: argparse.Namespace) -> int:
     # A resumed run has already validated input/config/mode hashes before its
     # exports are written.  It may therefore refresh its own known bundle
     # targets; a fresh run still refuses a non-empty directory by default.
-    if output_dir.exists() and any(output_dir.iterdir()) and not args.force and not resume:
+    if (output_dir.exists() and any(path.name != ".wingsaxs.lock" for path in output_dir.iterdir())
+            and not args.force and not resume):
         raise FileExistsError(f"输出目录已有内容，未覆盖：{output_dir}（需要 --force）")
 
     full2d = args.full2d or (config.full2d if config else False)
@@ -1213,6 +1224,8 @@ def _handle_batch(args: argparse.Namespace) -> int:
             ),
             result_sink=None if stream_writer is None else stream_writer.write,
             retain_results=stream_writer is None,
+            analyzer_identity="butterfly_saxs.pipeline.analyze_frame",
+            restore_frame=None if stream_writer is None else stream_writer.can_restore,
         )
         exports = (
             stream_writer.finalize(run)
@@ -1224,13 +1237,16 @@ def _handle_batch(args: argparse.Namespace) -> int:
                 force=bool(args.force or resume),
             )
         )
-    except Exception:
+    except BaseException:
         if stream_writer is not None:
             stream_writer.abort()
         raise
     compact_records = []
     for item in run.frame_results:
-        record = item.to_record()
+        # The result is replaced by the compact public mapping below, or
+        # omitted entirely for unattended runs. Do not expand detector arrays
+        # only to discard that copy at this boundary.
+        record = item.to_record(include_result=False)
         if hasattr(item.result, "to_mapping"):
             # Avoid printing/duplicating full detector arrays at the CLI
             # boundary; lossless arrays remain in results.npz and the object
@@ -1259,6 +1275,8 @@ def _handle_batch(args: argparse.Namespace) -> int:
                 )
                 if key in item.result
             }
+        else:
+            record["result"] = item.to_record()["result"]
         if unattended:
             # The streamed bundle is the evidence archive.  Keep headless
             # stdout bounded to per-frame control state for long acquisitions.

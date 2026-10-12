@@ -353,7 +353,10 @@ def _frame_overview(
     points = _ridge_xy(measurement, fit_record)
     if points is not None and len(points):
         ax_q.scatter(points[:, 0], points[:, 1], s=11, facecolors="none", edgecolors="#F0E442", linewidths=0.75, label="Measured ridge")
-        ax_q.legend(frameon=False, fontsize=7, loc="best")
+        # Auto placement converts every QuadMesh cell to a Path just to test
+        # legend collisions. Keep the single ridge key in a fixed corner;
+        # detector pixels remain on the original rasterized q mesh.
+        ax_q.legend(frameon=False, fontsize=7, loc="upper right")
 
     _plot_radial(ax_radial, radial, q_unit)
     _plot_angular(ax_angular, angular)

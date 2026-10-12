@@ -512,3 +512,17 @@ def test_log_normalization_is_labeled_explicitly():
     assert norm.__class__.__name__ == "LogNorm"
     assert "log color scale" in label
     assert "99.5th percentile" in label
+
+
+def test_overview_legend_never_expands_detector_mesh_to_paths(monkeypatch):
+    from matplotlib.collections import QuadMesh
+
+    image, qx, qy, _valid, measurement = _frame_case()
+    record = {"ridge_points_q": [[0.1, 0.1]]}
+    figure = _frame_overview(image, qx, qy, "nm^-1", measurement, record, "")
+    assert figure.axes[0].get_legend() is not None
+    monkeypatch.setattr(QuadMesh, "get_paths", lambda *_: pytest.fail("legend expanded the detector mesh"))
+    figure.canvas.draw()
+    np.testing.assert_array_equal(figure.axes[0].collections[0].get_array(), image)
+    assert figure.axes[0].collections[0].get_rasterized()
+    figure.clear()

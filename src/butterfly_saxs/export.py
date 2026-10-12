@@ -38,6 +38,8 @@ from .batch import (
     _json_safe,
 )
 from .csv_utils import safe_csv_cell
+from .file_identity import file_version
+from .output_lock import output_lock
 
 
 _MISSING = object()
@@ -56,6 +58,22 @@ def _artifact_digest(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _checkpoint_frame_signature(item: FrameFitResult) -> str | None:
+    """Bind exported evidence to a frame's values, excluding execution timing."""
+    record = item.to_record(include_result=False)
+    try:
+        record["result"] = _checkpoint_safe(item.result)
+    except RecursionError:
+        # Non-checkpointed public exports also accept cyclic metadata. They
+        # retain the existing cycle-aware sidecar serialization but cannot
+        # acquire a new checkpoint-reuse proof from that object.
+        return None
+    record.pop("elapsed_s")
+    record.pop("resumed")
+    value = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return __import__("hashlib").sha256(value.encode("utf-8")).hexdigest()
 
 
 def _verify_zip_members(archive: zipfile.ZipFile, members: Iterable[str]) -> None:
@@ -132,7 +150,7 @@ def _publish_staged_bundle(
     try:
         for key, target in normalized.items():
             old_files[key] = target.exists()
-            if target.exists():
+            if key not in preserved and target.exists():
                 shutil.copy2(target, backup / target.name)
         for key, target in normalized.items():
             if key in preserved:
@@ -145,6 +163,8 @@ def _publish_staged_bundle(
             published.append(target)
     except Exception:
         for key, target in normalized.items():
+            if key in preserved:
+                continue
             try:
                 old = old_files.get(key, False)
                 backup_file = backup / target.name
@@ -1581,6 +1601,29 @@ class StreamingBatchExporter:
         force: bool = False,
         resume: bool = False,
     ) -> None:
+        self._output_lock = output_lock(output_dir, create=True)
+        self._output_lock.__enter__()
+        try:
+            self._initialize(output_dir, provenance=provenance, prefix=prefix, force=force, resume=resume)
+        except BaseException:
+            self._release_output_lock()
+            raise
+
+    def _release_output_lock(self) -> None:
+        lock = getattr(self, "_output_lock", None)
+        self._output_lock = None
+        if lock is not None:
+            lock.__exit__(None, None, None)
+
+    def _initialize(
+        self,
+        output_dir: str | os.PathLike[str],
+        *,
+        provenance: Mapping[str, Any] | None = None,
+        prefix: str = "",
+        force: bool = False,
+        resume: bool = False,
+    ) -> None:
         self.output = Path(output_dir)
         self.prefix = str(prefix or "")
         self.force = bool(force)
@@ -1612,6 +1655,7 @@ class StreamingBatchExporter:
         self._details_handle: Any = None
         self._ellipse_rows: list[dict[str, Any]] = []
         self._compact_results: list[FrameFitResult] = []
+        self._frame_signatures: list[str | None] = []
         self._missing_frames: list[int] = []
         self._missing_ids: list[Any] = []
         self._missing_paths: list[str] = []
@@ -1626,7 +1670,7 @@ class StreamingBatchExporter:
             old_npz_path = self._targets["npz"]
             if not old_npz_path.exists():
                 shutil.rmtree(self._stage, ignore_errors=True)
-                self._stage = Path()
+                self._stage = None
                 raise FileNotFoundError(
                     f"resume stream export requires the previous NPZ bundle: {old_npz_path}"
                 )
@@ -1663,13 +1707,23 @@ class StreamingBatchExporter:
                     for name in parsed.get("arrays", ())
                 ]
                 _verify_zip_members(self._old_npz, declared_members)
+                marker_path = self.output / ".bundle.commit.json"
+                if marker_path.is_file():
+                    proof = json.loads(marker_path.read_text(encoding="utf-8"))
+                    artifacts = proof.get("artifacts", {})
+                    for key in ("npz", "manifest", "provenance"):
+                        target = self._targets[key]
+                        expected = artifacts.get(key, {})
+                        if (expected.get("name") != target.name or not target.is_file()
+                                or _artifact_digest(target) != expected.get("sha256")):
+                            raise ValueError(f"Previous bundle {key} does not match its commit marker; recover the prior generation before resuming.")
                 self._old_npz_metadata = dict(parsed)
             except Exception:
                 if self._old_npz is not None:
                     self._old_npz.close()
                     self._old_npz = None
                 shutil.rmtree(self._stage, ignore_errors=True)
-                self._stage = Path()
+                self._stage = None
                 raise
         try:
             for key, columns in (
@@ -1689,12 +1743,39 @@ class StreamingBatchExporter:
                 self._stage / self._targets["frame_details"].name
             ).open("w", encoding="utf-8", newline="\n")
             npz_path = self._stage / self._targets["npz"].name
-            self._npz = zipfile.ZipFile(npz_path, "w", compression=zipfile.ZIP_DEFLATED)
+            # Lossless low-search DEFLATE is faster for detector/q arrays;
+            # every dtype, bit and NPZ member remains present.
+            self._npz = zipfile.ZipFile(npz_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1)
         except Exception:
             self.abort()
             raise
 
+    def can_restore(self, frame: FrameRef, index: int) -> bool:
+        """Retry frames whose checkpoint advanced beyond the published NPZ."""
+        del frame  # run_batch has already matched the exact input/selection hash.
+        metadata = self._old_npz_metadata or {}
+        proof = (self._old_manifest or {}).get("provenance", {}).get("checkpoint_frame_sha256", [])
+        return (self._old_npz is not None and index < int(metadata.get("frame_count", 0))
+                and index not in metadata.get("missing_frames", [])
+                and index < len(proof) and isinstance(proof[index], str))
+
     def write(self, item: FrameFitResult) -> None:
+        try:
+            signature = _checkpoint_frame_signature(item)
+            if item.resumed and self.resume:
+                proof = (self._old_manifest or {}).get("provenance", {}).get("checkpoint_frame_sha256", [])
+                index = len(self._compact_results)
+                if not proof or index >= len(proof) or not isinstance(proof[index], str):
+                    raise ValueError("No producing frame proof is available for the restored values; use the original software or rerun that frame in a separate output.")
+                if proof[index] != signature:
+                    raise ValueError("Restored checkpoint values differ from the producing bundle; recover its original checkpoint before resuming.")
+            self._write(item)
+            self._frame_signatures.append(signature)
+        except BaseException:
+            self.abort()
+            raise
+
+    def _write(self, item: FrameFitResult) -> None:
         index = len(self._compact_results)
         for row in _frame_summary_rows([item]):
             row["frame_index"] = index
@@ -1782,6 +1863,47 @@ class StreamingBatchExporter:
         for handle in self._handles.values():
             handle.flush()
 
+    def _reuse_completed_bundle(self, batch: BatchRunResult | None) -> bool:
+        """Verify the producing generation before retaining a no-op resume.
+
+        Current execution state remains in the checkpoint and CLI result.
+        Exported scientific artifacts retain their original producer metadata.
+        """
+        if (not isinstance(batch, BatchRunResult) or batch.cancelled or not batch.producer_identity
+                or not batch.producer_identity.get("analyzer")
+                or not self.resume or self._old_npz is None or self._touched_frames
+                or len(self._compact_results) != batch.total_count or not self._old_manifest):
+            return False
+        previous = self._old_manifest.get("provenance", {})
+        if not isinstance(previous, Mapping) or previous.get("producer_identity") != batch.producer_identity:
+            return False
+        expected_results = previous.get("checkpoint_frame_sha256")
+        if not expected_results or not all(self._frame_signatures):
+            return False
+        if expected_results != self._frame_signatures:
+            raise ValueError("Restored checkpoint values differ from the producing bundle; recover its original checkpoint before resuming.")
+        metadata = self._old_npz_metadata or {}
+        if (metadata.get("artifact_complete") is not True or metadata.get("frame_count") != batch.total_count
+                or metadata.get("quality_failed_frames", []) != self._quality_failed_frames
+                or metadata.get("quality_warning_frames", []) != self._quality_warning_frames):
+            return False
+        marker = self.output / ".bundle.commit.json"
+        try:
+            proof = json.loads(marker.read_text(encoding="utf-8"))
+            artifacts = proof["artifacts"]
+            if (proof.get("schema_version") != "lamellarsaxs2d.bundle_commit.v1"
+                    or proof.get("complete") is not True or set(artifacts) != set(self._targets)):
+                return False
+            for key, target in self._targets.items():
+                expected = artifacts[key]
+                before = file_version(target, target.stat())
+                if (expected.get("name") != target.name or _artifact_digest(target) != expected.get("sha256")
+                        or file_version(target, target.stat()) != before):
+                    return False
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        return True
+
     def finalize(self, batch: BatchRunResult | None = None) -> dict[str, Path]:
         try:
             if self._old_manifest is not None and isinstance(batch, BatchRunResult):
@@ -1790,6 +1912,14 @@ class StreamingBatchExporter:
                         raise ValueError(
                             f"previous streamed bundle {key} does not match the validated resume run"
                         )
+            if self._reuse_completed_bundle(batch):
+                # CRC/member validation already ran when opening the old NPZ;
+                # the commit hashes above also bind every table and sidecar.
+                # Keeping their timestamps lets report/package validate and
+                # reuse their own unchanged generations without rerendering.
+                self.abort()
+                self._stage = None
+                return {**self._targets, "commit_marker": self.output / ".bundle.commit.json"}
             if self.resume and not self._compact_results and isinstance(batch, BatchRunResult) and batch.cancelled:
                 # A cancellation before the next frame starts has no new
                 # evidence to publish.  Keep the previous verified tables and
@@ -1805,7 +1935,8 @@ class StreamingBatchExporter:
                 if self._old_npz is not None:
                     self._old_npz.close()
                     self._old_npz = None
-                self._stage = Path()
+                self._stage = None
+                self._release_output_lock()
                 return dict(self._targets)
             metadata = {
                 "arrays": list(self._array_names),
@@ -1852,7 +1983,7 @@ class StreamingBatchExporter:
                 staged_npz = self._stage / self._targets["npz"].name
                 merged_npz = self._stage / (staged_npz.name + ".merged")
                 merged_names: list[str] = []
-                with zipfile.ZipFile(merged_npz, "w", compression=zipfile.ZIP_DEFLATED) as output:
+                with zipfile.ZipFile(merged_npz, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
                     old_names = self._old_npz.namelist()
                     for name in old_names:
                         if name == "__metadata__.npy":
@@ -1922,6 +2053,9 @@ class StreamingBatchExporter:
                 user_provenance=self.provenance,
                 resolved_config=(run.resolved_config if run is not None else None),
             )
+            if run is not None and run.producer_identity is not None:
+                provenance["producer_identity"] = run.producer_identity
+            provenance["checkpoint_frame_sha256"] = self._frame_signatures if all(self._frame_signatures) else []
             staged_manifest = self._stage / self._targets["manifest"].name
             staged_manifest.write_text(
                 json.dumps(
@@ -1952,9 +2086,10 @@ class StreamingBatchExporter:
                 force=self.force,
                 preserve_existing={"npz"} if no_op_resume else frozenset(),
             )
-            self._stage = Path()
+            self._stage = None
+            self._release_output_lock()
             return outputs
-        except Exception:
+        except BaseException:
             self.abort()
             raise
 
@@ -1984,8 +2119,9 @@ class StreamingBatchExporter:
             except Exception:
                 pass
         stage = getattr(self, "_stage", None)
-        if stage and stage.exists():
+        if stage is not None and stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
+        self._release_output_lock()
 
 
 @dataclass
@@ -2087,6 +2223,21 @@ def _provenance_payload(
 
 
 def export_batch(
+    batch: BatchRunResult | Iterable[FrameFitResult],
+    output_dir: str | os.PathLike[str],
+    *,
+    provenance: Mapping[str, Any] | None = None,
+    prefix: str = "",
+    force: bool = False,
+) -> dict[str, Path]:
+    """Publish the complete export bundle while excluding another writer."""
+    if isinstance(batch, (str, os.PathLike, Path)) and not isinstance(output_dir, (str, os.PathLike, Path)):
+        batch, output_dir = output_dir, batch
+    with output_lock(output_dir, create=True):
+        return _export_batch_locked(batch, output_dir, provenance=provenance, prefix=prefix, force=force)
+
+
+def _export_batch_locked(
     batch: BatchRunResult | Iterable[FrameFitResult],
     output_dir: str | os.PathLike[str],
     *,

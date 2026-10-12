@@ -20,8 +20,9 @@ import traceback as traceback_module
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, ParamSpec, TypeVar
 
 from .cancellation import AnalysisCancelled
 from .csv_utils import read_csv_rows
@@ -1816,7 +1817,7 @@ class FrameFitResult:
             return value.get("parameters", value.get("params", value))
         return getattr(value, "parameters", getattr(value, "params", None))
 
-    def to_record(self) -> dict[str, Any]:
+    def to_record(self, *, include_result: bool = True) -> dict[str, Any]:
         return {
             "frame": self.frame.to_dict(),
             "status": self.status,
@@ -1826,7 +1827,7 @@ class FrameFitResult:
             "warm_start_from": self.warm_start_from,
             "elapsed_s": self.elapsed_s,
             "resumed": self.resumed,
-            "result": _json_safe(self.result),
+            "result": _json_safe(self.result) if include_result else None,
         }
 
     @classmethod
@@ -1859,6 +1860,7 @@ class BatchRunResult:
     total_count: int = 0
     selection: Mapping[str, Any] = field(default_factory=dict)
     resolved_config: Any = None
+    producer_identity: Any = None
 
     # Sequence behaviour makes this object drop-in compatible with the early
     # prototype API, which returned ``list[FrameFitResult]``.
@@ -1983,7 +1985,7 @@ def _checkpoint_payload(
 ) -> dict[str, Any]:
     frame_records: list[dict[str, Any]] = []
     for item in run.frame_results:
-        record = item.to_record()
+        record = item.to_record(include_result=False)
         safe_result = _checkpoint_safe(item.result)
         if isinstance(safe_result, Mapping):
             safe_result = dict(safe_result)
@@ -2004,6 +2006,7 @@ def _checkpoint_payload(
         "mode": run.mode,
         "input_hash": run.input_hash,
         "config_hash": run.config_hash,
+        "producer_identity": run.producer_identity,
         "config": _config_with_file_fingerprints(config),
         "config_file_fingerprints": _config_with_file_fingerprints(config),
         "selection": _json_safe(run.selection),
@@ -2028,7 +2031,7 @@ def write_checkpoint(path: str | os.PathLike[str], payload: Mapping[str, Any]) -
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(_json_safe(payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -2050,6 +2053,24 @@ def read_checkpoint(path: str | os.PathLike[str]) -> dict[str, Any]:
     return value
 
 
+_Call = ParamSpec("_Call")
+_Return = TypeVar("_Return")
+
+
+def _checkpoint_locked(function: Callable[_Call, _Return]) -> Callable[_Call, _Return]:
+    @wraps(function)
+    def locked(*args: _Call.args, **kwargs: _Call.kwargs) -> _Return:
+        checkpoint = kwargs.get("checkpoint_path") or kwargs.get("checkpoint")
+        if checkpoint is None:
+            return function(*args, **kwargs)
+        from .output_lock import output_lock
+
+        with output_lock(Path(checkpoint).parent, create=True):
+            return function(*args, **kwargs)
+    return locked
+
+
+@_checkpoint_locked
 def run_batch(
     frames: Iterable[Any] | Any = (),
     analyze_frame: Callable[..., Any] | None = None,
@@ -2072,6 +2093,8 @@ def run_batch(
     on_progress: Callable[[Mapping[str, Any]], Any] | None = None,
     result_sink: Callable[[FrameFitResult], Any] | None = None,
     retain_results: bool = True,
+    analyzer_identity: Any = None,
+    restore_frame: Callable[[FrameRef, int], bool] | None = None,
 ) -> BatchRunResult:
     """Analyze a sequence of frames with failure isolation and optional resume."""
 
@@ -2142,6 +2165,9 @@ def run_batch(
     )
     callback = progress if progress is not None else on_progress
     started_batch = __import__("time").perf_counter()
+    from .producer import producer_identity
+
+    calculation_producer = {**producer_identity(), "analyzer": _json_safe(analyzer_identity)}
     # Checkpointed runs must carry content identities from the start.  A
     # resumed run repeats the same gate before comparing the stored hashes.
     require_content_hash = checkpoint_file is not None or resume
@@ -2230,6 +2256,7 @@ def run_batch(
         total_count=len(refs),
         selection=selection,
         resolved_config=config,
+        producer_identity=calculation_producer,
     )
 
     def emit_progress(index: int, item: FrameFitResult | None = None) -> None:
@@ -2282,6 +2309,11 @@ def run_batch(
             raise ValueError("checkpoint config hash mismatch; refusing resume")
         if payload.get("mode", mode) != mode:
             raise ValueError("checkpoint mode mismatch; refusing resume")
+        if payload.get("producer_identity") != calculation_producer:
+            raise ValueError(
+                "checkpoint calculation producer/dependency identity is missing or changed; "
+                "use its original software environment to resume, or choose a separate output for a new run"
+            )
         for record in payload.get("frames", []):
             if isinstance(record, Mapping):
                 frame_record = record.get("frame", record)
@@ -2300,7 +2332,7 @@ def run_batch(
 
     previous_result: Any = None
     previous_frame_key: str | None = None
-    for frame in refs:
+    for frame_index, frame in enumerate(refs):
         if cancelled():
             run.cancelled = True
             emit_progress(len(run.frame_results), None)
@@ -2333,7 +2365,7 @@ def run_batch(
                 and restored.get("result") is not None
             ):
                 restore_candidate = True
-        if restore_candidate:
+        if restore_candidate and (restore_frame is None or restore_frame(frame, frame_index)):
             restored_status, restored_reason = _batch_result_status(
                 restored.get("result")
             )
