@@ -212,7 +212,8 @@ def test_pipeline_wrapper_preserves_branch_labels_and_weights() -> None:
 
 
 def test_public_pipeline_exposes_symmetry_and_quadrant_point_metadata() -> None:
-    image, qmap = synthetic_butterfly((32, 32), return_qmap=True, seed=41)
+    # Resolve enough two-sided radial peaks to exercise the symmetry export.
+    image, qmap = synthetic_butterfly((64, 64), return_qmap=True, seed=41)
     result = analyze_frame(image, qmap=qmap)
     symmetry = result.ellipse_fit["symmetry"]
     assert "quadrant_counts" in symmetry

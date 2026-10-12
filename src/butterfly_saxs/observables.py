@@ -319,7 +319,7 @@ class RidgePoint(_MappingResult, _SharedRidgePoint):
             "qx", "qy", "method", "curvature", "normal_slope", "support",
             "pixel_y", "pixel_x", "accepted", "reason", "q_unit", "q_star_Ainv", "q_star_nm_inv", "Ln", "Ln_nm",
             "score", "point_score", "continuity_score", "trajectory_id", "branch_id", "local_q_step",
-            "q_normal_step", "q_scale_anisotropy",
+            "q_normal_step", "q_scale_anisotropy", "metadata",
         )
 
     @property
@@ -959,14 +959,16 @@ def _quadratic_peak(x: np.ndarray, y: np.ndarray, index: int, period: float | No
 
 
 def _periodic_fwhm(x: np.ndarray, y: np.ndarray, index: int, baseline: float, period: float = 2.0 * np.pi) -> float:
-    finite = np.isfinite(y)
-    if not np.any(finite) or not np.isfinite(y[index]):
+    x_values = np.asarray(x, dtype=float)
+    y_values = np.asarray(y, dtype=float)
+    finite = np.isfinite(y_values)
+    if not np.any(finite) or not np.isfinite(y_values[index]):
         return float("nan")
-    y0 = float(y[index])
+    y0 = float(y_values[index])
     half = baseline + 0.5 * (y0 - baseline)
-    n = len(y)
-    ext_y = np.tile(np.asarray(y, dtype=float), 3)
-    ext_x = np.linspace(x[0] - period, x[-1] + period, 3 * n)
+    n = len(y_values)
+    ext_y = np.tile(y_values, 3)
+    ext_x = np.concatenate((x_values - period, x_values, x_values + period))
     centre = n + index
     if ext_y[centre] < half:
         return float("nan")
@@ -978,6 +980,13 @@ def _periodic_fwhm(x: np.ndarray, y: np.ndarray, index: int, baseline: float, pe
         right += 1
     if left == 0 or right == len(ext_y) - 1:
         return float("nan")
+    left_bracket = (left - 1, left)
+    right_bracket = (right, right + 1)
+    bracket_indices = (*left_bracket, *right_bracket)
+    if not np.all(np.isfinite(ext_y[list(bracket_indices)])) or not np.all(
+        np.isfinite(ext_x[list(bracket_indices)])
+    ):
+        return float("nan")
     # Linear crossing at each half-height boundary.
     def crossing(i0: int, i1: int) -> float:
         y0_, y1_ = ext_y[i0], ext_y[i1]
@@ -985,31 +994,54 @@ def _periodic_fwhm(x: np.ndarray, y: np.ndarray, index: int, baseline: float, pe
             return float(ext_x[i0])
         return float(ext_x[i0] + (half - y0_) * (ext_x[i1] - ext_x[i0]) / (y1_ - y0_))
 
-    return max(0.0, crossing(right, right + 1) - crossing(left - 1, left))
+    width = crossing(*right_bracket) - crossing(*left_bracket)
+    return float(max(0.0, width)) if np.isfinite(width) else float("nan")
 
 
-def _linear_fwhm(x: np.ndarray, y: np.ndarray, index: int, baseline: float) -> float:
-    finite = np.isfinite(y)
-    if not np.any(finite) or not np.isfinite(y[index]):
+def _linear_fwhm(
+    x: np.ndarray,
+    y: np.ndarray,
+    index: int,
+    baseline: float,
+    *,
+    support_mask: np.ndarray | None = None,
+) -> float:
+    x_values = np.asarray(x, dtype=float)
+    y_values = np.asarray(y, dtype=float)
+    finite = np.isfinite(y_values)
+    if not np.any(finite) or not np.isfinite(y_values[index]):
         return float("nan")
-    half = baseline + 0.5 * (float(y[index]) - baseline)
-    if y[index] < half:
+    half = baseline + 0.5 * (float(y_values[index]) - baseline)
+    if y_values[index] < half:
         return float("nan")
     left = int(index)
-    while left > 0 and np.isfinite(y[left - 1]) and y[left - 1] >= half:
+    while left > 0 and np.isfinite(y_values[left - 1]) and y_values[left - 1] >= half:
         left -= 1
     right = int(index)
-    while right < len(y) - 1 and np.isfinite(y[right + 1]) and y[right + 1] >= half:
+    while right < len(y_values) - 1 and np.isfinite(y_values[right + 1]) and y_values[right + 1] >= half:
         right += 1
+    if left == 0 or right == len(y_values) - 1:
+        return float("nan")
+    bracket_indices = (left - 1, left, right, right + 1)
+    if not np.all(np.isfinite(y_values[list(bracket_indices)])) or not np.all(
+        np.isfinite(x_values[list(bracket_indices)])
+    ):
+        return float("nan")
+    if support_mask is not None:
+        measured = np.asarray(support_mask, dtype=bool)
+        if measured.shape != y_values.shape or not np.all(measured[left - 1 : right + 2]):
+            return float("nan")
 
     def cross(i0: int, i1: int) -> float:
-        if y[i1] == y[i0]:
-            return float(x[i0])
-        return float(x[i0] + (half - y[i0]) * (x[i1] - x[i0]) / (y[i1] - y[i0]))
+        if y_values[i1] == y_values[i0]:
+            return float(x_values[i0])
+        return float(
+            x_values[i0]
+            + (half - y_values[i0]) * (x_values[i1] - x_values[i0]) / (y_values[i1] - y_values[i0])
+        )
 
-    left_x = cross(left - 1, left) if left else float(x[left])
-    right_x = cross(right, right + 1) if right < len(y) - 1 else float(x[right])
-    return max(0.0, right_x - left_x)
+    width = cross(right, right + 1) - cross(left - 1, left)
+    return float(max(0.0, width)) if np.isfinite(width) else float("nan")
 
 
 def _refine_symmetric_lobes(
@@ -1349,6 +1381,70 @@ def _radial_profile_baseline_noise(
     return baseline, noise
 
 
+def _supported_radial_local_maxima(
+    values: np.ndarray,
+    finite: np.ndarray,
+    *,
+    dense_profile: bool,
+    blocked_bins: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return measured local maxima with observed support on both sides.
+
+    A candidate must be bracketed by measured samples.  Empty bins known to
+    contain geometric support but no measured pixels are treated as masked
+    gaps; bins with no geometric pixels may bracket a sparse observed profile.
+    Without geometric-support information, dense profiles require adjacent
+    measured bins as a conservative fallback.
+    """
+
+    signal = np.asarray(values, dtype=float)
+    measured = np.asarray(finite, dtype=bool) & np.isfinite(signal)
+    indices = np.flatnonzero(measured)
+    if indices.size < 3:
+        return np.empty(0, dtype=int)
+    blocked = None if blocked_bins is None else np.asarray(blocked_bins, dtype=bool)
+
+    maxima: list[int] = []
+    position = 0
+    while position < indices.size:
+        start = position
+        end = position
+        while end + 1 < indices.size:
+            current_index = int(indices[end])
+            next_index = int(indices[end + 1])
+            if next_index != current_index + 1:
+                break
+            scale = max(1.0, abs(float(signal[current_index])), abs(float(signal[next_index])))
+            tolerance = 8.0 * np.finfo(float).eps * scale
+            if abs(float(signal[next_index] - signal[current_index])) > tolerance:
+                break
+            end += 1
+        if start > 0 and end + 1 < indices.size:
+            left_index = int(indices[start - 1])
+            right_index = int(indices[end + 1])
+            first_index = int(indices[start])
+            last_index = int(indices[end])
+            if blocked is not None:
+                gap_has_unmeasured_support = bool(
+                    np.any(blocked[left_index + 1 : first_index])
+                    or np.any(blocked[last_index + 1 : right_index])
+                )
+                bracketed = not gap_has_unmeasured_support
+            else:
+                bracketed = not dense_profile or (
+                    first_index - left_index == 1 and right_index - last_index == 1
+                )
+            plateau_value = float(np.max(signal[indices[start : end + 1]]))
+            if (
+                bracketed
+                and plateau_value > signal[left_index]
+                and plateau_value > signal[right_index]
+            ):
+                maxima.append(int(indices[(start + end) // 2]))
+        position = end + 1
+    return np.asarray(maxima, dtype=int)
+
+
 def _radial_peak(
     profile: RadialProfile,
     snr_threshold: float = 2.0,
@@ -1386,68 +1482,79 @@ def _radial_peak(
     if gaussian_filter1d is not None and np.count_nonzero(finite) > 8:
         fill = np.interp(q, q[finite], y[finite])
         smooth = gaussian_filter1d(fill, 1.0, mode="nearest")
-    # Interpolation is useful for smoothing across small gaps, but an empty
-    # bin must never win the peak search.  Require measured support on both
-    # sides before accepting a q location; if the strongest apparent feature
-    # sits at a mask edge, the next supported maximum is considered instead.
-    supported = finite.copy()
-    if supported.size:
-        supported[0] = False
-        supported[-1] = False
-    # Sparse detector sectors (for example small synthetic/pixel-q fixtures)
-    # legitimately contain isolated sampled bins.  In that regime requiring
-    # two finite neighbours would erase the real peak.  Dense profiles retain
-    # the stricter two-sided support guard that rejects interpolation across a
-    # masked q gap.
+    # Interpolation is useful for smoothing across small gaps, but local
+    # maxima are accepted only when measured bins bracket them on both sides.
+    # Nearest observed bins may bracket sparse sampling, but never across
+    # bins with geometric pixels that were masked or left unmeasured.
     dense_profile = np.count_nonzero(finite) >= max(12, int(np.ceil(0.5 * len(finite))))
-    if supported.size > 2 and dense_profile:
-        supported[1:-1] &= finite[:-2] & finite[2:]
-    if not np.any(supported):
-        flags = list(_flags_with_q_unit(APPARENT_FLAGS, profile.q_unit))
-        flags.append("unsupported_radial_boundary")
-        return RidgePoint(
-            angle=profile.angle,
-            q=float("nan"),
-            q_star=float("nan"),
-            lamellar_spacing=float("nan"),
-            intensity=float("nan"),
-            baseline=baseline,
-            snr=float("nan"),
-            radial_fwhm=float("nan"),
-            azimuthal_fwhm=float("nan"),
-            area=0.0,
-            coverage=global_coverage,
-            n_pixels=int(np.sum(profile.counts)),
-            valid=False,
-            flags=tuple(flags),
-            score=0.0,
-            reason="unsupported_radial_boundary",
-            q_unit=profile.q_unit,
-        )
-    index = int(np.nanargmax(np.where(supported, smooth, np.nan)))
+    geometry_counts = np.asarray(profile.candidate_counts)
+    blocked_bins = (geometry_counts > 0) & ~finite
+    local_maxima = _supported_radial_local_maxima(
+        smooth,
+        finite,
+        dense_profile=dense_profile,
+        blocked_bins=blocked_bins,
+    )
+    resolved_local_maximum = bool(local_maxima.size)
+    if resolved_local_maximum:
+        index = int(local_maxima[np.argmax(smooth[local_maxima])])
+    else:
+        # Keep the strongest observed sample as an auditable candidate even
+        # when it lies at a q-window edge or lacks two-sided support.
+        observed_indices = np.flatnonzero(finite)
+        index = int(observed_indices[np.argmax(smooth[observed_indices])])
     peak_q, peak_intensity = _quadratic_peak(q, smooth, index)
     snr = (peak_intensity - baseline) / noise if noise else float("inf")
+    observed_indices = np.flatnonzero(finite)
+    observed_position = int(np.searchsorted(observed_indices, index))
     local_indices = [index]
-    for neighbour in (index - 1, index + 1):
-        if 0 <= neighbour < len(y) and finite[neighbour]:
-            local_indices.append(neighbour)
+    candidate_gap = False
+    if observed_position > 0:
+        left_index = int(observed_indices[observed_position - 1])
+        local_indices.append(left_index)
+        candidate_gap |= bool(np.any(blocked_bins[left_index + 1 : index]))
+    if observed_position + 1 < observed_indices.size:
+        right_index = int(observed_indices[observed_position + 1])
+        local_indices.append(right_index)
+        candidate_gap |= bool(np.any(blocked_bins[index + 1 : right_index]))
+    has_two_sided_support = bool(
+        observed_position > 0
+        and observed_position + 1 < observed_indices.size
+        and not candidate_gap
+    )
     local_coverage = float(
         np.nanmin(np.asarray(profile.coverage, dtype=float)[local_indices])
     )
+    fwhm = _linear_fwhm(q, smooth, index, baseline, support_mask=finite)
+    area = float(np.trapezoid(np.maximum(y[finite] - baseline, 0.0), q[finite])) if np.count_nonzero(finite) > 1 else 0.0
+    flags = list(_flags_with_q_unit(APPARENT_FLAGS, profile.q_unit))
+    if not np.isfinite(fwhm):
+        flags.append("radial_fwhm_unavailable")
+    unresolved_reason = None
+    candidate_edge = None
+    if not resolved_local_maximum:
+        if index == int(observed_indices[0]) or index == int(observed_indices[-1]):
+            unresolved_reason = "unresolved_radial_boundary"
+            candidate_edge = "low" if index == int(observed_indices[0]) else "high"
+        elif candidate_gap:
+            unresolved_reason = "unsupported_radial_gap"
+        else:
+            unresolved_reason = "no_local_radial_maximum"
     if local_coverage < float(min_coverage):
-        flags = list(_flags_with_q_unit(APPARENT_FLAGS, profile.q_unit))
         flags.append("low_peak_support")
+        if unresolved_reason is not None:
+            flags.append(unresolved_reason)
         point = RidgePoint(
             angle=profile.angle,
-            q=float("nan"),
+            q=float(peak_q),
             q_star=float("nan"),
             lamellar_spacing=float("nan"),
             intensity=float(peak_intensity),
             baseline=baseline,
             snr=float(snr),
-            radial_fwhm=float("nan"),
+            radial_fwhm=float(fwhm),
             azimuthal_fwhm=float("nan"),
-            area=float("nan"),
+            area=area,
             coverage=local_coverage,
             n_pixels=int(np.sum(profile.counts[local_indices])),
             valid=False,
@@ -1460,11 +1567,48 @@ def _radial_peak(
             profile_global_coverage=global_coverage,
             peak_coverage=local_coverage,
             peak_bin_index=int(index),
+            candidate_q=float(peak_q),
+            candidate_edge=candidate_edge,
+            resolved_local_maximum=resolved_local_maximum,
+            has_two_sided_support=has_two_sided_support,
+            support_density="dense" if dense_profile else "sparse",
+            radial_fwhm_available=bool(np.isfinite(fwhm)),
         )
         return point
-    fwhm = _linear_fwhm(q, smooth, index, baseline)
-    area = float(np.trapezoid(np.maximum(y[finite] - baseline, 0.0), q[finite])) if np.count_nonzero(finite) > 1 else 0.0
-    flags = list(_flags_with_q_unit(APPARENT_FLAGS, profile.q_unit))
+    if unresolved_reason is not None:
+        flags.append(unresolved_reason)
+        point = RidgePoint(
+            angle=profile.angle,
+            q=float(peak_q),
+            q_star=float("nan"),
+            lamellar_spacing=float("nan"),
+            intensity=float(peak_intensity),
+            baseline=baseline,
+            snr=float(snr),
+            radial_fwhm=float(fwhm),
+            azimuthal_fwhm=float("nan"),
+            area=area,
+            coverage=local_coverage,
+            n_pixels=int(np.sum(profile.counts[local_indices])),
+            valid=False,
+            flags=tuple(flags),
+            score=0.0,
+            reason=unresolved_reason,
+            q_unit=profile.q_unit,
+        )
+        point.metadata.update(
+            profile_global_coverage=global_coverage,
+            peak_coverage=local_coverage,
+            peak_bin_index=int(index),
+            candidate_q=float(peak_q),
+            candidate_edge=candidate_edge,
+            resolved_local_maximum=False,
+            has_two_sided_support=has_two_sided_support,
+            support_density="dense" if dense_profile else "sparse",
+            radial_fwhm_available=bool(np.isfinite(fwhm)),
+        )
+        return point
+
     valid = bool(np.isfinite(snr) and snr >= snr_threshold and np.isfinite(peak_q))
     if not valid:
         flags.append("low_snr")
@@ -1498,6 +1642,11 @@ def _radial_peak(
         profile_global_coverage=global_coverage,
         peak_coverage=local_coverage,
         peak_bin_index=int(index),
+        candidate_q=float(peak_q),
+        resolved_local_maximum=True,
+        has_two_sided_support=True,
+        support_density="dense" if dense_profile else "sparse",
+        radial_fwhm_available=bool(np.isfinite(fwhm)),
     )
     return point
 
@@ -1551,6 +1700,14 @@ def _radial_peak_candidates(
     if not np.isfinite(noise) or noise <= 0.0:
         return []
     peak_indices, _ = find_peaks(smooth, distance=4)
+    dense_profile = np.count_nonzero(finite) >= max(12, int(np.ceil(0.5 * len(finite))))
+    supported_indices = _supported_radial_local_maxima(
+        smooth,
+        finite,
+        dense_profile=dense_profile,
+        blocked_bins=(np.asarray(profile.candidate_counts) > 0) & ~finite,
+    )
+    peak_indices = peak_indices[np.isin(peak_indices, supported_indices)]
     if peak_indices.size == 0:
         return []
     prominences = peak_prominences(smooth, peak_indices)[0]
@@ -1564,26 +1721,14 @@ def _radial_peak_candidates(
     candidates: list[RidgePoint] = []
     for position in order:
         index = int(peak_indices[int(position)])
-        # Interpolation over a detector gap can manufacture a local maximum at
-        # the edge of the observed support.  Such a candidate has no measured
-        # two-sided peak shape and must not enter continuity tracking.
-        dense_profile = np.count_nonzero(finite) >= max(12, int(np.ceil(0.5 * len(finite))))
-        if (
-            index <= 0
-            or index >= len(y) - 1
-            or not finite[index - 1]
-            or not finite[index + 1]
-        ) and dense_profile:
-            continue
         score = float(prominences[int(position)] / noise)
         if not np.isfinite(score) or score < float(minimum_score):
             continue
         peak_q, peak_intensity = _quadratic_peak(q, smooth, index)
-        fwhm = _linear_fwhm(q, smooth, index, baseline)
-        local_indices = [index]
-        for neighbour in (index - 1, index + 1):
-            if 0 <= neighbour < len(y) and finite[neighbour]:
-                local_indices.append(neighbour)
+        fwhm = _linear_fwhm(q, smooth, index, baseline, support_mask=finite)
+        observed_indices = np.flatnonzero(finite)
+        observed_position = int(np.searchsorted(observed_indices, index))
+        local_indices = observed_indices[observed_position - 1 : observed_position + 2]
         local_coverage = float(
             np.nanmin(np.asarray(profile.coverage, dtype=float)[local_indices])
         )
@@ -1603,7 +1748,9 @@ def _radial_peak_candidates(
                 n_pixels=int(np.sum(profile.counts[local_indices])),
                 valid=True,
                 flags=_flags_with_q_unit(
-                    APPARENT_FLAGS + ("radial_continuity_candidate",),
+                    APPARENT_FLAGS
+                    + ("radial_continuity_candidate",)
+                    + (() if np.isfinite(fwhm) else ("radial_fwhm_unavailable",)),
                     profile.q_unit,
                 ),
                 score=score,

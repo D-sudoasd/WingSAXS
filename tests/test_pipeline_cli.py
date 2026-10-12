@@ -677,7 +677,10 @@ def test_cli_batch_manifest_only_and_utf8_bom_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     source = tmp_path / "frame.npy"
-    np.save(source, synthetic_butterfly((32, 32), seed=41))
+    # Match the generated ring to the uncalibrated pixel-q domain.
+    np.save(source, synthetic_butterfly(
+        (32, 32), q0=14.0, width=1.8, ellipticity=1.5, angle_deg=18.0, seed=0,
+    ))
     manifest = tmp_path / "frames.json"
     payload = json.dumps(
         [{"path": source.name, "frame_id": "f0"}],
@@ -696,7 +699,9 @@ def test_cli_batch_exports_partial_results_but_returns_nonzero_on_failed_frame(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     good = tmp_path / "good.npy"
-    np.save(good, synthetic_butterfly((32, 32), seed=31))
+    np.save(good, synthetic_butterfly(
+        (32, 32), q0=14.0, width=1.8, ellipticity=1.5, angle_deg=18.0, seed=0,
+    ))
     missing = tmp_path / "missing.npy"
     output = tmp_path / "partial-output"
 
