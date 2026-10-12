@@ -6,7 +6,9 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+import re
 import time
+import xml.etree.ElementTree as ET
 import zipfile
 
 import numpy as np
@@ -16,7 +18,7 @@ from PIL import Image
 # These describe execution/proof generation, rather than scientific values.
 _OPERATIONAL = {"created_at", "updated_at", "elapsed_s", "resumed", "generation",
                 "producer_identity", "checkpoint_frame_sha256", "source_state",
-                "artifact_sha256", "method_version", "receipt_sha256"}
+                "artifact_sha256", "receipt_sha256", "exporter_identity"}
 
 
 def _digest(path):
@@ -37,6 +39,62 @@ def _normalized(value, root):
 def _inventory(root):
     return {path.relative_to(root).as_posix(): path for path in root.rglob("*")
             if path.is_file() and not any(part.startswith(".") for part in path.relative_to(root).parts)}
+
+
+def _svg_contents(path):
+    """Compare actual vector/raster data, ignoring dates and random SVG IDs."""
+    root = ET.parse(path).getroot()
+    ids = {node.attrib["id"]: f"id_{index}" for index, node in enumerate(root.iter()) if "id" in node.attrib}
+
+    def references(value):
+        return re.sub(r"(?<=#)[A-Za-z_][\w:.-]*", lambda match: ids.get(match[0], match[0]), value)
+
+    def contents(node):
+        return (node.tag, sorted((key, ids[value] if key == "id" else references(value))
+                                 for key, value in node.attrib.items()), references(node.text or ""),
+                [contents(child) for child in node if child.tag != "{http://purl.org/dc/elements/1.1/}date"])
+
+    return contents(root)
+
+
+def _pdf_contents(path):
+    """Compare decoded drawing commands, resources, images, fonts and pages.
+
+    Requires pypdf (available in the bundled document runtime). Object numbers,
+    stream compression and creation dates do not describe plot content.
+    """
+    from pypdf import PdfReader
+    from pypdf.generic import StreamObject
+
+    def contents(value, active=None, location="$"):
+        value = value.get_object() if hasattr(value, "get_object") else value
+        active = {} if active is None else active
+        if isinstance(value, (dict, list)):
+            if id(value) in active:
+                return ("reference", active[id(value)])
+            active[id(value)] = location
+            try:
+                if isinstance(value, dict):
+                    omitted = {"/Length", "/Filter", "/DecodeParms"} if isinstance(value, StreamObject) else set()
+                    data = [(str(key), contents(item, active, location + str(key)))
+                            for key, item in sorted(value.items()) if key not in omitted]
+                    if isinstance(value, StreamObject):
+                        data.append(("decoded_stream_sha256", hashlib.sha256(value.get_data()).hexdigest()))
+                    return data
+                return [contents(item, active, f"{location}[{index}]") for index, item in enumerate(value)]
+            finally:
+                active.pop(id(value))
+        if isinstance(value, bytes):
+            return ("bytes", hashlib.sha256(value).hexdigest())
+        return str(value)
+
+    reader = PdfReader(path, strict=True)
+    pages = []
+    for page in reader.pages:
+        properties = {key: value for key, value in page.items() if key not in {"/Parent", "/Contents"}}
+        pages.append((contents(properties), page.get_contents().get_data()))
+    metadata = {key: value for key, value in (reader.metadata or {}).items() if key not in {"/CreationDate", "/ModDate"}}
+    return contents(metadata), pages
 
 
 def _verify_delivery(root):
@@ -70,7 +128,9 @@ def compare(before: Path, after: Path) -> dict:
     result = {"passed": True, "before": str(before), "after": str(after), "failures": [],
               "operational_fields_excluded": sorted(_OPERATIONAL), "arrays": 0, "array_values": 0,
               "maximum_absolute_error": 0.0, "csv_rows": 0, "json_records": 0,
+              "diagnostic_timing_values_excluded": 0,
               "png_identical": 0, "png_legend_changes": [], "vector_figures": 0}
+    result["vector_check"] = "SVG geometry/text/embedded rasters; PDF decoded commands/resources/fonts/images/pages"
     first, second = _inventory(before), _inventory(after)
     result["files"] = len(first)
     if set(first) != set(second):
@@ -97,6 +157,13 @@ def compare(before: Path, after: Path) -> dict:
                     rows_a, rows_b = csv.DictReader(a), csv.DictReader(b)
                     assert rows_a.fieldnames == rows_b.fieldnames, "CSV columns differ"
                     for index, (x, y) in enumerate(zip(rows_a, rows_b, strict=True)):
+                        # The long diagnostic table represents run timing as
+                        # a value row rather than an elapsed_s column. Retain
+                        # its field, frame, type and every other cell.
+                        if (x.get("field") == y.get("field")
+                                and x.get("field", "").endswith(".diagnostics.elapsed_s")):
+                            x["value"] = y["value"] = "<EXECUTION_SECONDS>"
+                            result["diagnostic_timing_values_excluded"] += 1
                         assert _normalized(x, before) == _normalized(y, after), f"CSV row {index} differs"
                         result["csv_rows"] += 1
             elif left.suffix in {".json", ".jsonl"}:
@@ -106,6 +173,11 @@ def compare(before: Path, after: Path) -> dict:
                     else:
                         records = ((json.loads(x), json.loads(y)) for x, y in zip(a, b, strict=True))
                     for x, y in records:
+                        if name.endswith("report_summary.json"):
+                            # Only the report builder's top-level receipt
+                            # version changed. Scientific method tags remain.
+                            x.pop("method_version", None)
+                            y.pop("method_version", None)
                         assert _normalized(x, before) == _normalized(y, after), "scientific JSON differs"
                         result["json_records"] += 1
             elif left.suffix == ".png":
@@ -118,9 +190,8 @@ def compare(before: Path, after: Path) -> dict:
                     assert name.endswith("_overview.png"), "unexpected image pixel change"
                     result["png_legend_changes"].append(name)
             elif left.suffix in {".svg", ".pdf"}:
-                expected = b"%PDF" if left.suffix == ".pdf" else b"<?xml"
-                with left.open("rb") as a, right.open("rb") as b:
-                    assert a.read(5).startswith(expected[:5]) and b.read(5).startswith(expected[:5])
+                reader = _svg_contents if left.suffix == ".svg" else _pdf_contents
+                assert reader(left) == reader(right), "vector drawing commands/resources differ"
                 result["vector_figures"] += 1
             else:
                 a, b = left.read_text(encoding="utf-8"), right.read_text(encoding="utf-8")

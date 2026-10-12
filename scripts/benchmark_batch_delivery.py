@@ -64,6 +64,7 @@ def _resources() -> dict:
 def _worker(args: argparse.Namespace) -> int:
     sys.path.insert(0, str(args.source.resolve() / "src"))
     from butterfly_saxs import batch, delivery, export, pipeline, report
+    from butterfly_saxs import lamellar_report_figures, report_figures, report_measurements
     from butterfly_saxs.cli import main
 
     if args.stop_after is not None:
@@ -92,13 +93,22 @@ def _worker(args: argparse.Namespace) -> int:
 
         @functools.wraps(function)
         def measured(*positional, **keywords):
+            resources = _resources()
+            cpu = time.process_time()
             started = time.perf_counter()
             try:
                 return function(*positional, **keywords)
             finally:
-                entry = stages.setdefault(label, {"calls": 0, "seconds": 0.0})
+                elapsed = time.perf_counter() - started
+                cpu_elapsed = time.process_time() - cpu
+                after = _resources()
+                entry = stages.setdefault(label, {"calls": 0, "seconds": 0.0, "cpu_seconds": 0.0,
+                                                  "io_read_bytes": 0, "io_write_bytes": 0})
                 entry["calls"] += 1
-                entry["seconds"] += time.perf_counter() - started
+                entry["seconds"] += elapsed
+                entry["cpu_seconds"] += cpu_elapsed
+                for name in ("io_read_bytes", "io_write_bytes"):
+                    entry[name] += after.get(name, 0) - resources.get(name, 0)
 
         setattr(owner, name, measured)
 
@@ -110,7 +120,14 @@ def _worker(args: argparse.Namespace) -> int:
         (export.StreamingBatchExporter, "write", "frame_export"),
         (export.StreamingBatchExporter, "finalize", "export_finalize"),
         (report, "build_analysis_report", "report"),
+        (report, "_source_state", "report_source_validation"),
+        (report_measurements, "measure_frame", "report_measurement"),
+        (report_figures, "render_frame_report", "report_frame_figures"),
+        (report_figures, "render_sequence_report", "report_sequence_figures"),
+        (lamellar_report_figures, "render_lamellar_report_frame", "report_lamellar_figures"),
+        (lamellar_report_figures, "render_lamellar_sequence_report", "report_lamellar_sequence"),
         (delivery, "package_batch", "package"),
+        (delivery, "_write_source", "package_members"),
     ):
         instrument(owner, name, label)
     command = ["batch", "--manifest", str(args.manifest.resolve()), "--config", str(args.config.resolve()),

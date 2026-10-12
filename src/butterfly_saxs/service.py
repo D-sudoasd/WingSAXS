@@ -2595,6 +2595,7 @@ class ButterflyAnalysisService:
                     or payload_mapping.get("resume", False)
                 ),
                 resume=bool(payload_mapping.get("resume", False)),
+                analyzer_identity="butterfly_saxs.service.ButterflyAnalysisService.batch",
             )
         try:
             run = run_batch(

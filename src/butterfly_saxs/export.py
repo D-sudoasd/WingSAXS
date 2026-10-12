@@ -40,6 +40,7 @@ from .batch import (
 from .csv_utils import safe_csv_cell
 from .file_identity import file_version
 from .output_lock import output_lock
+from .producer import exporter_identity
 
 
 _MISSING = object()
@@ -1600,11 +1601,13 @@ class StreamingBatchExporter:
         prefix: str = "",
         force: bool = False,
         resume: bool = False,
+        analyzer_identity: Any = None,
     ) -> None:
         self._output_lock = output_lock(output_dir, create=True)
         self._output_lock.__enter__()
         try:
-            self._initialize(output_dir, provenance=provenance, prefix=prefix, force=force, resume=resume)
+            self._initialize(output_dir, provenance=provenance, prefix=prefix, force=force, resume=resume,
+                             analyzer_identity=analyzer_identity)
         except BaseException:
             self._release_output_lock()
             raise
@@ -1623,12 +1626,18 @@ class StreamingBatchExporter:
         prefix: str = "",
         force: bool = False,
         resume: bool = False,
+        analyzer_identity: Any = None,
     ) -> None:
         self.output = Path(output_dir)
         self.prefix = str(prefix or "")
         self.force = bool(force)
         self.resume = bool(resume)
         self.provenance = provenance
+        self._exporter_identity = exporter_identity()
+        from .producer import producer_identity
+
+        self._expected_producer = (None if analyzer_identity is None
+                                   else {**producer_identity(), "analyzer": _json_safe(analyzer_identity)})
         self.output.mkdir(parents=True, exist_ok=True)
         self._targets = {
             "frame_summary": self.output / f"{self.prefix}frame_summary.csv",
@@ -1666,6 +1675,9 @@ class StreamingBatchExporter:
         self._old_npz: zipfile.ZipFile | None = None
         self._old_npz_metadata: dict[str, Any] | None = None
         self._old_manifest: Mapping[str, Any] | None = None
+        self._old_binding_verified = False
+        self._old_producer: Any = None
+        self._verified_targets: dict[str, tuple[Any, str]] = {}
         if self.resume:
             old_npz_path = self._targets["npz"]
             if not old_npz_path.exists():
@@ -1688,6 +1700,7 @@ class StreamingBatchExporter:
                     loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                     if isinstance(loaded_manifest, Mapping):
                         self._old_manifest = loaded_manifest
+                        self._old_producer = loaded_manifest.get("provenance", {}).get("producer_identity")
                 if parsed.get("complete") is not True and self._old_manifest is None:
                     raise ValueError(
                         "previous streamed NPZ is incomplete and has no manifest; refusing lossy resume"
@@ -1710,13 +1723,22 @@ class StreamingBatchExporter:
                 marker_path = self.output / ".bundle.commit.json"
                 if marker_path.is_file():
                     proof = json.loads(marker_path.read_text(encoding="utf-8"))
+                    if (proof.get("schema_version") != "lamellarsaxs2d.bundle_commit.v1"
+                            or proof.get("complete") is not True):
+                        raise ValueError("Previous bundle commit marker is invalid; recover its prior generation before resuming.")
                     artifacts = proof.get("artifacts", {})
                     for key in ("npz", "manifest", "provenance"):
                         target = self._targets[key]
                         expected = artifacts.get(key, {})
-                        if (expected.get("name") != target.name or not target.is_file()
-                                or _artifact_digest(target) != expected.get("sha256")):
+                        if expected.get("name") != target.name or not target.is_file():
                             raise ValueError(f"Previous bundle {key} does not match its commit marker; recover the prior generation before resuming.")
+                        before = file_version(target, target.stat())
+                        digest = _artifact_digest(target)
+                        if (digest != expected.get("sha256")
+                                or file_version(target, target.stat()) != before):
+                            raise ValueError(f"Previous bundle {key} does not match its commit marker; recover the prior generation before resuming.")
+                        self._verified_targets[key] = (before, digest)
+                    self._old_binding_verified = True
                 self._old_npz_metadata = dict(parsed)
             except Exception:
                 if self._old_npz is not None:
@@ -1756,6 +1778,8 @@ class StreamingBatchExporter:
         metadata = self._old_npz_metadata or {}
         proof = (self._old_manifest or {}).get("provenance", {}).get("checkpoint_frame_sha256", [])
         return (self._old_npz is not None and index < int(metadata.get("frame_count", 0))
+                and self._old_binding_verified
+                and (self._expected_producer is None or self._old_producer == self._expected_producer)
                 and index not in metadata.get("missing_frames", [])
                 and index < len(proof) and isinstance(proof[index], str))
 
@@ -1763,6 +1787,10 @@ class StreamingBatchExporter:
         try:
             signature = _checkpoint_frame_signature(item)
             if item.resumed and self.resume:
+                if self._expected_producer is not None and self._old_producer != self._expected_producer:
+                    raise ValueError("Previous bundle calculation producer differs from the current analyzer; rerun the frame before retaining its arrays.")
+                if not self._old_binding_verified:
+                    raise ValueError("No verified producing bundle marker is available; recover its prior generation before restoring frames.")
                 proof = (self._old_manifest or {}).get("provenance", {}).get("checkpoint_frame_sha256", [])
                 index = len(self._compact_results)
                 if not proof or index >= len(proof) or not isinstance(proof[index], str):
@@ -1850,7 +1878,7 @@ class StreamingBatchExporter:
             self._touched_frames.add(index)
         compact = FrameFitResult(
             frame=item.frame,
-            result=_frame_detail_safe(item.result),
+            result=detail["result"],
             status=item.status,
             error=item.error,
             diagnostic=item.diagnostic,
@@ -1877,6 +1905,8 @@ class StreamingBatchExporter:
         previous = self._old_manifest.get("provenance", {})
         if not isinstance(previous, Mapping) or previous.get("producer_identity") != batch.producer_identity:
             return False
+        if previous.get("exporter_identity") != self._exporter_identity:
+            return False
         expected_results = previous.get("checkpoint_frame_sha256")
         if not expected_results or not all(self._frame_signatures):
             return False
@@ -1897,7 +1927,10 @@ class StreamingBatchExporter:
             for key, target in self._targets.items():
                 expected = artifacts[key]
                 before = file_version(target, target.stat())
-                if (expected.get("name") != target.name or _artifact_digest(target) != expected.get("sha256")
+                verified = self._verified_targets.get(key)
+                digest = (verified[1] if before[-1] is not None and verified is not None and verified[0] == before
+                          else _artifact_digest(target))
+                if (expected.get("name") != target.name or digest != expected.get("sha256")
                         or file_version(target, target.stat()) != before):
                     return False
         except (OSError, ValueError, KeyError, TypeError):
@@ -1906,6 +1939,9 @@ class StreamingBatchExporter:
 
     def finalize(self, batch: BatchRunResult | None = None) -> dict[str, Path]:
         try:
+            current_producer = batch.producer_identity if isinstance(batch, BatchRunResult) else self._expected_producer
+            if self.resume and any(item.resumed for item in self._compact_results) and self._old_producer != current_producer:
+                raise ValueError("Previous bundle calculation producer differs from the resumed checkpoint; rerun its frames before retaining arrays.")
             if self._old_manifest is not None and isinstance(batch, BatchRunResult):
                 for key in ("input_hash", "config_hash", "mode"):
                     if self._old_manifest.get(key) != getattr(batch, key):
@@ -1968,6 +2004,8 @@ class StreamingBatchExporter:
             }
             no_op_resume = bool(
                 self.resume
+                and self._old_binding_verified
+                and self._old_producer == current_producer
                 and self._old_npz is not None
                 and not self._touched_frames
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled)
@@ -1991,6 +2029,10 @@ class StreamingBatchExporter:
                         match = re.match(r"frame_(\d+)__", name)
                         if match and int(match.group(1)) in self._touched_frames:
                             continue
+                        if not self._old_binding_verified:
+                            raise ValueError("Cannot retain unbound arrays from a previous NPZ; recover its producing commit marker before resuming.")
+                        if self._old_producer != current_producer:
+                            raise ValueError("Cannot retain arrays from a different calculation producer; rerun the affected frames.")
                         with self._old_npz.open(name, "r") as source_handle:
                             with output.open(name, "w") as target_handle:
                                 shutil.copyfileobj(source_handle, target_handle)
@@ -2055,6 +2097,7 @@ class StreamingBatchExporter:
             )
             if run is not None and run.producer_identity is not None:
                 provenance["producer_identity"] = run.producer_identity
+            provenance["exporter_identity"] = self._exporter_identity
             provenance["checkpoint_frame_sha256"] = self._frame_signatures if all(self._frame_signatures) else []
             staged_manifest = self._stage / self._targets["manifest"].name
             staged_manifest.write_text(

@@ -1202,6 +1202,7 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
             provenance={"command": "bsaxs batch", "full2d": full2d, "stream": True},
             force=bool(args.force or resume),
             resume=resume,
+            analyzer_identity="butterfly_saxs.pipeline.analyze_frame",
         )
     try:
         run = batch_module.run_batch(

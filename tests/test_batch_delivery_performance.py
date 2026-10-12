@@ -7,7 +7,7 @@ import os
 import numpy as np
 import pytest
 
-from butterfly_saxs import batch, producer
+from butterfly_saxs import batch, export, producer
 from butterfly_saxs.export import StreamingBatchExporter
 from butterfly_saxs.output_lock import output_lock
 
@@ -24,7 +24,7 @@ def _result(frame):
 
 
 def _stream_run(paths, output, checkpoint, *, resume=False):
-    writer = StreamingBatchExporter(output, resume=resume, force=resume)
+    writer = StreamingBatchExporter(output, resume=resume, force=resume, analyzer_identity="fixture v1")
     run = batch.run_batch(paths, _result, checkpoint=checkpoint, resume=resume,
                           result_sink=writer.write, retain_results=False, analyzer_identity="fixture v1",
                           restore_frame=writer.can_restore)
@@ -122,6 +122,77 @@ def test_presentation_edit_does_not_invalidate_calculation_but_dependencies_do(t
     assert producer.producer_identity()["versions"] != before["versions"]
 
 
+def test_cli_wrapper_and_exporter_changes_bind_the_correct_reuse_boundary(tmp_path, monkeypatch):
+    monkeypatch.setattr(producer, "__file__", str(tmp_path / "producer.py"))
+    wrapper, writer = tmp_path / "cli.py", tmp_path / "export.py"
+    wrapper.write_text("dataset='original'")
+    writer.write_text("schema='original'")
+    calculation, exported = producer.producer_identity(), producer.exporter_identity()
+    writer.write_text("schema='changed'")
+    assert producer.producer_identity() == calculation
+    assert producer.exporter_identity() != exported
+    wrapper.write_text("dataset='changed'")
+    assert producer.producer_identity() != calculation
+
+
+def test_writer_change_refreshes_artifacts_from_verified_fits_without_refitting(tmp_path, monkeypatch):
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    pixels = (output / "results.npz").read_bytes()
+    original = export._write_evolution
+    rendered = []
+
+    def render(*args):
+        rendered.append(args[0])
+        return original(*args)
+
+    monkeypatch.setattr(export, "exporter_identity", lambda: {"writer": "changed"})
+    monkeypatch.setattr(export, "_write_evolution", render)
+    monkeypatch.setattr(__import__(__name__, fromlist=["_result"]), "_result",
+                        lambda _: pytest.fail("writer change repeated a fit"))
+    run, _ = _stream_run(paths, output, checkpoint, resume=True)
+    assert all(item.resumed for item in run)
+    assert len(rendered) == 1
+    assert (output / "results.npz").read_bytes() == pixels
+    provenance = json.loads((output / "provenance.json").read_text(encoding="utf-8"))
+    assert provenance["exporter_identity"] == {"writer": "changed"}
+
+
+def test_current_checkpoint_cannot_retain_another_producers_pixels_with_equal_summaries(tmp_path, monkeypatch):
+    paths = _sources(tmp_path)
+    image = np.arange(12.).reshape(3, 4)
+    monkeypatch.setattr(producer, "producer_identity", lambda: {"sources": {"science": "old"}, "versions": {}})
+    monkeypatch.setitem(globals(), "_result", lambda _: {"image": image, "parameters": {"a": 0.4}})
+    output = tmp_path / "old_bundle"
+    _stream_run(paths, output, tmp_path / "old_checkpoint.json")
+    monkeypatch.setattr(producer, "producer_identity", lambda: {"sources": {"science": "current"}, "versions": {}})
+    changed_image = image[:, ::-1].copy()
+    assert batch._checkpoint_safe(changed_image) == batch._checkpoint_safe(image)
+    monkeypatch.setitem(globals(), "_result", lambda _: {"image": changed_image, "parameters": {"a": 0.4}})
+    current_checkpoint = tmp_path / "current_checkpoint.json"
+    _stream_run(paths, tmp_path / "current_bundle", current_checkpoint)
+    resumed, _ = _stream_run(paths, output, current_checkpoint, resume=True)
+    assert not any(item.resumed for item in resumed)
+    with np.load(output / "results.npz", allow_pickle=False) as arrays:
+        np.testing.assert_array_equal(arrays["frame_0000__image"], changed_image)
+        np.testing.assert_array_equal(arrays["frame_0001__image"], changed_image)
+
+
+def test_direct_writer_rejects_cross_producer_checkpoint_before_publication(tmp_path):
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    original = (output / "results.npz").read_bytes()
+    writer = StreamingBatchExporter(output, resume=True, force=True)
+    run = batch.run_batch(paths, _result, checkpoint=checkpoint, resume=True,
+                          analyzer_identity="fixture v1", result_sink=writer.write, retain_results=False)
+    run.producer_identity = {"source": "another producer", "analyzer": "fixture v1"}
+    with pytest.raises(ValueError, match="Previous bundle calculation producer"):
+        writer.finalize(run)
+    assert (output / "results.npz").read_bytes() == original
+
+
 def test_modified_checkpoint_values_cannot_reuse_unrelated_producing_evidence(tmp_path):
     paths = _sources(tmp_path)
     output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
@@ -201,6 +272,23 @@ def test_direct_resume_without_producing_manifest_fails_closed(tmp_path):
     resumed_writer = StreamingBatchExporter(output, resume=True, force=True)
     assert not resumed_writer.can_restore(original.frame, 0)
     resumed = batch.FrameFitResult(original.frame, result=batch._checkpoint_safe(original.result), resumed=True)
-    with pytest.raises(ValueError, match="No producing frame proof"):
+    with pytest.raises(ValueError, match="No verified producing bundle marker"):
         resumed_writer.write(resumed)
     assert (output / "results.npz").read_bytes() == before
+
+
+def test_missing_marker_cannot_promote_old_pixels_to_a_new_generation(tmp_path):
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    (output / ".bundle.commit.json").unlink()
+    before = (output / "results.npz").read_bytes()
+    writer = StreamingBatchExporter(output, resume=True, force=True)
+    assert not writer.can_restore(batch.FrameRef(paths[0]), 0)
+    restored = batch.read_checkpoint(checkpoint)["frames"][0]
+    item = batch.FrameFitResult.from_record(restored)
+    item.resumed = True
+    with pytest.raises(ValueError, match="No verified producing bundle marker"):
+        writer.write(item)
+    assert (output / "results.npz").read_bytes() == before
+    assert not (output / ".bundle.commit.json").exists()

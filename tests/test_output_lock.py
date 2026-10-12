@@ -201,3 +201,17 @@ def test_package_conflict_does_not_change_any_existing_output(tmp_path: Path):
         thread.join(10)
     assert not thread.is_alive()
     assert not failure
+
+
+def test_lock_rejects_hardlink_to_a_file_outside_output(tmp_path):
+    import os
+
+    original = tmp_path / "original_empty.dat"
+    original.write_bytes(b"")
+    root = tmp_path / "output"
+    root.mkdir()
+    os.link(original, root / ".wingsaxs.lock")
+    with pytest.raises(OSError, match="linked output lock file"):
+        with output_lock(root):
+            pytest.fail("linked lock was acquired")
+    assert original.read_bytes() == b""

@@ -2000,6 +2000,7 @@ def _checkpoint_payload(
                 safe_result["parameters"] = _checkpoint_safe(parameters)
         record["result"] = safe_result
         frame_records.append(record)
+    config_files = _config_with_file_fingerprints(config)
     return {
         "version": 1,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -2007,8 +2008,8 @@ def _checkpoint_payload(
         "input_hash": run.input_hash,
         "config_hash": run.config_hash,
         "producer_identity": run.producer_identity,
-        "config": _config_with_file_fingerprints(config),
-        "config_file_fingerprints": _config_with_file_fingerprints(config),
+        "config": config_files,
+        "config_file_fingerprints": config_files,
         "selection": _json_safe(run.selection),
         "cancelled": bool(run.cancelled),
         "processed_count": int(run.processed_count),
@@ -2096,7 +2097,17 @@ def run_batch(
     analyzer_identity: Any = None,
     restore_frame: Callable[[FrameRef, int], bool] | None = None,
 ) -> BatchRunResult:
-    """Analyze a sequence of frames with failure isolation and optional resume."""
+    """Analyze a sequence of frames with failure isolation and optional resume.
+
+    ``analyzer_identity`` is stable JSON-compatible caller evidence for an
+    external analyzer (for example its source SHA and dependency versions).
+    Built-in CLI/service callers supply their entry point explicitly. With
+    None, compatibility resume remains caller-managed for the external
+    callable and whole-bundle reuse is disabled; replacing a callback alone
+    cannot establish whether its calculation is equivalent. ``restore_frame``
+    lets a streaming consumer retry a checkpointed frame whose native array
+    evidence was never published, without recomputing delivered frames.
+    """
 
     # A few callers naturally write run_batch(analyze_frame, frames).  Keep
     # that form harmlessly supported while retaining the documented order.

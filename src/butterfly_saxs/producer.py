@@ -16,7 +16,7 @@ def producer_identity(*, presentation: bool = False) -> dict:
     """
     folder = Path(__file__).parent
     sources = {}
-    excluded = {"cli.py", "__main__.py", "export.py", "output_lock.py", "font_support.py",
+    excluded = {"__main__.py", "export.py", "output_lock.py", "font_support.py",
                 "visualization.py", "figure_support.py", "fit_overlays.py", "lamellar.py"}
     prefixes = ("report", "delivery", "benchmark", "publication", "lamellar_", "preflight", "doctor")
     for path in sorted(folder.glob("*.py")):
@@ -25,12 +25,32 @@ def producer_identity(*, presentation: bool = False) -> dict:
             continue
         sources[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     versions = {"python": platform.python_version()}
-    names = ("numpy", "scipy", "pyFAI", "fabio", "h5py", "tifffile", "PyYAML")
+    names = ("numpy", "scipy", "pyFAI", "fabio", "h5py", "tifffile", "PyYAML", "pillow")
     if presentation:
-        names += ("matplotlib", "pillow")
+        names += ("matplotlib",)
     for name in names:
         try:
             versions[name] = metadata.version(name)
         except metadata.PackageNotFoundError:
             versions[name] = None
     return {"sources": sources, "versions": versions}
+
+
+def exporter_identity() -> dict:
+    """Bind serialized artifacts and the native evolution plot to their writer.
+
+    Keep this separate from calculation identity so a writer change can
+    regenerate tables from verified fits without repeating scientific work.
+    """
+    identity = producer_identity()
+    folder = Path(__file__).parent
+    for name in ("export.py", "visualization.py", "font_support.py", "figure_support.py"):
+        path = folder / name
+        if path.is_file():
+            identity["sources"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for name in ("matplotlib", "pillow"):
+        try:
+            identity["versions"][name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            identity["versions"][name] = None
+    return identity

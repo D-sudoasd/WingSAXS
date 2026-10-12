@@ -412,25 +412,31 @@ def _render_index(report: Mapping[str, Any]) -> str:
                  f'<section><h2>Sequence</h2>{sequence}</section><section><h2>Frames ({len(frames)})</h2>{"".join(frames)}</section>')
 
 
-def _content_state(path: Path) -> list[Any]:
+def _content_state(path: Path, verified: dict[Path, tuple[Any, list[Any]]] | None = None) -> list[Any]:
     info = path.stat()
     before = file_version(path, info)
+    previous = None if verified is None else verified.get(path)
+    if before[-1] is not None and previous is not None and previous[0] == before:
+        return previous[1]
     with path.open("rb") as handle:
         digest = hashlib.file_digest(handle, "sha256").hexdigest()
     if file_version(path, path.stat()) != before:
         raise ValueError(f"File changed while validating report contents: {path}")
-    return [info.st_size, info.st_mtime_ns, digest]
+    state = [info.st_size, info.st_mtime_ns, digest]
+    if verified is not None:
+        verified[path] = (before, state)
+    return state
 
 
-def _source_state(folder: Path, prefix: str) -> dict[str, list[Any]]:
-    state: dict[str, list[Any]] = {name: _content_state(path) for name in (
+def _source_state(folder: Path, prefix: str, verified: dict | None = None) -> dict[str, list[Any]]:
+    state: dict[str, list[Any]] = {name: _content_state(path, verified) for name in (
         "frame_summary.csv", "parameters_long.csv", "results.npz", "frame_details.jsonl", "ellipse_fit.jsonl", "ellipse_fit.json", "ridge_points.csv", "provenance.json", "manifest.json")
         if (path := folder / f"{prefix}{name}").is_file()}
     source_manifest = _source_manifest_path(folder, prefix)
     if source_manifest is not None:
         try:
             state[_SOURCE_MANIFEST_STATE_KEY] = [
-                source_manifest.is_file(), *_content_state(source_manifest)
+                source_manifest.is_file(), *_content_state(source_manifest, verified)
             ]
         except OSError:
             state[_SOURCE_MANIFEST_STATE_KEY] = [False, None, None]
@@ -549,7 +555,11 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
     if not archive_path.is_file():
         raise FileNotFoundError(f"Native arrays are missing: {archive_path}; finish the batch export first.")
     target = folder / "figures" / f"{prefix}analysis_report"
-    state = _source_state(folder, prefix)
+    # The same invocation reuses a content proof only while a write-sensitive
+    # file revision (USN on Windows) stays unchanged. Without that proof each
+    # final check streams the bytes again, including same-mtime mutations.
+    verified_sources: dict = {}
+    state = _source_state(folder, prefix, verified_sources)
     receipt = target / "report_summary.json"
     if target.exists():
         if not (resume or force):
@@ -570,7 +580,7 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                     if path != "report_summary.json" and _content_state(target / relative)[2] != hashes.get(path):
                         valid = False
                         break
-                if valid and _source_state(folder, prefix) == state:
+                if valid and _source_state(folder, prefix, verified_sources) == state:
                     return {**old, "operation_status": "reused", "outputs": {"index": str(target / "index.html"), "summary": str(receipt)}}
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".analysis-report-", dir=target.parent))
@@ -786,7 +796,7 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                                     if path != "report_summary.json"}
         report["receipt_sha256"] = _receipt_seal(report)
         _write_json(stage / "report_summary.json", report)
-        if _source_state(folder, prefix) != state:
+        if _source_state(folder, prefix, verified_sources) != state:
             raise ValueError("Batch outputs changed during reporting; finish the export then retry report --resume.")
         backup = target.with_name(f".{target.name}-previous")
         if backup.exists():

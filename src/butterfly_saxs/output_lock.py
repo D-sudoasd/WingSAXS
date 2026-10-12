@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from collections.abc import Iterator
 import os
 from pathlib import Path
+import stat
 import threading
 
 
@@ -70,6 +71,14 @@ def output_lock(
         raise FileNotFoundError(f"output directory does not exist: {path}") from None
     if not resolved.is_dir():
         raise NotADirectoryError(f"output path is not a directory: {resolved}")
+    lock_path = resolved / _LOCK_NAME
+    try:
+        info = lock_path.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None and (stat.S_ISLNK(info.st_mode) or info.st_nlink > 1
+                             or getattr(info, "st_file_attributes", 0) & 0x400):
+        raise OSError(f"Refusing a linked output lock file: {lock_path}; use a regular lock file inside the output directory.")
 
     key = os.path.normcase(os.fspath(resolved))
     held: dict[str, list[object]] = getattr(_THREAD_STATE, "held", {})
@@ -89,7 +98,7 @@ def output_lock(
         if key in _ACTIVE:
             raise _locked_error(resolved)
         try:
-            handle = (resolved / _LOCK_NAME).open("a+b")
+            handle = lock_path.open("a+b")
             _acquire_file_lock(handle)
         except OSError as exc:
             if handle is not None:

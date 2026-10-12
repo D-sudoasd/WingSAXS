@@ -248,11 +248,42 @@ def test_source_digest_detects_rewrite_even_with_restored_size_and_mtime(tmp_pat
 
     source = tmp_path / "frame_summary.csv"
     source.write_bytes(b"a,1\n")
-    before = _source_state(tmp_path, "")
+    verified = {}
+    before = _source_state(tmp_path, "", verified)
     info = source.stat()
     source.write_bytes(b"a,2\n")
     os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
-    assert _source_state(tmp_path, "") != before
+    assert _source_state(tmp_path, "", verified) != before
+
+
+@pytest.mark.parametrize("revision_available", [False, True])
+def test_source_proof_reuse_requires_a_write_sensitive_revision(tmp_path, monkeypatch, revision_available):
+    import os
+    from butterfly_saxs import report
+
+    source = tmp_path / "frame_summary.csv"
+    source.write_bytes(b"a,1\n")
+    revision = [1]
+    original_digest = report.hashlib.file_digest
+    reads = []
+
+    def digest(*args):
+        reads.append(args[0].name)
+        return original_digest(*args)
+
+    monkeypatch.setattr(report.hashlib, "file_digest", digest)
+    monkeypatch.setattr(report, "file_version", lambda path, info: (info.st_size, info.st_mtime_ns,
+                                                                 revision[0] if revision_available else None))
+    verified = {}
+    first = report._source_state(tmp_path, "", verified)
+    assert report._source_state(tmp_path, "", verified) == first
+    assert len(reads) == (1 if revision_available else 2)
+    info = source.stat()
+    source.write_bytes(b"a,2\n")
+    os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
+    revision[0] += 1
+    assert report._source_state(tmp_path, "", verified) != first
+    assert len(reads) == (2 if revision_available else 3)
 
 
 def test_changed_report_status_cannot_be_promoted_by_receipt_reuse(tmp_path):
