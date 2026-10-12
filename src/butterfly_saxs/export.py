@@ -21,7 +21,7 @@ import tempfile
 import zipfile
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -1405,6 +1405,37 @@ def _frame_detail_record(
     return _json_safe(record)
 
 
+def _restore_export_values(
+    value: Any, archive: zipfile.ZipFile, prefix: str, *, arrays: bool = True, checkpoint_value: Any = _MISSING
+) -> Any:
+    """Decode proven detail values needed by native scalar/vector exports.
+
+    Detector maps stay in NPZ. Small fit/profile arrays recover their exact
+    values so restart descriptors never replace existing JSON/CSV evidence.
+    The original detail record separately retains tagged Enum metadata.
+    """
+    if isinstance(value, Mapping):
+        if (set(value) == {"enum_type", "name", "value"}
+                and not isinstance(checkpoint_value, Mapping) and checkpoint_value == value["value"]):
+            return value["value"]
+        member = prefix + ".npy"
+        if arrays and value.get("array_omitted") is True and member in archive.namelist():
+            with archive.open(member) as handle:
+                return np.load(handle, allow_pickle=False)
+        excluded = ({"image", "data", "qmap", "analysis_domain", "analysis_arrays", "valid_mask", "model", "residual", "model_image", "residual_image"}
+                    if "__" not in prefix else
+                    {"model", "residual", "model_image", "residual_image", "sampled_indices"} if prefix.endswith("__full2d") else set())
+        return {key: _restore_export_values(item, archive, prefix + "__" + _safe_key(key),
+                    arrays=arrays and key not in excluded,
+                    checkpoint_value=checkpoint_value.get(key, _MISSING) if isinstance(checkpoint_value, Mapping) else _MISSING)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_restore_export_values(item, archive, f"{prefix}__{index}", arrays=arrays,
+                    checkpoint_value=checkpoint_value[index] if isinstance(checkpoint_value, list) and index < len(checkpoint_value) else _MISSING)
+                for index, item in enumerate(value)]
+    return value
+
+
 def _contains_omitted_array(value: Any, _visited: set[int] | None = None) -> bool:
     """Detect an explicit checkpoint marker without guessing from absence.
 
@@ -1677,6 +1708,9 @@ class StreamingBatchExporter:
         self._old_manifest: Mapping[str, Any] | None = None
         self._old_binding_verified = False
         self._old_producer: Any = None
+        self._old_details_handle: Any = None
+        self._old_details_position = 0
+        self._old_details_used = False
         self._verified_targets: dict[str, tuple[Any, str]] = {}
         if self.resume:
             old_npz_path = self._targets["npz"]
@@ -1727,7 +1761,7 @@ class StreamingBatchExporter:
                             or proof.get("complete") is not True):
                         raise ValueError("Previous bundle commit marker is invalid; recover its prior generation before resuming.")
                     artifacts = proof.get("artifacts", {})
-                    for key in ("npz", "manifest", "provenance"):
+                    for key in ("npz", "manifest", "provenance", "frame_details"):
                         target = self._targets[key]
                         expected = artifacts.get(key, {})
                         if expected.get("name") != target.name or not target.is_file():
@@ -1739,6 +1773,7 @@ class StreamingBatchExporter:
                             raise ValueError(f"Previous bundle {key} does not match its commit marker; recover the prior generation before resuming.")
                         self._verified_targets[key] = (before, digest)
                     self._old_binding_verified = True
+                    self._old_details_handle = self._targets["frame_details"].open(encoding="utf-8")
                 self._old_npz_metadata = dict(parsed)
             except Exception:
                 if self._old_npz is not None:
@@ -1783,6 +1818,35 @@ class StreamingBatchExporter:
                 and index not in metadata.get("missing_frames", [])
                 and index < len(proof) and isinstance(proof[index], str))
 
+    def _original_detail(self, item: FrameFitResult, index: int) -> dict[str, Any]:
+        if self._old_details_handle is None:
+            raise ValueError("No verified producing frame details are available; rerun the frame before exporting restored values.")
+        line = ""
+        while self._old_details_position <= index:
+            line = self._old_details_handle.readline()
+            if not line:
+                raise ValueError("Producing frame details ended before the restored frame; recover the prior generation.")
+            self._old_details_position += 1
+        record = json.loads(line)
+        if (not isinstance(record, dict) or record.get("frame_index") != index
+                or record.get("path") != str(item.frame.path)
+                or record.get("frame_id") != _scalar(item.frame.frame_id)):
+            raise ValueError("Producing frame details do not match the restored frame identity.")
+        self._old_details_used = True
+        return record
+
+    def _close_original_details(self, *, verify: bool = False) -> None:
+        handle = self._old_details_handle
+        self._old_details_handle = None
+        if handle is not None:
+            handle.close()
+        if verify and self._old_details_used:
+            target = self._targets["frame_details"]
+            version, digest = self._verified_targets["frame_details"]
+            current = file_version(target, target.stat())
+            if current != version or (current[-1] is None and _artifact_digest(target) != digest):
+                raise ValueError("Producing frame details changed while restoring values; retry after recovering the prior generation.")
+
     def write(self, item: FrameFitResult) -> None:
         try:
             signature = _checkpoint_frame_signature(item)
@@ -1797,13 +1861,18 @@ class StreamingBatchExporter:
                     raise ValueError("No producing frame proof is available for the restored values; use the original software or rerun that frame in a separate output.")
                 if proof[index] != signature:
                     raise ValueError("Restored checkpoint values differ from the producing bundle; recover its original checkpoint before resuming.")
-            self._write(item)
+            detail = None
+            if item.resumed and self.resume:
+                detail = self._original_detail(item, len(self._compact_results))
+                item = replace(item, result=_restore_export_values(detail.get("result"), self._old_npz,
+                            f"frame_{len(self._compact_results):04d}", checkpoint_value=item.result))
+            self._write(item, restored_detail=detail)
             self._frame_signatures.append(signature)
         except BaseException:
             self.abort()
             raise
 
-    def _write(self, item: FrameFitResult) -> None:
+    def _write(self, item: FrameFitResult, *, restored_detail: dict[str, Any] | None = None) -> None:
         index = len(self._compact_results)
         for row in _frame_summary_rows([item]):
             row["frame_index"] = index
@@ -1836,7 +1905,10 @@ class StreamingBatchExporter:
         self._ellipse_rows.append(_batch_ellipse_row(item, index))
         array_prefix = f"frame_{index:04d}"
         arrays: dict[str, Any] = {}
-        _walk_arrays(item.result, array_prefix, arrays)
+        if not (item.resumed and self._old_npz is not None):
+            # Restored arrays belong to the producing NPZ. A checkpoint may
+            # contain array-like values too; never create duplicate members.
+            _walk_arrays(item.result, array_prefix, arrays)
         for name, value in arrays.items():
             with self._npz.open(name + ".npy", "w") as handle:
                 np.lib.format.write_array(handle, np.asarray(value), allow_pickle=False)
@@ -1852,11 +1924,10 @@ class StreamingBatchExporter:
                     if name.startswith(prefix) and name.endswith(".npy")
                 }
             )
-        detail = _frame_detail_record(
-            item,
-            index,
-            array_names=frame_array_names,
-        )
+        if restored_detail is None:
+            detail = _frame_detail_record(item, index, array_names=frame_array_names)
+        else:
+            detail = {**restored_detail, **_frame_base(item, index)}
         self._details_handle.write(
             json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             + "\n"
@@ -1939,6 +2010,14 @@ class StreamingBatchExporter:
 
     def finalize(self, batch: BatchRunResult | None = None) -> dict[str, Path]:
         try:
+            self._close_original_details(verify=True)
+            if self.resume and isinstance(batch, BatchRunResult) and batch.cancelled:
+                # A canceled recovery must not replace a delivered generation
+                # with skipped placeholders. Newly checkpointed frames whose
+                # arrays were not published will be retried by can_restore.
+                self.abort()
+                self._stage = None
+                return {**self._targets, "commit_marker": self.output / ".bundle.commit.json"}
             current_producer = batch.producer_identity if isinstance(batch, BatchRunResult) else self._expected_producer
             if self.resume and any(item.resumed for item in self._compact_results) and self._old_producer != current_producer:
                 raise ValueError("Previous bundle calculation producer differs from the resumed checkpoint; rerun its frames before retaining arrays.")
@@ -2123,6 +2202,10 @@ class StreamingBatchExporter:
                 json.dumps(provenance, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
                 encoding="utf-8",
             )
+            # Closing the reader earlier is required on Windows. Check its
+            # producing source again at the publication boundary as copying
+            # retained arrays and rendering evolution may take time.
+            self._close_original_details(verify=True)
             outputs = _publish_staged_bundle(
                 self._stage,
                 self._targets,
@@ -2137,6 +2220,7 @@ class StreamingBatchExporter:
             raise
 
     def abort(self) -> None:
+        self._close_original_details()
         try:
             npz = getattr(self, "_npz", None)
             if npz is not None:

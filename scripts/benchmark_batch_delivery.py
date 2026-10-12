@@ -67,6 +67,26 @@ def _worker(args: argparse.Namespace) -> int:
     from butterfly_saxs import lamellar_report_figures, report_figures, report_measurements
     from butterfly_saxs.cli import main
 
+    if args.hard_stop_after is not None:
+        original_checkpoint = batch.write_checkpoint
+
+        @functools.wraps(original_checkpoint)
+        def crash_after_checkpoint(path, payload):
+            result = original_checkpoint(path, payload)
+            completed = sum(item.get("status") != "skipped" for item in payload.get("frames", ()))
+            if completed >= args.hard_stop_after and not payload.get("cancelled"):
+                # Real abrupt exit: no Python finally blocks, ZIP close or
+                # publication. The prior committed bundle must survive.
+                record = {"injected_abrupt_exit": True, "phase": "after_durable_checkpoint_before_bundle_publish",
+                          "processed_frames": completed, "checkpoint": str(path), "resources": _resources(),
+                          "source": str(args.source.resolve()), "revision_label": args.revision,
+                          "manifest_sha256": _digest(args.manifest), "config_sha256": _digest(args.config)}
+                args.metrics.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+                os._exit(99)
+            return result
+
+        batch.write_checkpoint = crash_after_checkpoint
+
     if args.stop_after is not None:
         original_batch = batch.run_batch
 
@@ -176,6 +196,7 @@ def main() -> int:
     parser.add_argument("--revision", help="Descriptive revision label; actual source hashes are also recorded")
     parser.add_argument("--label", default="", help="Optional suffix to retain repeated resume measurements")
     parser.add_argument("--stop-after", type=int, help="Exercise real cooperative cancellation after N frames")
+    parser.add_argument("--hard-stop-after", type=int, help="Abruptly exit after the Nth durable checkpoint, before publishing arrays (fault test only)")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--metrics", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -183,6 +204,8 @@ def main() -> int:
         return _worker(args)
     if args.stop_after is not None and args.stop_after < 1:
         parser.error("--stop-after must be >= 1")
+    if args.hard_stop_after is not None and (args.hard_stop_after < 1 or args.stop_after is not None):
+        parser.error("--hard-stop-after must be >= 1 and cannot be combined with --stop-after")
     if args.label and (Path(args.label).name != args.label or "/" in args.label or "\\" in args.label):
         parser.error("--label must be a file-name component")
     args.output.parent.mkdir(parents=True, exist_ok=True)

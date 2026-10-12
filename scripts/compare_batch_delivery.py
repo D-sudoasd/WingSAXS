@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+from importlib import metadata, util
 import json
 from pathlib import Path
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -112,14 +114,23 @@ def _verify_delivery(root):
                 digest = hashlib.file_digest(handle, "sha256").hexdigest()
             if name == "delivery_index.html":
                 assert digest == receipt["index_sha256"]
+                assert digest == _digest(root / name), "published index differs from the ZIP"
             elif name != "delivery_contents.json":
                 assert digest == receipt["files"][name]["sha256"], f"member SHA differs: {name}"
                 assert _digest(root / name) == digest, f"published source differs: {name}"
         contents = json.loads(archive.read("delivery_contents.json"))
         assert contents["files"] == receipt["files"]
         assert contents["source_signature"] == receipt["source_signature"]
-    return {"members": len(names), "bytes": path.stat().st_size, "sha256": receipt["archive"]["sha256"],
-            "counts": receipt["counts"], "dependencies": receipt["dependencies"]}
+        for key, value in contents.items():
+            if key not in {"files", "source_signature"}:
+                assert value == receipt.get(key), f"embedded delivery metadata differs: {key}"
+    semantic = {key: value for key, value in receipt.items()
+                if key not in {"files", "archive", "source_signature", "index_sha256"}}
+    semantic["archive"] = {key: value for key, value in receipt["archive"].items()
+                           if key not in {"sha256", "bytes", "source_signature"}}
+    return {"members": len(names), "member_names": sorted(names),
+            "bytes": path.stat().st_size, "sha256": receipt["archive"]["sha256"],
+            "counts": receipt["counts"], "dependencies": receipt["dependencies"], "semantic_receipt": semantic}
 
 
 def compare(before: Path, after: Path) -> dict:
@@ -131,6 +142,9 @@ def compare(before: Path, after: Path) -> dict:
               "diagnostic_timing_values_excluded": 0,
               "png_identical": 0, "png_legend_changes": [], "vector_figures": 0}
     result["vector_check"] = "SVG geometry/text/embedded rasters; PDF decoded commands/resources/fonts/images/pages"
+    result["comparison_script_sha256"] = _digest(Path(__file__))
+    result["python"] = sys.version
+    result["validation_versions"] = {name: metadata.version(name) for name in ("numpy", "Pillow", "pypdf")}
     first, second = _inventory(before), _inventory(after)
     result["files"] = len(first)
     if set(first) != set(second):
@@ -161,7 +175,7 @@ def compare(before: Path, after: Path) -> dict:
                         # a value row rather than an elapsed_s column. Retain
                         # its field, frame, type and every other cell.
                         if (x.get("field") == y.get("field")
-                                and x.get("field", "").endswith(".diagnostics.elapsed_s")):
+                                and x.get("field", "").endswith((".diagnostics.elapsed_s", ".trace_diagnostics.elapsed_s"))):
                             x["value"] = y["value"] = "<EXECUTION_SECONDS>"
                             result["diagnostic_timing_values_excluded"] += 1
                         assert _normalized(x, before) == _normalized(y, after), f"CSV row {index} differs"
@@ -191,7 +205,10 @@ def compare(before: Path, after: Path) -> dict:
                     result["png_legend_changes"].append(name)
             elif left.suffix in {".svg", ".pdf"}:
                 reader = _svg_contents if left.suffix == ".svg" else _pdf_contents
-                assert reader(left) == reader(right), "vector drawing commands/resources differ"
+                try:
+                    assert reader(left) == reader(right), "vector drawing commands/resources differ"
+                except Exception as error:
+                    raise ValueError(f"Vector comparison failed: {error}") from error
                 result["vector_figures"] += 1
             else:
                 a, b = left.read_text(encoding="utf-8"), right.read_text(encoding="utf-8")
@@ -203,6 +220,12 @@ def compare(before: Path, after: Path) -> dict:
             result[label + "_delivery"] = _verify_delivery(root)
         except (AssertionError, ValueError, OSError, KeyError) as error:
             result["failures"].append({"bundle": label, "error": str(error)})
+    if "before_delivery" in result and "after_delivery" in result:
+        if result["before_delivery"]["member_names"] != result["after_delivery"]["member_names"]:
+            result["failures"].append({"delivery_members": "Package member inventories differ"})
+        if (_normalized(result["before_delivery"]["semantic_receipt"], before)
+                != _normalized(result["after_delivery"]["semantic_receipt"], after)):
+            result["failures"].append({"delivery_metadata": "Package receipt/content semantics differ"})
     result["passed"] = not result["failures"]
     result["verification_wall_seconds"] = time.perf_counter() - started
     return result
@@ -214,6 +237,8 @@ def main():
     parser.add_argument("after", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    if util.find_spec("pypdf") is None:
+        parser.error("PDF verification requires pypdf. Use the bundled document Python runtime or install pypdf in this verification environment.")
     if args.output.exists():
         parser.error("Refusing to overwrite comparison evidence")
     result = compare(args.before, args.after)

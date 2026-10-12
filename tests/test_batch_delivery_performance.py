@@ -292,3 +292,266 @@ def test_missing_marker_cannot_promote_old_pixels_to_a_new_generation(tmp_path):
         writer.write(item)
     assert (output / "results.npz").read_bytes() == before
     assert not (output / ".bundle.commit.json").exists()
+
+
+def test_partial_resume_preserves_rich_metadata_and_full_fit_vectors(tmp_path, monkeypatch):
+    from enum import IntEnum
+    import threading
+
+    class Orientation(IntEnum):
+        TOP = 1
+
+    paths = _sources(tmp_path)
+    result = {"image": np.ones((3, 4)), "parameters": {"a": 0.4},
+              "analysis_arrays": {"fit_valid_mask": np.ones((3, 4), dtype=bool)},
+              "full2d": {"sampled_indices": np.arange(12)},
+              "qmap": {"metadata": {"orientation": Orientation.TOP}},
+              "ellipse_fit": {"a": 0.4, "residual": np.array([0.1, 0.2]), "covariance": np.eye(2),
+                              "metadata": {"enum_type": "literal", "name": "TOP", "value": 1},
+                              "orientation": Orientation.TOP}}
+    monkeypatch.setitem(globals(), "_result", lambda _: result)
+    cancel = threading.Event()
+    writer = StreamingBatchExporter(tmp_path / "bundle", analyzer_identity="fixture v1")
+
+    def analyzer(frame):
+        cancel.set()
+        return result
+
+    checkpoint = tmp_path / "checkpoint.json"
+    run = batch.run_batch(paths, analyzer, checkpoint=checkpoint, cancel_event=cancel,
+                          analyzer_identity="fixture v1", result_sink=writer.write, retain_results=False)
+    writer.finalize(run)
+    output = tmp_path / "bundle"
+    detail = json.loads((output / "frame_details.jsonl").read_text().splitlines()[0])
+    ellipse = json.loads((output / "ellipse_fit.jsonl").read_text().splitlines()[0])
+    original_load = np.load
+
+    def load(*args, **kwargs):
+        assert "analysis_arrays" not in str(getattr(args[0], "name", "")), "unneeded detector mask was materialized"
+        assert "sampled_indices" not in str(getattr(args[0], "name", "")), "unneeded full2d indices were materialized"
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(np, "load", load)
+    resumed, _ = _stream_run(paths, output, checkpoint, resume=True)
+    assert [item.resumed for item in resumed] == [True, False]
+    restored_detail = json.loads((output / "frame_details.jsonl").read_text().splitlines()[0])
+    assert restored_detail["result"] == detail["result"]
+    assert restored_detail["qmap_metadata"] == detail["qmap_metadata"]
+    restored_ellipse = json.loads((output / "ellipse_fit.jsonl").read_text().splitlines()[0])
+    for row in (ellipse, restored_ellipse):
+        row.pop("elapsed_s")
+        row.pop("resumed")
+    assert restored_ellipse == ellipse
+    with np.load(output / "results.npz", allow_pickle=False) as arrays:
+        np.testing.assert_array_equal(arrays["frame_0000__analysis_arrays__fit_valid_mask"], result["analysis_arrays"]["fit_valid_mask"])
+
+
+@pytest.mark.parametrize("revision_available", [False, True])
+def test_original_detail_mutation_during_restore_never_publishes_a_new_generation(tmp_path, monkeypatch, revision_available):
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    pixels = (output / "results.npz").read_bytes()
+    marker = (output / ".bundle.commit.json").read_bytes()
+    if not revision_available:
+        original_version = export.file_version
+        monkeypatch.setattr(export, "file_version", lambda path, info: (*original_version(path, info)[:-1], None))
+    writer = StreamingBatchExporter(output, resume=True, force=True, analyzer_identity="fixture v1")
+
+    def sink(item):
+        writer.write(item)
+        if len(writer._compact_results) == 1:
+            target = output / "frame_details.jsonl"
+            info = target.stat()
+            target.write_bytes(target.read_bytes().replace(b'"a":0.4', b'"a":0.9'))
+            os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+    run = batch.run_batch(paths, _result, checkpoint=checkpoint, resume=True, analyzer_identity="fixture v1",
+                          result_sink=sink, retain_results=False, restore_frame=writer.can_restore)
+    with pytest.raises(ValueError, match="Producing frame details changed"):
+        writer.finalize(run)
+    assert (output / "results.npz").read_bytes() == pixels
+    assert (output / ".bundle.commit.json").read_bytes() == marker
+
+
+@pytest.mark.parametrize("during_hash", [False, True])
+def test_cancelled_resume_preserves_delivered_generation_and_checkpoint_fits(tmp_path, during_hash):
+    import threading
+
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    before = {path.name: path.read_bytes() for path in output.iterdir()
+              if path.is_file() and path.name != ".wingsaxs.lock"}
+    prior = json.loads(checkpoint.read_text())
+    cancel = threading.Event()
+    if during_hash:
+        cancel.set()
+
+    def progress(update):
+        if update.get("phase") == "analyze":
+            cancel.set()
+
+    writer = StreamingBatchExporter(output, resume=True, force=True, analyzer_identity="fixture v1")
+    run = batch.run_batch(paths, lambda _: pytest.fail("canceled resume fitted a frame"),
+                          checkpoint=checkpoint, resume=True, analyzer_identity="fixture v1",
+                          result_sink=writer.write, retain_results=False, restore_frame=writer.can_restore,
+                          cancel_event=cancel, progress=progress)
+    writer.finalize(run)
+    assert run.cancelled
+    assert {path.name: path.read_bytes() for path in output.iterdir()
+            if path.is_file() and path.name != ".wingsaxs.lock"} == before
+    current = json.loads(checkpoint.read_text())
+    assert [item["result"] for item in current["frames"]] == [item["result"] for item in prior["frames"]]
+    assert all(item["status"] == "warning" for item in current["frames"])
+    resumed, _ = _stream_run(paths, output, checkpoint, resume=True)
+    assert all(item.resumed for item in resumed)
+
+
+def test_cancelled_resume_after_retry_keeps_prior_tail_and_published_arrays(tmp_path):
+    import threading
+
+    paths = _sources(tmp_path)
+    paths.append(tmp_path / "frame_2.dat")
+    paths[-1].write_bytes(b"2")
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    before = {path.name: path.read_bytes() for path in output.iterdir()
+              if path.is_file() and path.name != ".wingsaxs.lock"}
+    payload = json.loads(checkpoint.read_text())
+    payload["frames"][1].update(status="failed", error="RuntimeError: retry", traceback="injected exception")
+    checkpoint.write_text(json.dumps(payload))
+    cancel = threading.Event()
+
+    def analyzer(frame):
+        cancel.set()
+        return _result(frame)
+
+    writer = StreamingBatchExporter(output, resume=True, force=True, analyzer_identity="fixture v1")
+    run = batch.run_batch(paths, analyzer, checkpoint=checkpoint, resume=True, analyzer_identity="fixture v1",
+                          result_sink=writer.write, retain_results=False, restore_frame=writer.can_restore,
+                          cancel_event=cancel)
+    writer.finalize(run)
+    assert run.cancelled
+    assert [item.resumed for item in run] == [True, False, True]
+    assert all(item["result"] is not None for item in json.loads(checkpoint.read_text())["frames"])
+    assert {path.name: path.read_bytes() for path in output.iterdir()
+            if path.is_file() and path.name != ".wingsaxs.lock"} == before
+
+
+def test_detail_mutation_after_copy_started_is_rejected_before_publication(tmp_path, monkeypatch):
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    before = (output / "results.npz").read_bytes()
+    marker = (output / ".bundle.commit.json").read_bytes()
+    monkeypatch.setattr(export, "exporter_identity", lambda: {"writer": "regenerate"})
+    original = export._write_evolution
+
+    def changed(*args):
+        target = output / "frame_details.jsonl"
+        target.write_bytes(target.read_bytes().replace(b'"a":0.4', b'"a":0.9'))
+        return original(*args)
+
+    monkeypatch.setattr(export, "_write_evolution", changed)
+    with pytest.raises(ValueError, match="Producing frame details changed"):
+        _stream_run(paths, output, checkpoint, resume=True)
+    assert (output / "results.npz").read_bytes() == before
+    assert (output / ".bundle.commit.json").read_bytes() == marker
+
+
+def test_retained_array_copy_failure_preserves_prior_generation_and_releases_lock(tmp_path, monkeypatch):
+    import threading
+    import zipfile
+
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    cancel = threading.Event()
+    writer = StreamingBatchExporter(output, analyzer_identity="fixture v1")
+
+    def analyzer(frame):
+        cancel.set()
+        return _result(frame)
+
+    run = batch.run_batch(paths, analyzer, checkpoint=checkpoint, analyzer_identity="fixture v1",
+                          cancel_event=cancel, result_sink=writer.write, retain_results=False)
+    writer.finalize(run)
+    before = (output / "results.npz").read_bytes()
+    marker = (output / ".bundle.commit.json").read_bytes()
+    original = zipfile.ZipFile.open
+
+    def failing(archive, name, mode="r", *args, **kwargs):
+        if mode == "w" and name == "frame_0000__image.npy":
+            raise OSError("injected retained-member copy failure")
+        return original(archive, name, mode, *args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(zipfile.ZipFile, "open", failing)
+        with pytest.raises(OSError, match="retained-member copy failure"):
+            _stream_run(paths, output, checkpoint, resume=True)
+    assert (output / "results.npz").read_bytes() == before
+    assert (output / ".bundle.commit.json").read_bytes() == marker
+    with ThreadPoolExecutor() as pool:
+        assert pool.submit(_can_lock, output).result()
+    resumed, _ = _stream_run(paths, output, checkpoint, resume=True)
+    assert [item.resumed for item in resumed] == [True, False]
+
+
+def test_cancel_and_durable_progress_preserve_checkpoint_ahead_of_native_arrays(tmp_path, monkeypatch):
+    import threading
+
+    paths = _sources(tmp_path)
+    checkpoint = tmp_path / "checkpoint.json"
+    batch.run_batch(paths, _result, checkpoint=checkpoint, analyzer_identity="fixture v1")
+    before = json.loads(checkpoint.read_text())
+    snapshots = []
+    original_write = batch.write_checkpoint
+
+    def saved(path, payload):
+        snapshots.append(json.loads(json.dumps(payload)))
+        return original_write(path, payload)
+
+    monkeypatch.setattr(batch, "write_checkpoint", saved)
+    cancel = threading.Event()
+
+    def analyzer(frame):
+        cancel.set()
+        return _result(frame)
+
+    run = batch.run_batch(paths, analyzer, checkpoint=checkpoint, resume=True, analyzer_identity="fixture v1",
+                          restore_frame=lambda frame, index: False, cancel_event=cancel)
+    assert run.cancelled and run[1].status == "skipped"
+    assert len(snapshots) == 2
+    for snapshot in snapshots:
+        assert len(snapshot["frames"]) == 2
+        assert snapshot["processed_count"] == 2
+        assert [row["result"] for row in snapshot["frames"]] == [row["result"] for row in before["frames"]]
+        assert all(row["status"] == "warning" for row in snapshot["frames"])
+
+
+def test_cancelled_unbound_resume_preserves_old_files_without_promoting_them(tmp_path):
+    import threading
+
+    paths = _sources(tmp_path)
+    output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
+    _stream_run(paths, output, checkpoint)
+    (output / ".bundle.commit.json").unlink()
+    before = {path.name: path.read_bytes() for path in output.iterdir()
+              if path.is_file() and path.name != ".wingsaxs.lock"}
+    cancel = threading.Event()
+
+    def progress(update):
+        if update.get("phase") == "analyze":
+            cancel.set()
+
+    writer = StreamingBatchExporter(output, resume=True, force=True, analyzer_identity="fixture v1")
+    run = batch.run_batch(paths, lambda _: pytest.fail("canceled resume fitted a frame"),
+                          checkpoint=checkpoint, resume=True, analyzer_identity="fixture v1",
+                          result_sink=writer.write, retain_results=False, restore_frame=writer.can_restore,
+                          cancel_event=cancel, progress=progress)
+    writer.finalize(run)
+    assert run.cancelled and all(item.status == "skipped" for item in run)
+    assert not (output / ".bundle.commit.json").exists()
+    assert {path.name: path.read_bytes() for path in output.iterdir()
+            if path.is_file() and path.name != ".wingsaxs.lock"} == before
+    assert all(row["result"] is not None for row in json.loads(checkpoint.read_text())["frames"])
