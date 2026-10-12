@@ -1292,6 +1292,10 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
         payload["apparent_period_from_sector_median_nm"] = sector_measurement[
             "apparent_period_from_sector_median_nm"
         ]
+    if settings["trace_method"] == "annular_peak":
+        from .annular_measurements import summarize_annular_measurements
+
+        payload["measurement_summary"] = summarize_annular_measurements(trace)
     payload["ellipse_local"] = ellipse_local_views(trace.get("points", []), candidate)
     payload["recipe_sha256"] = hashlib.sha256(json.dumps(settings, sort_keys=True,
         ensure_ascii=True, allow_nan=False).encode()).hexdigest()

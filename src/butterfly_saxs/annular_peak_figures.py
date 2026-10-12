@@ -285,7 +285,8 @@ def _metadata(data: Mapping[str, Any], payload: Mapping[str, Any], rows: Sequenc
         "spacing_conversion_not_performed": True,
         "quadrants_are_not_synthesized": True,
         "missing_bins_are_left_blank": True,
-        "smooth_is_locator_only": True,
+        "smooth_is_locator_only": False,
+        "smooth_uses": ["peak_localisation", "angular_half_height_span"],
         "no_ellipse_fitted_or_drawn": True,
         "candidate_selection_repeated_at_export": False,
     }
@@ -438,8 +439,8 @@ def _build_profiles(payload: Mapping[str, Any], rows: Sequence[Mapping[str, Any]
     fig = Figure(figsize=(width_mm / 25.4, height_mm / 25.4), dpi=dpi, facecolor="white", edgecolor="white")
     FigureCanvasAgg(fig)
     reps, _ = _representative_rows(rows)
-    fig.suptitle("Representative annular I(χ) · raw mean + locator-only smooth" if width_mm == 183.0 else "Representative annular I(χ)\nraw mean + locator-only smooth", x=0.5, y=0.965, fontsize=7.0, linespacing=1.05)
-    legend_handles = [Line2D([0], [0], color="#555555", marker="o", markerfacecolor="none", linewidth=0.75, markersize=2.5, label="raw annular mean"), Line2D([0], [0], color="#555555", linestyle="--", linewidth=0.95, label="locator-only smooth")]
+    fig.suptitle("Representative annular I(χ) · raw mean + supported smooth" if width_mm == 183.0 else "Representative annular I(χ)\nraw mean + supported smooth", x=0.5, y=0.965, fontsize=7.0, linespacing=1.05)
+    legend_handles = [Line2D([0], [0], color="#555555", marker="o", markerfacecolor="none", linewidth=0.75, markersize=2.5, label="raw annular mean"), Line2D([0], [0], color="#555555", linestyle="--", linewidth=0.95, label="supported smooth")]
     fig.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, 0.91), frameon=False, ncol=2, fontsize=5.0, handlelength=1.3, handletextpad=0.3, columnspacing=0.7)
     if not reps:
         ax = fig.add_axes([0.18, 0.24, 0.68, 0.52])
@@ -466,7 +467,7 @@ def _build_profiles(payload: Mapping[str, Any], rows: Sequence[Mapping[str, Any]
                 ax.plot(angles, raw, color=color, linewidth=0.7, marker="o", markersize=1.4, markerfacecolor="none", label="raw annular mean")
             finite_smooth = np.isfinite(smooth)
             if finite_smooth.any():
-                ax.plot(angles, smooth, color=color, linewidth=1.0, linestyle="--", label="locator-only smooth")
+                ax.plot(angles, smooth, color=color, linewidth=1.0, linestyle="--", label="supported smooth")
             peak_x: list[float] = []
             peak_y: list[float] = []
             for peak in row["selected_peaks"]:
@@ -502,10 +503,10 @@ def _build_profiles(payload: Mapping[str, Any], rows: Sequence[Mapping[str, Any]
             for spine in ax.spines.values():
                 spine.set_linewidth(0.5)
     footer = (
-        "Raw I(χ) and locator-only smooth are copied from the result; markers = selected peaks.\n"
+        "Raw I(χ) and supported smooth are copied from the result; markers = selected peaks.\n"
         "q is an annulus coordinate; no 2π/q conversion or gap filling."
         if width_mm == 89.0
-        else "Raw I(χ) and locator-only smoothing are copied from the supplied annular result; markers are supplied selected peaks.\n"
+        else "Raw I(χ) and supported smoothing are copied from the supplied annular result; markers are supplied selected peaks.\n"
         "q is an annulus coordinate, not radial q*; no missing peaks or quadrants are filled."
     )
     fig.text(0.5, 0.045, footer, ha="center", va="center", fontsize=5.0, linespacing=1.25, color="#555555")
@@ -621,6 +622,21 @@ def _write_json(path: Path, payload: Any) -> None:
         stream.write("\n")
 
 
+def _write_measurement_csv(path: Path, rows: Sequence[Mapping[str, Any]], summary: Mapping[str, Any]) -> None:
+    """Copy direct measurements without recalculating or filling gaps."""
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    columns += ["q_unit", "reference_axis_deg"]
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            record = {**row, "q_unit": summary.get("q_unit"), "reference_axis_deg": summary.get("reference_axis_deg")}
+            writer.writerow({
+                key: safe_csv_cell(json.dumps(value, ensure_ascii=False, allow_nan=False) if isinstance(value, (list, dict)) else value)
+                for key, value in record.items()
+            })
+
+
 def _caption(metadata: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], representative_info: Sequence[Mapping[str, Any]]) -> str:
     q_range = metadata.get("q_range")
     q_text = f"[{q_range[0]:.6g}, {q_range[1]:.6g}] {metadata['q_unit']}" if q_range else f"unknown range in {metadata['q_unit']}"
@@ -632,7 +648,7 @@ def _caption(metadata: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], rep
         "The q–χ panel retains finite measured means and leaves missing support blank. At most four selected peaks per q annulus are drawn; "
         "candidate lists and rejected annuli remain in the CSV/JSON evidence, and no missing peak or quadrant is synthesized. "
         "The representative profiles use target q values 0.25, 0.40 and 0.60 when in range, otherwise the nearest effective q quantiles "
-        f"({rep_text}). Smoothing is locator-only and is copied from the supplied result. A peak q is the sampled annulus coordinate, not a radial q*; "
+        f"({rep_text}). Supplied mask-aware smoothing is used for peak localisation and angular half-height spans; raw intensity means are unchanged. A peak q is the sampled annulus coordinate, not a radial q*; "
         "no 2π/q spacing conversion, ellipse fit, or scientific acceptance is performed. Counts and coverage are support statistics, and overlapping annuli may be correlated. "
         f"The source intensity scale is {metadata['intensity_unit']} ({metadata['intensity_unit_source']})."
     )
@@ -675,6 +691,10 @@ def export_annular_peak_figures(stage: str | Path, *, data: Mapping[str, Any], r
     metadata = _metadata(data, payload, rows)
     _, representative_info = _representative_rows(rows)
     outputs = {key: stage_path / name for key, name in {"annular_qchi_svg": "annular_qchi.svg", "annular_qchi_pdf": "annular_qchi.pdf", "annular_qchi_png": "annular_qchi.png", "annular_qchi_tiff": "annular_qchi.tiff", "annular_profiles_svg": "annular_profiles.svg", "annular_profiles_pdf": "annular_profiles.pdf", "annular_profiles_png": "annular_profiles.png", "annular_profiles_tiff": "annular_profiles.tiff", "annular_profiles_csv": "annular_profiles.csv", "annular_peaks_csv": "annular_peaks.csv", "annular_profiles_npz": "annular_profiles.npz", "annular_caption": "annular_caption.txt", "annular_manifest": "annular_manifest.json"}.items()}
+    direct = result.get("measurement_summary")
+    direct_tables = {"annular_measurements": "rows", "annular_opposite_pairs": "opposite_pairs", "annular_trajectories": "trajectories"}
+    if isinstance(direct, Mapping) and direct.get("method_version") == "annular-direct-measurements-v1":
+        outputs.update({f"{name}_csv": stage_path / f"{name}.csv" for name in direct_tables})
     existing = next((path for path in outputs.values() if path.exists()), None)
     if existing is not None:
         raise FileExistsError(f"annular figure output already exists in stage: {existing.name}")
@@ -697,6 +717,9 @@ def export_annular_peak_figures(stage: str | Path, *, data: Mapping[str, Any], r
     _write_profiles_csv(outputs["annular_profiles_csv"], rows, metadata)
     _write_peaks_csv(outputs["annular_peaks_csv"], rows, metadata)
     _write_npz(outputs["annular_profiles_npz"], payload, rows, metadata)
+    for name, key in direct_tables.items():
+        if f"{name}_csv" in outputs:
+            _write_measurement_csv(outputs[f"{name}_csv"], direct.get(key, []), direct)
     outputs["annular_caption"].write_text(_caption(metadata, rows, representative_info) + "\n", encoding="utf-8", newline="\n")
     for path in outputs.values():
         if path.parent != stage_path:

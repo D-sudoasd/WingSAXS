@@ -41,6 +41,39 @@ def test_annuli_trace_four_extended_petals_instead_of_radial_peak_positions():
     assert len(result["diagnostics"]["outer_window_accepted_sides"]) >= 2
 
 
+def test_trace_exports_direct_measurements_without_geometry_evaluation():
+    image, qmap, _ = _curved_petals()
+    result = analyze_butterfly(image, qmap, (.25, .75), options={
+        "trace_method": "annular_peak", "annular_radial_bins": 20,
+        "stage": "trace", "resamples": 0, "sensitivity": False,
+    })
+    assert result["candidate_fit"]["success"] is False
+    summary = result["measurement_summary"]
+    assert summary["ellipse_required"] is False
+    assert sum(row["status"] == "observed" for row in summary["rows"]) >= 72
+    assert len(summary["trajectories"]) == 4
+    assert "q_star" not in summary
+
+
+def test_pipeline_preserves_direct_measurements_as_strict_json():
+    import json
+
+    from butterfly_saxs.pipeline import analyze_frame
+
+    image, qmap, _ = _curved_petals()
+    result = analyze_frame(image, qmap=qmap, config={"analysis": {
+        "q_min": .25, "q_max": .75, "ridge_method": "butterfly_curvature",
+        "butterfly": {"trace_method": "annular_peak", "annular_radial_bins": 20,
+                      "stage": "trace", "resamples": 0, "sensitivity": False},
+    }})
+    payload = json.loads(json.dumps(result.to_mapping(), allow_nan=False))
+    summary = payload["observables"]["butterfly"]["measurement_summary"]
+    assert summary["q_unit"] == "nm^-1"
+    assert summary["ellipse_required"] is False
+    assert sum(row["status"] == "observed" for row in summary["rows"]) >= 72
+    assert all("q_star" not in row and "Ln_nm" not in row for row in summary["rows"])
+
+
 def test_missing_lobe_and_masked_ring_are_not_synthesized_or_bridged():
     image, qmap, chi = _curved_petals()
     q = qmap["q"]

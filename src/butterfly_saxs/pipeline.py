@@ -685,6 +685,13 @@ def _read_frame_bundle(
         data = source if isinstance(source, np.ndarray) else getattr(source, "data")
         image = _coerce_array(data)
         metadata = dict(getattr(source, "metadata", {}) or {})
+        source_path = getattr(source, "path", None) or getattr(source, "source", None)
+        if isinstance(source_path, (str, os.PathLike)):
+            metadata.setdefault("path", os.fspath(source_path))
+        for selector in ("frame", "dataset"):
+            value = getattr(source, selector, None)
+            if value is not None:
+                metadata.setdefault(selector, value)
         source_valid = [
             getattr(source, key, None)
             for key in ("valid_mask", "valid")

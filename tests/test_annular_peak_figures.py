@@ -129,8 +129,15 @@ def test_annular_narrow_layout_stays_contained_at_export_dpi() -> None:
 
 def test_annular_export_roundtrips_raw_arrays_and_selected_candidates(tmp_path: Path) -> None:
     result = _result()
-    original_raw = np.asarray([row["raw_mean"] for row in result["annuli"]], dtype=float)
-    original_angles = np.asarray(result["angle_centers_deg"], dtype=float).copy()
+    result = {"annular_peaks": result, "measurement_summary": {
+        "method_version": "annular-direct-measurements-v1", "q_unit": "nm^-1", "reference_axis_deg": 0.0,
+        "rows": [{"quadrant": "QI", "status": "missing", "chi_deg": None}],
+        "opposite_pairs": [{"status": "missing_counterpart", "opposition_error_deg": None}],
+        "trajectories": [{"quadrant": "QI", "n_observed_annuli": 0}],
+    }}
+    annular = result["annular_peaks"]
+    original_raw = np.asarray([row["raw_mean"] for row in annular["annuli"]], dtype=float)
+    original_angles = np.asarray(annular["angle_centers_deg"], dtype=float).copy()
     output, metadata = export_annular_peak_figures(
         tmp_path,
         data={
@@ -145,10 +152,14 @@ def test_annular_export_roundtrips_raw_arrays_and_selected_candidates(tmp_path: 
     assert metadata["selected_peak_count"] == 12
     with np.load(output["annular_profiles_npz"], allow_pickle=False) as arrays:
         np.testing.assert_array_equal(arrays["raw_mean"], original_raw)
-        np.testing.assert_array_equal(arrays["q_edges"], result["q_edges"])
+        np.testing.assert_array_equal(arrays["q_edges"], annular["q_edges"])
         assert arrays["q_unit"].item() == "nm^-1"
-    np.testing.assert_array_equal(result["angle_centers_deg"], original_angles)
-    np.testing.assert_array_equal(result["annuli"][0]["raw_mean"], original_raw[0])
+    np.testing.assert_array_equal(annular["angle_centers_deg"], original_angles)
+    np.testing.assert_array_equal(annular["annuli"][0]["raw_mean"], original_raw[0])
+    with output["annular_measurements_csv"].open(encoding="utf-8-sig", newline="") as stream:
+        direct_rows = list(csv.DictReader(stream))
+    assert direct_rows[0]["status"] == "missing" and direct_rows[0]["chi_deg"] == ""
+    assert direct_rows[0]["q_unit"] == "nm^-1"
     with output["annular_profiles_csv"].open(encoding="utf-8-sig", newline="") as stream:
         profile_rows = list(csv.DictReader(stream))
     assert len(profile_rows) == 6 * 4
@@ -162,12 +173,66 @@ def test_annular_export_roundtrips_raw_arrays_and_selected_candidates(tmp_path: 
     assert sum(row["record_type"] == "selected" for row in peak_rows) == 12
     assert sum(row["record_type"] == "candidate" for row in peak_rows) == 6
     manifest = json.loads(output["annular_manifest"].read_text(encoding="utf-8"))
+    for name in ("annular_measurements", "annular_opposite_pairs", "annular_trajectories"):
+        assert f"{name}.csv" in manifest["sha256"]
     for name, digest in manifest["sha256"].items():
         assert hashlib.sha256((tmp_path / name).read_bytes()).hexdigest() == digest
     caption = output["annular_caption"].read_text(encoding="utf-8")
     assert "annulus coordinate" in caption
     assert "2π/q" in caption
     assert "ellipse fit" in caption
+
+
+def test_public_butterfly_figure_bundle_includes_direct_measurement_tables(tmp_path: Path) -> None:
+    from butterfly_saxs.butterfly_figure import export_butterfly_figure
+
+    qx, qy = np.meshgrid(np.linspace(-0.9, 0.9, 12), np.linspace(-0.9, 0.9, 12))
+    result = {"annular_peaks": _result(), "points": [], "arcs": [], "measurement_status": "traced",
+              "measurement_summary": {
+                  "method_version": "annular-direct-measurements-v1", "q_unit": "nm^-1",
+                  "reference_axis_deg": 0.0,
+                  "rows": [{"status": "missing", "chi_deg": None}],
+                  "opposite_pairs": [{"status": "missing_counterpart"}],
+                  "trajectories": [{"n_observed_annuli": 0}],
+              }}
+    output = export_butterfly_figure(tmp_path / "figure", observed=np.ones(qx.shape), qx=qx, qy=qy,
+                                    q_unit="nm^-1", result=result, dpi=120)
+    for name in ("annular_measurements", "annular_opposite_pairs", "annular_trajectories"):
+        assert output[f"{name}_csv"].is_file()
+    with output["annular_measurements_csv"].open(encoding="utf-8-sig", newline="") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["status"] == "missing" and row["chi_deg"] == ""
+
+
+@pytest.mark.parametrize("name", ["annular_measurements", "annular_opposite_pairs", "annular_trajectories"])
+def test_direct_measurement_tables_respect_existing_output(tmp_path: Path, name: str) -> None:
+    protected = tmp_path / f"{name}.csv"
+    protected.write_text("preserved evidence", encoding="utf-8")
+    result = {"annular_peaks": _result(), "measurement_summary": {
+        "method_version": "annular-direct-measurements-v1",
+        "rows": [], "opposite_pairs": [], "trajectories": [],
+    }}
+    with pytest.raises(FileExistsError):
+        export_annular_peak_figures(tmp_path, data={"dpi": 120}, result=result)
+    assert protected.read_text(encoding="utf-8") == "preserved evidence"
+    assert list(tmp_path.iterdir()) == [protected]
+
+
+def test_direct_measurement_csv_keeps_missing_values_and_sanitizes_text(tmp_path: Path) -> None:
+    from butterfly_saxs.annular_peak_figures import _write_measurement_csv
+
+    path = tmp_path / "direct.csv"
+    _write_measurement_csv(path, [{
+        "point_id": "=UNTRUSTED()", "chi_deg": None,
+        "flags": ["angular_half_height_crossings_unavailable"],
+    }], {"q_unit": "pixel-q", "reference_axis_deg": 15.0})
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["point_id"] == "'=UNTRUSTED()"
+    assert row["chi_deg"] == ""
+    assert json.loads(row["flags"]) == ["angular_half_height_crossings_unavailable"]
+    assert row["q_unit"] == "pixel-q"
+    assert float(row["reference_axis_deg"]) == 15.0
 
 
 def test_annular_export_preserves_candidate_text_and_does_not_reselect(tmp_path: Path) -> None:

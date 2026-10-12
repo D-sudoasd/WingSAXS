@@ -950,6 +950,19 @@ def _lobe_angular(value: Any) -> Any:
     return _value(observables, "lobes", "lobe_metrics", "angular_lobes", default=None)
 
 
+def _butterfly_evidence(value: Any) -> Any:
+    """Return direct or nested butterfly evidence, preferring a valid mapping."""
+
+    direct = _value(value, "butterfly", default=None)
+    if isinstance(direct, Mapping) and direct:
+        return direct
+    observables = _value(value, "observables", default=None)
+    nested = _value(observables, "butterfly", default=None)
+    if isinstance(nested, Mapping):
+        return nested
+    return direct if direct is not None else nested if nested is not None else {}
+
+
 def _angle_pair(value: Any, angle_deg: Any = None) -> tuple[float | None, float | None]:
     """Normalize one observed angle to the paired radian/degree fields."""
 
@@ -1040,9 +1053,7 @@ def _lobe_measurement_rows(item: FrameFitResult, index: int) -> list[dict[str, A
                 "flags": _json_text(_value(peak, "flags", default=())),
             }
         )
-    butterfly = _value(item.result, "butterfly", default=None)
-    if not isinstance(butterfly, Mapping):
-        butterfly = _value(_value(item.result, "observables", default={}), "butterfly", default={})
+    butterfly = _butterfly_evidence(item.result)
     landmarks = butterfly.get("peak_landmarks", {}) if isinstance(butterfly, Mapping) else {}
     if isinstance(landmarks, Mapping):
         raw = landmarks.get("raw_global_max")
@@ -1089,6 +1100,24 @@ def _fit_audit(value: Any) -> dict[str, Any]:
         if _value(source, name, default=None) is not None
     }
     return result
+
+
+def _batch_ellipse_row(item: FrameFitResult, index: int) -> dict[str, Any]:
+    """Build one shared compact ellipse/butterfly sidecar row."""
+
+    from .pipeline import _jsonable
+
+    butterfly = _jsonable(_butterfly_evidence(item.result), array_summary=True)
+    return {
+        **_frame_base(item, index),
+        "ellipse_fit": _json_safe(_ellipse_fit(item.result)),
+        "fit_audit": _json_safe(_fit_audit(item.result)),
+        "lobe_angular": _json_safe(_lobe_angular(item.result)),
+        "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
+        "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
+        "peak_landmarks": _json_safe(_value(butterfly, "peak_landmarks", default={})),
+        "butterfly": _json_safe(butterfly),
+    }
 
 
 def _walk_arrays(
@@ -1686,17 +1715,7 @@ class StreamingBatchExporter:
             self._writers["lobe_measurements"].writerow(
                 {key: _scalar(row.get(key, "")) for key in self._LOBE_COLUMNS}
             )
-        self._ellipse_rows.append(
-            {
-                **base,
-                "ellipse_fit": _json_safe(_ellipse_fit(item.result)),
-                "fit_audit": _json_safe(_fit_audit(item.result)),
-                "lobe_angular": _json_safe(_lobe_angular(item.result)),
-                "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
-                "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
-                "peak_landmarks": _json_safe(_value(_value(item.result, "butterfly", default={}), "peak_landmarks", default={})),
-            }
-        )
+        self._ellipse_rows.append(_batch_ellipse_row(item, index))
         array_prefix = f"frame_{index:04d}"
         arrays: dict[str, Any] = {}
         _walk_arrays(item.result, array_prefix, arrays)
@@ -2222,17 +2241,9 @@ def export_batch(
         lobe_rows.extend(_lobe_measurement_rows(item, index))
     _write_csv(lobe_measurements, lobe_rows, columns=StreamingBatchExporter._LOBE_COLUMNS)
 
-    ellipse_rows = []
-    for index, item in enumerate(results):
-        ellipse_rows.append({
-            **_frame_base(item, index),
-            "ellipse_fit": _json_safe(_ellipse_fit(item.result)),
-            "fit_audit": _json_safe(_fit_audit(item.result)),
-            "lobe_angular": _json_safe(_lobe_angular(item.result)),
-            "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
-            "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
-            "peak_landmarks": _json_safe(_value(_value(item.result, "butterfly", default={}), "peak_landmarks", default={})),
-        })
+    ellipse_rows = [
+        _batch_ellipse_row(item, index) for index, item in enumerate(results)
+    ]
     ellipse_fit.write_text(
         json.dumps({"frames": ellipse_rows}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",

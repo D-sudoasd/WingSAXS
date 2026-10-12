@@ -1012,7 +1012,7 @@ def export_butterfly_figure(
             annular_outputs, annular_metadata = export_annular_peak_figures(
                 stage, data={"q_unit": data["q_unit"], "context": data["context"],
                              "width_mm": data["width_mm"], "dpi": data["dpi"]},
-                result=result["annular_peaks"], cancel_event=cancel_event,
+                result=result, cancel_event=cancel_event,
             )
             figure_settings["annular_peaks"] = annular_metadata
         figure_settings["comparison"] = comparison_metadata
