@@ -67,6 +67,11 @@ def _worker(args: argparse.Namespace) -> int:
     from butterfly_saxs import lamellar_report_figures, report_figures, report_measurements
     from butterfly_saxs.cli import main
 
+    if args.disable_native_reuse:
+        # Timing control only: regenerate from the same verified fits with
+        # the same producer identity and every scientific output retained.
+        export.StreamingBatchExporter._reuse_completed_bundle = lambda self, result: False
+
     if args.hard_stop_after is not None:
         original_checkpoint = batch.write_checkpoint
 
@@ -176,6 +181,8 @@ def _worker(args: argparse.Namespace) -> int:
                    "manifest_sha256": _digest(args.manifest), "config_sha256": _digest(args.config),
                    "source": str(args.source.resolve()), "resume": args.resume, "profiled": args.profile,
                    "revision_label": args.revision, "stop_after_frames": args.stop_after,
+                   "disable_native_reuse": args.disable_native_reuse,
+                   "benchmark_driver_sha256": _digest(Path(__file__).resolve()),
                    "source_sha256": {str(path.relative_to(args.source / "src")): _digest(path)
                                      for path in sorted((args.source / "src").rglob("*.py"))},
                    "thread_environment": {name: os.environ.get(name) for name in (
@@ -192,6 +199,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--unattended", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--disable-native-reuse", action="store_true",
+                        help="Benchmark control only: regenerate native sidecars from verified fits instead of retaining the complete bundle")
     parser.add_argument("--profile", action="store_true", help="Diagnostic only; do not compare to an unprofiled run")
     parser.add_argument("--revision", help="Descriptive revision label; actual source hashes are also recorded")
     parser.add_argument("--label", default="", help="Optional suffix to retain repeated resume measurements")
