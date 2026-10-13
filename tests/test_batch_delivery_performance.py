@@ -48,6 +48,40 @@ def test_checkpoint_does_not_expand_detector_arrays_before_omitting_them(tmp_pat
     assert record["min"] == 0. and record["max"] == 11.
 
 
+def test_checkpoint_preserves_restart_precision_and_nested_metadata(tmp_path):
+    finite = [np.nextafter(1., 2.), np.finfo(float).tiny, -0., np.finfo(float).max]
+    target = tmp_path / "checkpoint.json"
+    batch.write_checkpoint(target, {
+        "frame_id": "实测帧", "source": tmp_path / "source.h5",
+        "result": {"profile": np.array([*finite, np.nan, np.inf]),
+                   "flags": ["missing_support"], "candidate": None},
+    })
+    record = batch.read_checkpoint(target)
+    assert record["frame_id"] == "实测帧"
+    assert record["source"] == str(tmp_path / "source.h5")
+    assert record["result"]["flags"] == ["missing_support"]
+    assert record["result"]["candidate"] is None
+    actual = record["result"]["profile"]
+    assert [value.hex() for value in actual[:4]] == [float(value).hex() for value in finite]
+    assert actual[4:] == [None, None]
+
+
+@pytest.mark.parametrize("failure_point", ["fsync", "replace"])
+def test_checkpoint_write_failure_keeps_prior_durable_state(tmp_path, monkeypatch, failure_point):
+    target = tmp_path / "checkpoint.json"
+    batch.write_checkpoint(target, {"processed_count": 60, "frames": [{"status": "warning"}]})
+    before = target.read_bytes()
+
+    def fail(*args):
+        raise OSError("injected checkpoint I/O failure")
+
+    monkeypatch.setattr(batch.os, failure_point, fail)
+    with pytest.raises(OSError, match="injected checkpoint I/O failure"):
+        batch.write_checkpoint(target, {"processed_count": 61, "frames": [{"status": "ok"}]})
+    assert target.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [target]
+
+
 def test_noop_stream_resume_preserves_verified_artifacts_including_warnings(tmp_path):
     paths = _sources(tmp_path)
     output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"

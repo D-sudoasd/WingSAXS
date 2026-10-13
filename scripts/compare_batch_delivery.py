@@ -21,6 +21,19 @@ from PIL import Image
 _OPERATIONAL = {"created_at", "updated_at", "elapsed_s", "resumed", "generation",
                 "producer_identity", "checkpoint_frame_sha256", "source_state",
                 "artifact_sha256", "receipt_sha256", "exporter_identity"}
+_BUNDLE_COMMIT_ARTIFACTS = {
+    "ellipse_fit": "ellipse_fit.json",
+    "ellipse_fit_jsonl": "ellipse_fit.jsonl",
+    "evolution_png": "evolution.png",
+    "frame_details": "frame_details.jsonl",
+    "frame_summary": "frame_summary.csv",
+    "lobe_measurements": "lobe_measurements.csv",
+    "manifest": "manifest.json",
+    "npz": "results.npz",
+    "parameters_long": "parameters_long.csv",
+    "provenance": "provenance.json",
+    "ridge_points": "ridge_points.csv",
+}
 
 
 def _digest(path):
@@ -108,6 +121,7 @@ def _verify_delivery(root):
         names = archive.namelist()
         assert len(names) == len(set(names)), "duplicate ZIP member"
         assert set(names) == set(receipt["files"]) | {"delivery_index.html", "delivery_contents.json"}
+        verified_files = {}
         for name in names:
             with archive.open(name) as handle:
                 # Streaming to EOF validates CRC as well as the member SHA.
@@ -118,29 +132,60 @@ def _verify_delivery(root):
             elif name != "delivery_contents.json":
                 assert digest == receipt["files"][name]["sha256"], f"member SHA differs: {name}"
                 assert _digest(root / name) == digest, f"published source differs: {name}"
+                verified_files[name] = digest
         contents = json.loads(archive.read("delivery_contents.json"))
         assert contents["files"] == receipt["files"]
         assert contents["source_signature"] == receipt["source_signature"]
         for key, value in contents.items():
             if key not in {"files", "source_signature"}:
                 assert value == receipt.get(key), f"embedded delivery metadata differs: {key}"
+
+    # The native bundle commit marker is deliberately hidden from the public
+    # delivery inventory. Validate its small proof separately and bind every
+    # declared artifact to both the package receipt and the source SHA already
+    # checked above (including the large NPZ, without hashing it a second time).
+    marker_path = root / ".bundle.commit.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert isinstance(marker, dict), "native bundle commit marker must be an object"
+    assert marker.get("schema_version") == "lamellarsaxs2d.bundle_commit.v1", "unsupported native bundle commit marker"
+    assert marker.get("complete") is True, "native bundle commit marker is incomplete"
+    artifacts = marker.get("artifacts")
+    assert isinstance(artifacts, dict), "native bundle commit artifacts must be an object"
+    assert set(artifacts) == set(_BUNDLE_COMMIT_ARTIFACTS), "native bundle commit artifact inventory differs"
+    verified_artifacts = {}
+    for key, expected_name in _BUNDLE_COMMIT_ARTIFACTS.items():
+        entry = artifacts[key]
+        assert isinstance(entry, dict) and set(entry) == {"name", "sha256"}, f"invalid native artifact proof: {key}"
+        name, digest = entry["name"], entry["sha256"]
+        # Fixed schema-v1 artifact names reject absolute paths, traversal and
+        # other path aliases before consulting receipt/source inventories.
+        assert name == expected_name, f"invalid native artifact path: {key}"
+        assert isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest), f"invalid native artifact SHA: {key}"
+        assert name in receipt["files"], f"native artifact is absent from delivery receipt: {name}"
+        assert name in verified_files, f"native artifact was not verified in the package: {name}"
+        assert digest == receipt["files"][name]["sha256"] == verified_files[name], f"native artifact SHA differs: {name}"
+        verified_artifacts[key] = {"name": name, "sha256": digest}
+
     semantic = {key: value for key, value in receipt.items()
                 if key not in {"files", "archive", "source_signature", "index_sha256"}}
     semantic["archive"] = {key: value for key, value in receipt["archive"].items()
                            if key not in {"sha256", "bytes", "source_signature"}}
     return {"members": len(names), "member_names": sorted(names),
             "bytes": path.stat().st_size, "sha256": receipt["archive"]["sha256"],
-            "counts": receipt["counts"], "dependencies": receipt["dependencies"], "semantic_receipt": semantic}
+            "counts": receipt["counts"], "dependencies": receipt["dependencies"], "semantic_receipt": semantic,
+            "native_commit": {"schema_version": marker["schema_version"], "complete": True,
+                              "marker_sha256": _digest(marker_path), "artifacts": verified_artifacts}}
 
 
-def compare(before: Path, after: Path) -> dict:
+def compare(before: Path, after: Path, *, allow_overview_legend_changes: bool = False) -> dict:
     before, after = before.resolve(), after.resolve()
     started = time.perf_counter()
     result = {"passed": True, "before": str(before), "after": str(after), "failures": [],
               "operational_fields_excluded": sorted(_OPERATIONAL), "arrays": 0, "array_values": 0,
               "maximum_absolute_error": 0.0, "csv_rows": 0, "json_records": 0,
               "diagnostic_timing_values_excluded": 0,
-              "png_identical": 0, "png_legend_changes": [], "vector_figures": 0}
+              "png_identical": 0, "png_legend_changes": [],
+              "overview_legend_changes_allowed": bool(allow_overview_legend_changes), "vector_figures": 0}
     result["vector_check"] = "SVG geometry/text/embedded rasters; PDF decoded commands/resources/fonts/images/pages"
     result["comparison_script_sha256"] = _digest(Path(__file__))
     result["python"] = sys.version
@@ -178,7 +223,10 @@ def compare(before: Path, after: Path) -> dict:
                                 and x.get("field", "").endswith((".diagnostics.elapsed_s", ".trace_diagnostics.elapsed_s"))):
                             x["value"] = y["value"] = "<EXECUTION_SECONDS>"
                             result["diagnostic_timing_values_excluded"] += 1
-                        assert _normalized(x, before) == _normalized(y, after), f"CSV row {index} differs"
+                        # Most long-table rows are already identical. Avoid
+                        # recursively copying every cell in multi-million-row
+                        # full batches; differing rows retain the same checks.
+                        assert x == y or _normalized(x, before) == _normalized(y, after), f"CSV row {index} differs"
                         result["csv_rows"] += 1
             elif left.suffix in {".json", ".jsonl"}:
                 with left.open(encoding="utf-8") as a, right.open(encoding="utf-8") as b:
@@ -203,6 +251,7 @@ def compare(before: Path, after: Path) -> dict:
                 else:
                     assert name.endswith("_overview.png"), "unexpected image pixel change"
                     result["png_legend_changes"].append(name)
+                    assert allow_overview_legend_changes, "overview image pixel changes are disabled"
             elif left.suffix in {".svg", ".pdf"}:
                 reader = _svg_contents if left.suffix == ".svg" else _pdf_contents
                 try:
@@ -236,12 +285,14 @@ def main():
     parser.add_argument("before", type=Path)
     parser.add_argument("after", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--allow-overview-legend-changes", action="store_true",
+                        help="Diagnostic only: allow pixel changes in overview PNGs while recording them in the receipt")
     args = parser.parse_args()
     if util.find_spec("pypdf") is None:
         parser.error("PDF verification requires pypdf. Use the bundled document Python runtime or install pypdf in this verification environment.")
     if args.output.exists():
         parser.error("Refusing to overwrite comparison evidence")
-    result = compare(args.before, args.after)
+    result = compare(args.before, args.after, allow_overview_legend_changes=args.allow_overview_legend_changes)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: result[key] for key in ("passed", "files", "arrays", "csv_rows", "failures", "verification_wall_seconds")}))
     return 0 if result["passed"] else 1
