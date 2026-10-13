@@ -588,4 +588,3 @@ def test_interleaved_resume_compresses_each_new_member_once_and_keeps_all_keys(t
             np.testing.assert_array_equal(archive[f"frame_{index:04d}__image"], np.ones((3, 4)))
         assert json.loads(str(archive["__metadata__"]))["arrays"] == [
             "frame_0000__image", "frame_0002__image", "frame_0001__image"]
-
