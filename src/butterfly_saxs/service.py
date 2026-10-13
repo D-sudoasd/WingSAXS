@@ -2595,11 +2595,13 @@ class ButterflyAnalysisService:
                     or payload_mapping.get("resume", False)
                 ),
                 resume=bool(payload_mapping.get("resume", False)),
+                analyzer_identity="butterfly_saxs.service.ButterflyAnalysisService.batch",
             )
         try:
             run = run_batch(
                 frames,
                 analyze_with_state,
+                analyzer_identity="butterfly_saxs.service.ButterflyAnalysisService.batch",
                 mode=mode,
                 config={
                 "parameters": specs,
@@ -2652,6 +2654,7 @@ class ButterflyAnalysisService:
                 progress=payload_mapping.get("progress"),
                 result_sink=None if stream_writer is None else stream_writer.write,
                 retain_results=stream_writer is None,
+                restore_frame=None if stream_writer is None else stream_writer.can_restore,
             )
             if stream_writer is not None:
                 outputs = {
@@ -2660,7 +2663,7 @@ class ButterflyAnalysisService:
                 }
             else:
                 outputs = {}
-        except Exception:
+        except BaseException:
             if stream_writer is not None:
                 stream_writer.abort()
             raise

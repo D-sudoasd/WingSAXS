@@ -1466,3 +1466,17 @@ def test_evolution_plot_uses_separate_panels_for_different_units(tmp_path: Path)
 
     image = imread(outputs["evolution_png"])
     assert image.shape[0] > 800
+
+
+@pytest.mark.parametrize("missing", [None, "", float("nan"), float("inf")])
+def test_missing_axis_ratio_does_not_abort_weak_frame_export(tmp_path: Path, missing) -> None:
+    result = {
+        "parameters": {"eccentricity": None, "ellipticity": None},
+        "ellipse_fit": {"quantitative_parameters": {
+            "axis_ratio": {"status": "undetermined", "value": missing, "candidate_value": missing},
+        }},
+    }
+    rows = _parameters(result)
+    assert {row["parameter"] for row in rows} == {"eccentricity", "ellipticity"}
+    assert all(row["value"] == "" and row["candidate_value"] == "" for row in rows)
+    export_batch([FrameFitResult(FrameRef("weak.tif"), result, status="warning")], tmp_path / "bundle")

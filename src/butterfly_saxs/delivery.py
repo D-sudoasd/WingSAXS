@@ -19,6 +19,7 @@ import zipfile
 
 from .csv_utils import iter_csv_rows
 from .delivery_dependencies import collect_html_dependencies, local_path_problem
+from .output_lock import output_lock
 
 SCHEMA = "wingsaxs.delivery.v1"
 _ARTIFACTS = {
@@ -206,8 +207,8 @@ def _render(report: Mapping[str, Any]) -> str:
             f'{dependency_notice}<nav><ul>{"".join(navigation)}</ul></nav>{"".join(sections)}</html>\n')
 
 
-def package_batch(
-    root: str | os.PathLike[str],
+def _package_batch_locked(
+    root: Path,
     *,
     archive: bool = True,
     resume: bool = False,
@@ -221,9 +222,6 @@ def package_batch(
     dependencies inside the output root. Raw inputs and unrelated siblings
     are not swept into the archive. Resume rebuilds only changed delivery files.
     """
-    root = Path(root).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"batch output directory does not exist: {root}")
     targets = [root / _INDEX, root / _SUMMARY] + ([root / _ARCHIVE] if archive else [])
     if not (resume or force) and any(path.exists() for path in targets):
         raise FileExistsError("Delivery already exists; use --resume to finish/reuse it, or --force to rebuild.")
@@ -410,3 +408,21 @@ def package_batch(
             return report
     _write_if_changed(root / _SUMMARY, _json(persisted))
     return report
+
+
+def package_batch(
+    root: str | os.PathLike[str],
+    *,
+    archive: bool = True,
+    resume: bool = False,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Finish delivery while exclusively owning its output directory."""
+    resolved = Path(root).expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"batch output directory does not exist: {resolved}")
+    with output_lock(resolved):
+        return _package_batch_locked(
+            resolved, archive=archive, resume=resume, force=force, progress=progress
+        )

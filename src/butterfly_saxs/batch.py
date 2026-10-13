@@ -20,8 +20,9 @@ import traceback as traceback_module
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, ParamSpec, TypeVar
 
 from .cancellation import AnalysisCancelled
 from .csv_utils import read_csv_rows
@@ -1816,7 +1817,7 @@ class FrameFitResult:
             return value.get("parameters", value.get("params", value))
         return getattr(value, "parameters", getattr(value, "params", None))
 
-    def to_record(self) -> dict[str, Any]:
+    def to_record(self, *, include_result: bool = True) -> dict[str, Any]:
         return {
             "frame": self.frame.to_dict(),
             "status": self.status,
@@ -1826,7 +1827,7 @@ class FrameFitResult:
             "warm_start_from": self.warm_start_from,
             "elapsed_s": self.elapsed_s,
             "resumed": self.resumed,
-            "result": _json_safe(self.result),
+            "result": _json_safe(self.result) if include_result else None,
         }
 
     @classmethod
@@ -1859,6 +1860,7 @@ class BatchRunResult:
     total_count: int = 0
     selection: Mapping[str, Any] = field(default_factory=dict)
     resolved_config: Any = None
+    producer_identity: Any = None
 
     # Sequence behaviour makes this object drop-in compatible with the early
     # prototype API, which returned ``list[FrameFitResult]``.
@@ -1983,7 +1985,7 @@ def _checkpoint_payload(
 ) -> dict[str, Any]:
     frame_records: list[dict[str, Any]] = []
     for item in run.frame_results:
-        record = item.to_record()
+        record = item.to_record(include_result=False)
         safe_result = _checkpoint_safe(item.result)
         if isinstance(safe_result, Mapping):
             safe_result = dict(safe_result)
@@ -1998,14 +2000,16 @@ def _checkpoint_payload(
                 safe_result["parameters"] = _checkpoint_safe(parameters)
         record["result"] = safe_result
         frame_records.append(record)
+    config_files = _config_with_file_fingerprints(config)
     return {
         "version": 1,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "mode": run.mode,
         "input_hash": run.input_hash,
         "config_hash": run.config_hash,
-        "config": _config_with_file_fingerprints(config),
-        "config_file_fingerprints": _config_with_file_fingerprints(config),
+        "producer_identity": run.producer_identity,
+        "config": config_files,
+        "config_file_fingerprints": config_files,
         "selection": _json_safe(run.selection),
         "cancelled": bool(run.cancelled),
         "processed_count": int(run.processed_count),
@@ -2028,7 +2032,7 @@ def write_checkpoint(path: str | os.PathLike[str], payload: Mapping[str, Any]) -
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(_json_safe(payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -2050,6 +2054,24 @@ def read_checkpoint(path: str | os.PathLike[str]) -> dict[str, Any]:
     return value
 
 
+_Call = ParamSpec("_Call")
+_Return = TypeVar("_Return")
+
+
+def _checkpoint_locked(function: Callable[_Call, _Return]) -> Callable[_Call, _Return]:
+    @wraps(function)
+    def locked(*args: _Call.args, **kwargs: _Call.kwargs) -> _Return:
+        checkpoint = kwargs.get("checkpoint_path") or kwargs.get("checkpoint")
+        if checkpoint is None:
+            return function(*args, **kwargs)
+        from .output_lock import output_lock
+
+        with output_lock(Path(checkpoint).parent, create=True):
+            return function(*args, **kwargs)
+    return locked
+
+
+@_checkpoint_locked
 def run_batch(
     frames: Iterable[Any] | Any = (),
     analyze_frame: Callable[..., Any] | None = None,
@@ -2072,8 +2094,20 @@ def run_batch(
     on_progress: Callable[[Mapping[str, Any]], Any] | None = None,
     result_sink: Callable[[FrameFitResult], Any] | None = None,
     retain_results: bool = True,
+    analyzer_identity: Any = None,
+    restore_frame: Callable[[FrameRef, int], bool] | None = None,
 ) -> BatchRunResult:
-    """Analyze a sequence of frames with failure isolation and optional resume."""
+    """Analyze a sequence of frames with failure isolation and optional resume.
+
+    ``analyzer_identity`` is stable JSON-compatible caller evidence for an
+    external analyzer (for example its source SHA and dependency versions).
+    Built-in CLI/service callers supply their entry point explicitly. With
+    None, compatibility resume remains caller-managed for the external
+    callable and whole-bundle reuse is disabled; replacing a callback alone
+    cannot establish whether its calculation is equivalent. ``restore_frame``
+    lets a streaming consumer retry a checkpointed frame whose native array
+    evidence was never published, without recomputing delivered frames.
+    """
 
     # A few callers naturally write run_batch(analyze_frame, frames).  Keep
     # that form harmlessly supported while retaining the documented order.
@@ -2142,6 +2176,9 @@ def run_batch(
     )
     callback = progress if progress is not None else on_progress
     started_batch = __import__("time").perf_counter()
+    from .producer import producer_identity
+
+    calculation_producer = {**producer_identity(), "analyzer": _json_safe(analyzer_identity)}
     # Checkpointed runs must carry content identities from the start.  A
     # resumed run repeats the same gate before comparing the stored hashes.
     require_content_hash = checkpoint_file is not None or resume
@@ -2230,6 +2267,7 @@ def run_batch(
         total_count=len(refs),
         selection=selection,
         resolved_config=config,
+        producer_identity=calculation_producer,
     )
 
     def emit_progress(index: int, item: FrameFitResult | None = None) -> None:
@@ -2262,12 +2300,17 @@ def run_batch(
     def mark_cancelled_tail(start_index: int) -> None:
         """Represent every selected but unprocessed frame in its original position."""
 
-        for frame in refs[start_index:]:
-            item = FrameFitResult(
-                frame=frame,
-                status="skipped",
-                error="analysis cancelled before frame processing",
-            )
+        for index, frame in enumerate(refs[start_index:], start_index):
+            # A cancellation does not invalidate an earlier verified fit.
+            # Keep that evidence in the checkpoint instead of replacing it
+            # with a skipped placeholder. No new analysis is started here.
+            item = restore_checkpoint_item(frame, index)
+            if item is None:
+                item = FrameFitResult(
+                    frame=frame,
+                    status="skipped",
+                    error="analysis cancelled before frame processing",
+                )
             run.frame_results.append(item)
             publish(item)
 
@@ -2282,6 +2325,11 @@ def run_batch(
             raise ValueError("checkpoint config hash mismatch; refusing resume")
         if payload.get("mode", mode) != mode:
             raise ValueError("checkpoint mode mismatch; refusing resume")
+        if payload.get("producer_identity") != calculation_producer:
+            raise ValueError(
+                "checkpoint calculation producer/dependency identity is missing or changed; "
+                "use its original software environment to resume, or choose a separate output for a new run"
+            )
         for record in payload.get("frames", []):
             if isinstance(record, Mapping):
                 frame_record = record.get("frame", record)
@@ -2298,20 +2346,9 @@ def run_batch(
                     if legacy_key is not None:
                         prior_records[str(legacy_key)] = record
 
-    previous_result: Any = None
-    previous_frame_key: str | None = None
-    for frame in refs:
-        if cancelled():
-            run.cancelled = True
-            emit_progress(len(run.frame_results), None)
-            mark_cancelled_tail(len(run.frame_results))
-            break
-        emit_progress(len(run.frame_results), None)
-        if cancelled():
-            run.cancelled = True
-            emit_progress(len(run.frame_results), None)
-            mark_cancelled_tail(len(run.frame_results))
-            break
+    def restore_checkpoint_item(
+        frame: FrameRef, frame_index: int, *, require_artifacts: bool = True
+    ) -> FrameFitResult | None:
         restored = prior_records.get(frame.key)
         # Completed frames with usable estimates restore regardless of their
         # quality assessment. Legacy ``failed`` rows may have been written by
@@ -2333,7 +2370,7 @@ def run_batch(
                 and restored.get("result") is not None
             ):
                 restore_candidate = True
-        if restore_candidate:
+        if restore_candidate and (not require_artifacts or restore_frame is None or restore_frame(frame, frame_index)):
             restored_status, restored_reason = _batch_result_status(
                 restored.get("result")
             )
@@ -2347,15 +2384,58 @@ def run_batch(
                     item.diagnostic = item.diagnostic or item.error
                     item.error = None
                 item.resumed = True
-                run.frame_results.append(item)
-                if mode == "warm_start":
-                    seed = _warm_start_seed(item.result)
-                    if seed is not None:
-                        previous_result = seed
-                        previous_frame_key = frame.key
-                publish(item)
-                emit_progress(len(run.frame_results) - 1, item)
-                continue
+                return item
+        return None
+
+    def save_checkpoint() -> None:
+        payload = _checkpoint_payload(run, refs, config=config)
+        if prior_records:
+            # A resume checkpoint may already contain successful later fits.
+            # Preserve them on every durable write, including cancellation
+            # and crashes before their native arrays have been published.
+            records = payload["frames"]
+            for index, frame in enumerate(refs):
+                if index < len(records) and records[index]["status"] != "skipped":
+                    continue
+                retained = restore_checkpoint_item(frame, index, require_artifacts=False)
+                if retained is None and index < len(records):
+                    continue
+                if retained is None:
+                    retained = FrameFitResult(frame=frame, status="skipped")
+                record = retained.to_record(include_result=False)
+                record["result"] = _checkpoint_safe(retained.result)
+                if index < len(records):
+                    records[index] = record
+                else:
+                    records.append(record)
+            payload["processed_count"] = sum(record["status"] != "skipped" for record in records)
+        write_checkpoint(checkpoint_file, payload)
+
+    previous_result: Any = None
+    previous_frame_key: str | None = None
+    for frame_index, frame in enumerate(refs):
+        if cancelled():
+            run.cancelled = True
+            emit_progress(len(run.frame_results), None)
+            mark_cancelled_tail(len(run.frame_results))
+            break
+        emit_progress(len(run.frame_results), None)
+        if cancelled():
+            run.cancelled = True
+            emit_progress(len(run.frame_results), None)
+            mark_cancelled_tail(len(run.frame_results))
+            break
+        item = restore_checkpoint_item(frame, frame_index)
+        if item is not None:
+            run.frame_results.append(item)
+            if mode == "warm_start":
+                seed = _warm_start_seed(item.result)
+                if seed is not None:
+                    previous_result = seed
+                    previous_frame_key = frame.key
+            publish(item)
+            emit_progress(len(run.frame_results) - 1, item)
+            continue
 
         initial = previous_result if mode == "warm_start" else None
         lineage = previous_frame_key if mode == "warm_start" and previous_frame_key else None
@@ -2405,15 +2485,12 @@ def run_batch(
         run.processed_count = len(run.frame_results)
         emit_progress(len(run.frame_results) - 1, item)
         if checkpoint_file is not None:
-            write_checkpoint(
-                checkpoint_file,
-                _checkpoint_payload(run, refs, config=config),
-            )
+            save_checkpoint()
 
     run.processed_count = sum(item.status != "skipped" for item in run.frame_results)
     run.elapsed_s = __import__("time").perf_counter() - started_batch
     if checkpoint_file is not None:
-        write_checkpoint(checkpoint_file, _checkpoint_payload(run, refs, config=config))
+        save_checkpoint()
     return run
 
 

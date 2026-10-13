@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 import csv
+import hashlib
 import html
 import json
 import math
@@ -24,12 +25,14 @@ import numpy as np
 
 from .csv_utils import iter_csv_rows, safe_csv_cell
 from .serialization import json_safe
+from .file_identity import file_version
+from .producer import producer_identity
 
 if TYPE_CHECKING:
     from .lamellar_models import LamellarSettings
 
 SCHEMA = "wingsaxs.analysis_report.v1"
-_VERSION = 2
+_VERSION = 3
 _SOURCE_MANIFEST_STATE_KEY = "__source_manifest__"
 
 
@@ -60,6 +63,12 @@ def _plot_parameter_rows(path: Path) -> list[dict[str, Any]]:
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(json_safe(value), ensure_ascii=False, indent=2,
                                allow_nan=False) + "\n", encoding="utf-8")
+
+
+def _receipt_seal(value: Mapping[str, Any]) -> str:
+    payload = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _same_contents(first: Path, second: Path) -> bool:
@@ -403,16 +412,31 @@ def _render_index(report: Mapping[str, Any]) -> str:
                  f'<section><h2>Sequence</h2>{sequence}</section><section><h2>Frames ({len(frames)})</h2>{"".join(frames)}</section>')
 
 
-def _source_state(folder: Path, prefix: str) -> dict[str, list[Any]]:
-    state: dict[str, list[Any]] = {name: [path.stat().st_size, path.stat().st_mtime_ns] for name in (
+def _content_state(path: Path, verified: dict[Path, tuple[Any, list[Any]]] | None = None) -> list[Any]:
+    info = path.stat()
+    before = file_version(path, info)
+    previous = None if verified is None else verified.get(path)
+    if before[-1] is not None and previous is not None and previous[0] == before:
+        return previous[1]
+    with path.open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    if file_version(path, path.stat()) != before:
+        raise ValueError(f"File changed while validating report contents: {path}")
+    state = [info.st_size, info.st_mtime_ns, digest]
+    if verified is not None:
+        verified[path] = (before, state)
+    return state
+
+
+def _source_state(folder: Path, prefix: str, verified: dict | None = None) -> dict[str, list[Any]]:
+    state: dict[str, list[Any]] = {name: _content_state(path, verified) for name in (
         "frame_summary.csv", "parameters_long.csv", "results.npz", "frame_details.jsonl", "ellipse_fit.jsonl", "ellipse_fit.json", "ridge_points.csv", "provenance.json", "manifest.json")
         if (path := folder / f"{prefix}{name}").is_file()}
     source_manifest = _source_manifest_path(folder, prefix)
     if source_manifest is not None:
         try:
-            info = source_manifest.stat()
             state[_SOURCE_MANIFEST_STATE_KEY] = [
-                source_manifest.is_file(), info.st_size, info.st_mtime_ns
+                source_manifest.is_file(), *_content_state(source_manifest, verified)
             ]
         except OSError:
             state[_SOURCE_MANIFEST_STATE_KEY] = [False, None, None]
@@ -517,7 +541,7 @@ def _manifest_time_units(folder: Path, prefix: str) -> list[str]:
     return units
 
 
-def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Mapping[str, Any], progress: Callable[[str], Any] | None) -> dict[str, Any]:
+def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Mapping[str, Any], progress: Callable[[str], Any] | None, producer: Mapping[str, Any]) -> dict[str, Any]:
     from .lamellar import build_lamellar_scene
     from .lamellar_analysis import analyze_lamellar_morphology
     from .lamellar_export import _scene_arrays, _scene_payload
@@ -531,16 +555,32 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
     if not archive_path.is_file():
         raise FileNotFoundError(f"Native arrays are missing: {archive_path}; finish the batch export first.")
     target = folder / "figures" / f"{prefix}analysis_report"
-    state = _source_state(folder, prefix)
+    # The same invocation reuses a content proof only while a write-sensitive
+    # file revision (USN on Windows) stays unchanged. Without that proof each
+    # final check streams the bytes again, including same-mtime mutations.
+    verified_sources: dict = {}
+    state = _source_state(folder, prefix, verified_sources)
     receipt = target / "report_summary.json"
     if target.exists():
         if not (resume or force):
             raise FileExistsError(f"Report already exists: {target}; use --resume or --force.")
         if resume and not force and receipt.is_file():
             old = json.loads(receipt.read_text(encoding="utf-8"))
-            if old.get("source_state") == state and old.get("settings") == settings and old.get("method_version") == _VERSION:
+            if (old.get("source_state") == state and old.get("settings") == settings
+                    and old.get("method_version") == _VERSION and old.get("producer_identity") == producer
+                    and old.get("receipt_sha256") == _receipt_seal(old)):
                 expected = old.get("artifacts", [])
-                if expected and all((target / path).is_file() for path in expected):
+                hashes = old.get("artifact_sha256", {})
+                valid = bool(expected) and set(hashes) == set(expected) - {"report_summary.json"}
+                for path in expected:
+                    relative = Path(path)
+                    if relative.is_absolute() or ".." in relative.parts or not (target / relative).is_file():
+                        valid = False
+                        break
+                    if path != "report_summary.json" and _content_state(target / relative)[2] != hashes.get(path):
+                        valid = False
+                        break
+                if valid and _source_state(folder, prefix, verified_sources) == state:
                     return {**old, "operation_status": "reused", "outputs": {"index": str(target / "index.html"), "summary": str(receipt)}}
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".analysis-report-", dir=target.parent))
@@ -729,6 +769,7 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                     ("branch_id", "parameter", "unit", "value_field", "n_records", "n_finite")) as table:
             table.write(lamellar_changes)
         report = {"schema_version": SCHEMA, "method_version": _VERSION, "operation_status": "completed", "settings": dict(settings),
+                  "producer_identity": producer,
                   "source_state": state, "frames": frame_reports,
                   "native_array_status": {key: value for key, value in native_metadata.items() if key != "arrays"},
                   "counts": {"frames": len(frames), "reported": sum(row["report_status"] == "completed" for row in frame_reports),
@@ -751,8 +792,11 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                                            "lamellar_analysis": "Ellipse-derived apparent periods and observed q-directions; these do not uniquely identify a microscopic structure.",
                                            "lamellar_geometry": "Deterministic scene arrays use the declared layer dimensions, stack counts and drawing assumptions; those dimensions are not fitted measurements."})
         report["artifacts"] = sorted(path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_file()) + ["report_summary.json"]
+        report["artifact_sha256"] = {path: _content_state(stage / path)[2] for path in report["artifacts"]
+                                    if path != "report_summary.json"}
+        report["receipt_sha256"] = _receipt_seal(report)
         _write_json(stage / "report_summary.json", report)
-        if _source_state(folder, prefix) != state:
+        if _source_state(folder, prefix, verified_sources) != state:
             raise ValueError("Batch outputs changed during reporting; finish the export then retry report --resume.")
         backup = target.with_name(f".{target.name}-previous")
         if backup.exists():
@@ -776,9 +820,9 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
 
 
 def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "", force: bool = False, resume: bool = False,
-                          radial_bins: int = 128, angular_bins: int = 72, formats: Sequence[str] = ("png", "svg", "pdf"),
-                          dpi: int = 180, lamellar_settings: Mapping[str, Any] | LamellarSettings | None = None,
-                          progress: Callable[[str], Any] | None = None) -> dict[str, Any]:
+                                 radial_bins: int = 128, angular_bins: int = 72, formats: Sequence[str] = ("png", "svg", "pdf"),
+                                 dpi: int = 180, lamellar_settings: Mapping[str, Any] | LamellarSettings | None = None,
+                                 progress: Callable[[str], Any] | None = None) -> dict[str, Any]:
     """Report one batch or all sample batches under a parent output directory."""
     from .lamellar_models import LamellarSettings
 
@@ -813,13 +857,22 @@ def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "
     root = Path(output_dir).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Batch output directory does not exist: {root}")
+    settings = {"radial_bins": radial_bins, "angular_bins": angular_bins, "formats": formats, "dpi": dpi,
+                "lamellar_settings": defaults}
+    from .output_lock import output_lock
+
+    with output_lock(root):
+        return _build_reports(root, prefix=prefix, force=force, resume=resume, settings=settings, progress=progress)
+
+
+def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
+                   settings: Mapping[str, Any], progress: Callable[[str], Any] | None) -> dict[str, Any]:
     summaries = sorted(path for path in root.rglob(f"{prefix}*frame_summary.csv")
                        if not any(part.startswith(".") or part == "figures" for part in path.relative_to(root).parts))
     if not summaries:
         raise FileNotFoundError(f"No frame_summary.csv batch exports found under {root}")
-    settings = {"radial_bins": radial_bins, "angular_bins": angular_bins, "formats": formats, "dpi": dpi,
-                "lamellar_settings": defaults}
-    reports = [_build_sample(path, force=force, resume=resume, settings=settings, progress=progress) for path in summaries]
+    producer = producer_identity(presentation=True)
+    reports = [_build_sample(path, force=force, resume=resume, settings=settings, progress=progress, producer=producer) for path in summaries]
     if len(reports) == 1:
         return reports[0]
     collection = root / "analysis_reports.html"

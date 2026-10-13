@@ -219,3 +219,83 @@ def test_lamellar_figure_failure_keeps_intensity_report_and_fit_data(tmp_path, m
         assert frame["figures"]
         assert frame["lamellar_error"] == "scene drawing failed"
         assert "lamellar_analysis" in frame["data"]
+
+
+def test_report_revalidates_artifact_contents_and_producer(tmp_path, monkeypatch):
+    import os
+    from butterfly_saxs import report as report_module
+
+    folder = _batch(tmp_path / "batch", failed=False)
+    options = {"radial_bins": 4, "angular_bins": 6, "formats": ("png",), "dpi": 30}
+    first = build_analysis_report(folder, **options)
+    target = Path(first["outputs"]["summary"]).parent / "radial_profiles.csv"
+    original = target.read_bytes()
+    info = target.stat()
+    target.write_bytes(original.replace(b"mean", b"xxxx", 1))
+    os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+    repaired = build_analysis_report(folder, resume=True, **options)
+    assert repaired["operation_status"] == "completed"
+    assert target.read_bytes() == original
+    monkeypatch.setattr(report_module, "producer_identity", lambda **_: {"source": "new renderer"})
+    regenerated = build_analysis_report(folder, resume=True, **options)
+    assert regenerated["operation_status"] == "completed"
+    assert regenerated["producer_identity"] == {"source": "new renderer"}
+
+
+def test_source_digest_detects_rewrite_even_with_restored_size_and_mtime(tmp_path):
+    import os
+    from butterfly_saxs.report import _source_state
+
+    source = tmp_path / "frame_summary.csv"
+    source.write_bytes(b"a,1\n")
+    verified = {}
+    before = _source_state(tmp_path, "", verified)
+    info = source.stat()
+    source.write_bytes(b"a,2\n")
+    os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
+    assert _source_state(tmp_path, "", verified) != before
+
+
+@pytest.mark.parametrize("revision_available", [False, True])
+def test_source_proof_reuse_requires_a_write_sensitive_revision(tmp_path, monkeypatch, revision_available):
+    import os
+    from butterfly_saxs import report
+
+    source = tmp_path / "frame_summary.csv"
+    source.write_bytes(b"a,1\n")
+    revision = [1]
+    original_digest = report.hashlib.file_digest
+    reads = []
+
+    def digest(*args):
+        reads.append(args[0].name)
+        return original_digest(*args)
+
+    monkeypatch.setattr(report.hashlib, "file_digest", digest)
+    monkeypatch.setattr(report, "file_version", lambda path, info: (info.st_size, info.st_mtime_ns,
+                                                                 revision[0] if revision_available else None))
+    verified = {}
+    first = report._source_state(tmp_path, "", verified)
+    assert report._source_state(tmp_path, "", verified) == first
+    assert len(reads) == (1 if revision_available else 2)
+    info = source.stat()
+    source.write_bytes(b"a,2\n")
+    os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
+    revision[0] += 1
+    assert report._source_state(tmp_path, "", verified) != first
+    assert len(reads) == (2 if revision_available else 3)
+
+
+def test_changed_report_status_cannot_be_promoted_by_receipt_reuse(tmp_path):
+    folder = _batch(tmp_path / "batch", failed=True)
+    options = {"radial_bins": 4, "angular_bins": 6, "formats": ("png",), "dpi": 30}
+    first = build_analysis_report(folder, **options)
+    assert first["exit_code"] == 1
+    path = Path(first["outputs"]["summary"])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(exit_code=0, status="ready")
+    payload["counts"]["warning_frames"] = 0
+    path.write_text(json.dumps(payload))
+    second = build_analysis_report(folder, resume=True, **options)
+    assert second["operation_status"] == "completed"
+    assert second["exit_code"] == 1
