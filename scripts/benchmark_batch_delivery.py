@@ -67,30 +67,22 @@ def _worker(args: argparse.Namespace) -> int:
     from butterfly_saxs import lamellar_report_figures, report_figures, report_measurements
     from butterfly_saxs.cli import main
 
+    # Bind the running code once, before any fault can bypass normal cleanup.
+    identity = {
+        "source": str(args.source.resolve()), "revision_label": args.revision,
+        "manifest_sha256": _digest(args.manifest), "config_sha256": _digest(args.config),
+        "benchmark_driver_sha256": _digest(Path(__file__).resolve()),
+        "source_sha256": {str(path.relative_to(args.source / "src")): _digest(path)
+                          for path in sorted((args.source / "src").rglob("*.py"))},
+        "python": sys.version, "platform": platform.platform(),
+        "thread_environment": {name: os.environ.get(name) for name in (
+            "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")},
+    }
+
     if args.disable_native_reuse:
         # Timing control only: regenerate from the same verified fits with
         # the same producer identity and every scientific output retained.
         export.StreamingBatchExporter._reuse_completed_bundle = lambda self, result: False
-
-    if args.hard_stop_after is not None:
-        original_checkpoint = batch.write_checkpoint
-
-        @functools.wraps(original_checkpoint)
-        def crash_after_checkpoint(path, payload):
-            result = original_checkpoint(path, payload)
-            completed = sum(item.get("status") != "skipped" for item in payload.get("frames", ()))
-            if completed >= args.hard_stop_after and not payload.get("cancelled"):
-                # Real abrupt exit: no Python finally blocks, ZIP close or
-                # publication. The prior committed bundle must survive.
-                record = {"injected_abrupt_exit": True, "phase": "after_durable_checkpoint_before_bundle_publish",
-                          "processed_frames": completed, "checkpoint": str(path), "resources": _resources(),
-                          "source": str(args.source.resolve()), "revision_label": args.revision,
-                          "manifest_sha256": _digest(args.manifest), "config_sha256": _digest(args.config)}
-                args.metrics.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-                os._exit(99)
-            return result
-
-        batch.write_checkpoint = crash_after_checkpoint
 
     if args.stop_after is not None:
         original_batch = batch.run_batch
@@ -155,6 +147,28 @@ def _worker(args: argparse.Namespace) -> int:
         (delivery, "_write_source", "package_members"),
     ):
         instrument(owner, name, label)
+
+    if args.hard_stop_after is not None:
+        # Wrap the measured writer so the last durable write is counted before
+        # os._exit bypasses all Python finally blocks and bundle publication.
+        original_checkpoint = batch.write_checkpoint
+
+        @functools.wraps(original_checkpoint)
+        def crash_after_checkpoint(path, payload):
+            result = original_checkpoint(path, payload)
+            completed = sum(item.get("status") != "skipped" for item in payload.get("frames", ()))
+            if completed >= args.hard_stop_after and not payload.get("cancelled"):
+                record = {**identity, "injected_abrupt_exit": True,
+                          "phase": "after_durable_checkpoint_before_bundle_publish",
+                          "processed_frames": completed, "checkpoint": str(path), "resources": _resources(),
+                          "cli_wall_seconds": time.perf_counter() - started,
+                          "cpu_seconds": time.process_time() - started_cpu,
+                          "process_cpu_seconds": time.process_time(), "stages_inclusive": stages}
+                args.metrics.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+                os._exit(99)
+            return result
+
+        batch.write_checkpoint = crash_after_checkpoint
     command = ["batch", "--manifest", str(args.manifest.resolve()), "--config", str(args.config.resolve()),
                "--output", str(args.output.resolve()), "--stream", "--checkpoint",
                str(args.output.resolve() / "checkpoint.json"), "--report", "--package"]
@@ -173,20 +187,12 @@ def _worker(args: argparse.Namespace) -> int:
         if profiler:
             profiler.disable()
             profiler.dump_stats(str(args.metrics.with_suffix(".prof")))
-        metrics = {"cli_wall_seconds": time.perf_counter() - started,
+        metrics = {**identity, "cli_wall_seconds": time.perf_counter() - started,
                    "cpu_seconds": time.process_time() - started_cpu, "stages_inclusive": stages,
                    "process_cpu_seconds": time.process_time(), "cpu_logical_cores": os.cpu_count(),
                    "resources": _resources(), "command": ["python", "-m", "butterfly_saxs", *command],
-                   "python": sys.version, "platform": platform.platform(),
-                   "manifest_sha256": _digest(args.manifest), "config_sha256": _digest(args.config),
-                   "source": str(args.source.resolve()), "resume": args.resume, "profiled": args.profile,
-                   "revision_label": args.revision, "stop_after_frames": args.stop_after,
-                   "disable_native_reuse": args.disable_native_reuse,
-                   "benchmark_driver_sha256": _digest(Path(__file__).resolve()),
-                   "source_sha256": {str(path.relative_to(args.source / "src")): _digest(path)
-                                     for path in sorted((args.source / "src").rglob("*.py"))},
-                   "thread_environment": {name: os.environ.get(name) for name in (
-                       "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")}}
+                   "resume": args.resume, "profiled": args.profile,
+                   "stop_after_frames": args.stop_after, "disable_native_reuse": args.disable_native_reuse}
         args.metrics.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     return code
 
