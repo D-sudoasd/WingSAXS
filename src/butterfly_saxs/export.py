@@ -1812,9 +1812,12 @@ class StreamingBatchExporter:
         del frame  # run_batch has already matched the exact input/selection hash.
         metadata = self._old_npz_metadata or {}
         proof = (self._old_manifest or {}).get("provenance", {}).get("checkpoint_frame_sha256", [])
+        from .producer import calculation_producers_compatible
+
         return (self._old_npz is not None and index < int(metadata.get("frame_count", 0))
                 and self._old_binding_verified
-                and (self._expected_producer is None or self._old_producer == self._expected_producer)
+                and (self._expected_producer is None
+                     or calculation_producers_compatible(self._old_producer, self._expected_producer))
                 and index not in metadata.get("missing_frames", [])
                 and index < len(proof) and isinstance(proof[index], str))
 
@@ -1851,7 +1854,10 @@ class StreamingBatchExporter:
         try:
             signature = _checkpoint_frame_signature(item)
             if item.resumed and self.resume:
-                if self._expected_producer is not None and self._old_producer != self._expected_producer:
+                from .producer import calculation_producers_compatible
+
+                if (self._expected_producer is not None
+                        and not calculation_producers_compatible(self._old_producer, self._expected_producer)):
                     raise ValueError("Previous bundle calculation producer differs from the current analyzer; rerun the frame before retaining its arrays.")
                 if not self._old_binding_verified:
                     raise ValueError("No verified producing bundle marker is available; recover its prior generation before restoring frames.")
@@ -2019,7 +2025,10 @@ class StreamingBatchExporter:
                 self._stage = None
                 return {**self._targets, "commit_marker": self.output / ".bundle.commit.json"}
             current_producer = batch.producer_identity if isinstance(batch, BatchRunResult) else self._expected_producer
-            if self.resume and any(item.resumed for item in self._compact_results) and self._old_producer != current_producer:
+            from .producer import calculation_producers_compatible
+
+            if (self.resume and any(item.resumed for item in self._compact_results)
+                    and not calculation_producers_compatible(self._old_producer, current_producer)):
                 raise ValueError("Previous bundle calculation producer differs from the resumed checkpoint; rerun its frames before retaining arrays.")
             if self._old_manifest is not None and isinstance(batch, BatchRunResult):
                 for key in ("input_hash", "config_hash", "mode"):
@@ -2084,7 +2093,7 @@ class StreamingBatchExporter:
             no_op_resume = bool(
                 self.resume
                 and self._old_binding_verified
-                and self._old_producer == current_producer
+                and calculation_producers_compatible(self._old_producer, current_producer)
                 and self._old_npz is not None
                 and not self._touched_frames
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled)
@@ -2102,7 +2111,7 @@ class StreamingBatchExporter:
                         continue
                     if not self._old_binding_verified:
                         raise ValueError("Cannot retain unbound arrays from a previous NPZ; recover its producing commit marker before resuming.")
-                    if self._old_producer != current_producer:
+                    if not calculation_producers_compatible(self._old_producer, current_producer):
                         raise ValueError("Cannot retain arrays from a different calculation producer; rerun the affected frames.")
                     with self._old_npz.open(name, "r") as source_handle:
                         with self._npz.open(name, "w") as target_handle:
@@ -2157,6 +2166,16 @@ class StreamingBatchExporter:
             if run is not None and run.producer_identity is not None:
                 provenance["producer_identity"] = run.producer_identity
             provenance["exporter_identity"] = self._exporter_identity
+            if (self.resume and self._old_producer != current_producer
+                    and any(item.resumed for item in self._compact_results)):
+                provenance["restored_calculation_producer_identity"] = self._old_producer
+            if no_op_resume:
+                old_provenance = (self._old_manifest or {}).get("provenance", {})
+                provenance["retained_npz_provenance"] = old_provenance.get("retained_npz_provenance") or {
+                    "producer_identity": self._old_producer,
+                    "exporter_identity": old_provenance.get("exporter_identity"),
+                    "sha256": self._verified_targets["npz"][1],
+                }
             provenance["checkpoint_frame_sha256"] = self._frame_signatures if all(self._frame_signatures) else []
             staged_manifest = self._stage / self._targets["manifest"].name
             staged_manifest.write_text(

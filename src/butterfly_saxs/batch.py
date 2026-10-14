@@ -2021,7 +2021,13 @@ def _checkpoint_payload(
 
 
 def write_checkpoint(path: str | os.PathLike[str], payload: Mapping[str, Any]) -> Path:
-    """Write a checkpoint with replace-on-success semantics."""
+    """Synchronously replace a checkpoint with lossless compact JSON.
+
+    Indentation repeats for every scalar in the accumulated restart profiles.
+    Besides writing those spaces on every frame, ``indent`` selects Python's
+    slower recursive encoder. Keep the same JSON values and durability boundary
+    while letting the compact encoder serialize them without that extra work.
+    """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2032,7 +2038,8 @@ def write_checkpoint(path: str | os.PathLike[str], payload: Mapping[str, Any]) -
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True))
+            handle.write(json.dumps(_json_safe(payload), ensure_ascii=False,
+                                    separators=(",", ":"), sort_keys=True, allow_nan=False))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -2176,7 +2183,7 @@ def run_batch(
     )
     callback = progress if progress is not None else on_progress
     started_batch = __import__("time").perf_counter()
-    from .producer import producer_identity
+    from .producer import calculation_producers_compatible, producer_identity
 
     calculation_producer = {**producer_identity(), "analyzer": _json_safe(analyzer_identity)}
     # Checkpointed runs must carry content identities from the start.  A
@@ -2325,7 +2332,7 @@ def run_batch(
             raise ValueError("checkpoint config hash mismatch; refusing resume")
         if payload.get("mode", mode) != mode:
             raise ValueError("checkpoint mode mismatch; refusing resume")
-        if payload.get("producer_identity") != calculation_producer:
+        if not calculation_producers_compatible(payload.get("producer_identity"), calculation_producer):
             raise ValueError(
                 "checkpoint calculation producer/dependency identity is missing or changed; "
                 "use its original software environment to resume, or choose a separate output for a new run"
