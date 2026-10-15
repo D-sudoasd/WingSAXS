@@ -170,3 +170,55 @@ def test_batch_replay_uses_each_stored_result_and_preserves_identity_flags(tmp_p
     assert metrics["readback_verification"]["target_resumed_count"] == 0
     assert [row["write_phase"] for row in measurements] == ["frame_prefix", "frame_prefix", "final_snapshot"]
     assert all("payload_construction" in row for row in measurements)
+
+
+def test_instrumentation_times_only_outer_recursive_conversion():
+    from butterfly_saxs import batch
+    from scripts.benchmark_checkpoint_writes import _instrument_batch_writer
+
+    # Timing changes alone must not add one clock/counter event per scalar.
+    raw = {"profile": [0.0, -0.0, 1.0] * 1000}
+    original = batch._checkpoint_safe
+    import os
+    original_fdopen = os.fdopen
+    expected = original(raw)
+    restore, stages = _instrument_batch_writer(batch)
+    try:
+        _strict_equal(batch._checkpoint_safe(raw), expected)
+        assert stages()["checkpoint_safe_calls"] == 1
+    finally:
+        restore()
+    assert batch._checkpoint_safe is original
+    assert os.fdopen is original_fdopen
+
+
+@pytest.mark.parametrize("timing", ["outer", "stages"])
+def test_partial_resume_replay_preserves_later_records_and_commit_count(tmp_path, timing):
+    from scripts.benchmark_checkpoint_writes import sample_fixture
+
+    fixture = sample_fixture(tmp_path / "sample", frames=5, profiles=1, points=8)
+    output = tmp_path / "resume"
+    output.mkdir()
+    metrics_path = output / "metrics.json"
+    measurements_path = output / "measurements.jsonl"
+    result = _worker(SimpleNamespace(
+        source=Path(__file__).resolve().parents[1], revision="test-source", fixture=fixture,
+        mode="batch-replay", indices=None, frames=None, output_dir=output,
+        timing=timing, resume_every=2,
+        worker_metrics=metrics_path, worker_measurements=measurements_path,
+    ))
+    assert result == 0
+    metrics = json.loads(metrics_path.read_text())
+    assert metrics["write_count"] == 4  # Three missing frames plus final snapshot.
+    assert metrics["readback_verification"]["target_resumed_count"] == 2
+    assert metrics["strict_readback_equivalence"] is True
+    assert metrics["retained_record_reconstruction_wall_seconds_sum"] >= 0
+    rows = [json.loads(line) for line in measurements_path.read_text().splitlines()]
+    if timing == "stages":
+        stages = metrics["instrumented_stage_totals"]
+        assert stages["fsync_calls"] == stages["flush_calls"] == stages["file_close_calls"] == 4
+        assert stages["file_write_calls"] == 8
+        assert sum(row["retained_record_reconstruction"]["stages"].get(
+            "checkpoint_safe_calls", 0) for row in rows) > 0
+    else:
+        assert metrics["instrumented_stage_totals"] == {}
