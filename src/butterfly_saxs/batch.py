@@ -78,6 +78,20 @@ def _checkpoint_safe(value: Any) -> Any:
     in-situ run cannot grow the checkpoint by several images per frame.
     """
 
+    # Profiles restored from JSON (or compacted after publication) consist
+    # mostly of plain scalar lists. Copy those leaves directly: repeating
+    # recursive dispatch/array introspection for every historical scalar is
+    # unnecessary. Containers are still copied on every snapshot, so later
+    # callback/seed mutations remain visible; this is not an identity cache.
+    if type(value) is list:
+        return [
+            (item if math.isfinite(item) else None) if type(item) is float
+            else item if item is None or type(item) in (str, bool, int)
+            else _checkpoint_safe(item)
+            for item in value
+        ]
+    if type(value) is dict:
+        return {str(key): _checkpoint_safe(item) for key, item in value.items()}
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):

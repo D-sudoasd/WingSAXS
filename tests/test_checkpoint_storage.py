@@ -16,9 +16,11 @@ from butterfly_saxs import batch, producer
 from butterfly_saxs.export import StreamingBatchExporter
 
 
-def _legacy_identity(current):
+def _legacy_identity(current, *, compact=False):
     old = copy.deepcopy(current)
-    old_batch, old_producer = sorted(producer._PRETTY_CHECKPOINT_SOURCES)[0]
+    sources = (producer._PREVIOUS_COMPACT_CHECKPOINT_SOURCES if compact
+               else producer._PRETTY_CHECKPOINT_SOURCES)
+    old_batch, old_producer = sorted(sources)[0]
     old["sources"].update({"batch.py": old_batch, "producer.py": old_producer})
     return old
 
@@ -82,14 +84,15 @@ def test_builder_source_pin_rejects_an_unreviewed_rule_change():
     assert producer._reviewed_checkpoint_builder_hash(changed) is None
 
 
+@pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("partial", [False, True])
-def test_legacy_checkpoint_and_native_arrays_restore_without_refitting(tmp_path, monkeypatch, partial):
+def test_legacy_checkpoint_and_native_arrays_restore_without_refitting(tmp_path, monkeypatch, partial, compact):
     paths = [tmp_path / f"frame_{index}.dat" for index in range(2)]
     for index, path in enumerate(paths):
         path.write_text(str(index))
     output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
     current = producer.producer_identity()
-    legacy = _legacy_identity(current)
+    legacy = _legacy_identity(current, compact=compact)
     stop = threading.Event()
 
     def analyze(frame):

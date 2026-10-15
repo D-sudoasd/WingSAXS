@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import FunctionType
 from typing import Any
 
 
@@ -312,18 +313,31 @@ def _windows_io() -> dict[str, int] | None:
 
 
 def _instrument_batch_writer(batch: Any) -> tuple[Callable[..., Any], Callable[[], dict[str, float]]]:
-    """Time conversion, dumps, fsync, replace, and the inclusive writer call."""
+    """Measure disjoint outer conversions and synchronous file operations.
+
+    Do not wrap every recursive _checkpoint_safe call: that adds clocks to
+    every scalar and sums overlapping durations. A private globals copy keeps
+    recursion in the unchanged implementation; only its outer call is timed.
+    """
     originals = {
         "json_safe": batch._json_safe,
         "checkpoint_safe": batch._checkpoint_safe,
         "json_dumps": batch.json.dumps,
         "fsync": batch.os.fsync,
         "replace": batch.os.replace,
+        "fdopen": batch.os.fdopen,
     }
     current: dict[str, float] = {}
+    recursive = originals["checkpoint_safe"]
+    scope = dict(recursive.__globals__)
+    uninstrumented = FunctionType(recursive.__code__, scope, recursive.__name__,
+                                  recursive.__defaults__, recursive.__closure__)
+    uninstrumented.__kwdefaults__ = recursive.__kwdefaults__
+    scope["_checkpoint_safe"] = uninstrumented
 
     def wrap(name: str, function: Callable[..., Any]) -> Callable[..., Any]:
         def measured(*args: Any, **kwargs: Any) -> Any:
+            current[name + "_calls"] = current.get(name + "_calls", 0) + 1
             wall = time.perf_counter()
             cpu = time.process_time()
             try:
@@ -334,10 +348,31 @@ def _instrument_batch_writer(batch: Any) -> tuple[Callable[..., Any], Callable[[
         return measured
 
     batch._json_safe = wrap("json_safe", originals["json_safe"])
-    batch._checkpoint_safe = wrap("checkpoint_safe", originals["checkpoint_safe"])
+    batch._checkpoint_safe = wrap("checkpoint_safe", uninstrumented)
     batch.json.dumps = wrap("json_dumps", originals["json_dumps"])
     batch.os.fsync = wrap("fsync", originals["fsync"])
     batch.os.replace = wrap("replace", originals["replace"])
+
+    class TimedFile:
+        def __init__(self, handle: Any):
+            self.handle = handle
+            self.write = wrap("file_write", handle.write)
+            self.flush = wrap("flush", handle.flush)
+
+        def __enter__(self) -> Any:
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return wrap("file_close", self.handle.__exit__)(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+    def timed_fdopen(*args: Any, **kwargs: Any) -> Any:
+        return TimedFile(originals["fdopen"](*args, **kwargs))
+
+    batch.os.fdopen = timed_fdopen
 
     def restore() -> dict[str, float]:
         batch._json_safe = originals["json_safe"]
@@ -345,21 +380,26 @@ def _instrument_batch_writer(batch: Any) -> tuple[Callable[..., Any], Callable[[
         batch.json.dumps = originals["json_dumps"]
         batch.os.fsync = originals["fsync"]
         batch.os.replace = originals["replace"]
+        batch.os.fdopen = originals["fdopen"]
         return current.copy()
 
     return restore, lambda: current.copy()
 
 
-def _instrument_run_batch(batch: Any) -> tuple[
+def _instrument_run_batch(batch: Any, *, stages: bool = True) -> tuple[
         Callable[[], dict[str, float]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Measure run_batch payload construction and each synchronous checkpoint."""
-    restore_writer_stages, get_stages = _instrument_batch_writer(batch)
+    restore_writer_stages, get_stages = (
+        _instrument_batch_writer(batch) if stages else (lambda: {}, lambda: {})
+    )
     original_payload = batch._checkpoint_payload
     original_write = batch.write_checkpoint
     payload_events: list[dict[str, Any]] = []
     write_events: list[dict[str, Any]] = []
+    payload_end: tuple[float, float, dict[str, float]] | None = None
 
     def measured_payload(*args: Any, **kwargs: Any) -> Any:
+        nonlocal payload_end
         stages_before = get_stages()
         wall_started = time.perf_counter()
         cpu_started = time.process_time()
@@ -378,8 +418,19 @@ def _instrument_run_batch(batch: Any) -> tuple[
                     for name in stages_after.keys() | stages_before.keys()
                 },
             })
+            payload_end = (time.perf_counter(), time.process_time(), get_stages())
 
     def measured_write(path: str | os.PathLike[str], payload: Mapping[str, Any]) -> Any:
+        # In run_batch these calls are consecutive except for the loop which
+        # retains verified later records during resume. Measure that gap, not
+        # a Python profiler invoked on every scalar/function call.
+        restore_end_wall, restore_end_cpu = time.perf_counter(), time.process_time()
+        retained = {} if payload_end is None else {
+            "wall_seconds": restore_end_wall - payload_end[0],
+            "cpu_seconds": restore_end_cpu - payload_end[1],
+            "stages": {name: value - payload_end[2].get(name, 0.0)
+                       for name, value in get_stages().items()},
+        }
         io_before = _windows_io()
         stages_before = get_stages()
         wall_started = time.perf_counter()
@@ -401,6 +452,7 @@ def _instrument_run_batch(batch: Any) -> tuple[
             "file_size_bytes": size_bytes,
             "cumulative_file_bytes": sum(item["file_size_bytes"] for item in write_events) + size_bytes,
             "writer_stages": stage_delta,
+            "retained_record_reconstruction": retained,
         }
         if io_before is not None and io_after is not None:
             event["logical_io"] = {
@@ -517,7 +569,31 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
     target = args.output_dir.resolve() / "checkpoint.json"
     if target.exists():
         raise FileExistsError(f"refusing to overwrite existing replay checkpoint: {target}")
-    restore, payload_events, writes = _instrument_run_batch(batch)
+    resume_every = getattr(args, "resume_every", 0)
+    if resume_every < 0:
+        raise ValueError("--resume-every must be nonnegative")
+    expected_writes = len(records) + 1
+    if resume_every:
+        # Create an independent partial checkpoint outside the timed interval.
+        # Its identities are generated from the actual frozen source/input/config
+        # environment; run_batch still performs its normal resume checks.
+        from butterfly_saxs.producer import producer_identity
+
+        seed_records = [dict(record) for record in records]
+        missing = list(range(0, len(records), resume_every))
+        for index in missing:
+            seed_records[index].update(status="skipped", result=None)
+        seed = {
+            **metadata, "frames": seed_records, "frame_count": len(records),
+            "total_count": len(records), "processed_count": len(records) - len(missing),
+            "input_hash": batch.input_fingerprint(refs, require_content_hash=True),
+            "config_hash": batch.config_fingerprint(config, mode=mode, require_content_hash=True),
+            "producer_identity": {**producer_identity(), "analyzer": producer.get("analyzer")},
+        }
+        batch.write_checkpoint(target, seed)
+        expected_writes = len(missing) + 1
+    restore, payload_events, writes = _instrument_run_batch(
+        batch, stages=getattr(args, "timing", "stages") == "stages")
     io_before = _windows_io()
     production_wall_started = time.perf_counter()
     production_cpu_started = time.process_time()
@@ -533,6 +609,7 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
             # ordering authority for this replay.
             manifest=refs,
             checkpoint=target,
+            resume=bool(resume_every),
             retain_results=False,
             analyzer_identity=producer.get("analyzer"),
         )
@@ -542,14 +619,14 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
     finally:
         stage_totals = restore()
 
-    if len(payload_events) != len(records) + 1 or len(writes) != len(records) + 1:
+    if len(payload_events) != expected_writes or len(writes) != expected_writes:
         raise AssertionError(
             f"run_batch emitted {len(payload_events)} payloads and {len(writes)} writes; "
-            f"expected {len(records) + 1} of each"
+            f"expected {expected_writes} of each"
         )
     for write, payload_event in zip(writes, payload_events, strict=True):
         write["write_phase"] = (
-            "final_snapshot" if write["write_index"] == len(records) + 1 else "frame_prefix"
+            "final_snapshot" if write["write_index"] == expected_writes else "frame_prefix"
         )
         write["payload_construction"] = payload_event
 
@@ -575,7 +652,8 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
         "unique_input_path_count": len(source_paths),
         "checkpoint_path": str(target),
         "write_count": len(writes),
-        "expected_write_count": len(records) + 1,
+        "expected_write_count": expected_writes,
+        "resume_every": resume_every,
         "checkpoint_payload_count": len(payload_events),
         "checkpoint_payload_wall_seconds_sum": sum(item["wall_seconds"] for item in payload_events),
         "checkpoint_payload_cpu_seconds_sum": sum(item["cpu_seconds"] for item in payload_events),
@@ -594,6 +672,10 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
         "readback_equivalence_wall_seconds": verification_wall,
         "final_hash_wall_seconds": target_hash_wall,
         "instrumented_stage_totals": stage_totals,
+        "timing": getattr(args, "timing", "stages"),
+        "retained_record_reconstruction_wall_seconds_sum": sum(
+            item["retained_record_reconstruction"].get("wall_seconds", 0.0) for item in writes
+        ),
         "batch_run_result": {
             "input_hash": run_result.input_hash,
             "config_hash": run_result.config_hash,
@@ -718,7 +800,10 @@ def _worker(args: argparse.Namespace) -> int:
         return _run_batch_replay(args, batch, source, identity, fixture_identity, records)
 
     payload_metadata = dict(checkpoint_metadata)
-    restore, get_stages = _instrument_batch_writer(batch)
+    restore, get_stages = (
+        _instrument_batch_writer(batch)
+        if getattr(args, "timing", "stages") == "stages" else (lambda: {}, lambda: {})
+    )
     writes: list[dict[str, Any]] = []
     production_wall_start = time.perf_counter()
     production_cpu_start = time.process_time()
@@ -818,6 +903,52 @@ def _worker(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def sample_fixture(output_dir: Path, *, frames: int = 24, profiles: int = 8,
+                   points: int = 2048) -> Path:
+    """Build deterministic synthetic records; never fit scientific data."""
+    if min(frames, profiles, points) < 1:
+        raise ValueError("sample dimensions must be positive")
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
+    records = []
+    for index in range(frames):
+        input_path = output_dir / f"frame{index:04d}.dat"
+        input_path.write_bytes(f"synthetic frame {index}\n".encode("ascii"))
+        records.append({
+            "frame": {"path": str(input_path), "frame_id": f"F{index:04d}",
+                      "time": float(index), "metadata": {"sample": "synthetic"},
+                      "order": index, "source": None, "dataset": None, "frame": None},
+            "status": "ok", "error": None, "diagnostic": None, "traceback": None,
+            "warm_start_from": None, "elapsed_s": 0.5, "resumed": False,
+            "result": {
+                "parameters": {"a": 0.4 + index / 1024, "offset": -0.0},
+                "flags": ["synthetic", True, None],
+                "lobe_radial_profiles": [
+                    {"q": [point / 2048 for point in range(points)],
+                     "intensity": [(point + index + profile) / 7 for point in range(points)]}
+                    for profile in range(profiles)
+                ],
+            },
+        })
+    metadata = {
+        "version": 1, "mode": "independent", "updated_at": "synthetic",
+        "input_hash": "fixture-only", "config_hash": "fixture-only",
+        "producer_identity": {"analyzer": {"implementation": "synthetic replay v1"}},
+        "config": {"q_window": [0.1, 1.0]}, "config_file_fingerprints": {},
+        "selection": {}, "cancelled": False, "processed_count": frames,
+        "total_count": frames, "elapsed_s": 0.0, "frame_count": frames,
+        "sample_kind": "synthetic; not measured detector data",
+        "sample_dimensions": {"frames": frames, "profiles": profiles, "points": points},
+        "frames": records,
+    }
+    checkpoint = output_dir / "source.json"
+    _write_json_new(checkpoint, metadata)
+    fixture = output_dir / "fixture.jsonl"
+    prepare_fixture(checkpoint, fixture, expected_frames=frames)
+    return fixture
+
+
 def _run(args: argparse.Namespace) -> int:
     fixture = args.fixture.resolve()
     source = args.source.resolve()
@@ -829,6 +960,8 @@ def _run(args: argparse.Namespace) -> int:
     metadata_path = fixture.with_name(fixture.name + ".metadata.json")
     if not fixture.is_file() or not metadata_path.is_file():
         raise FileNotFoundError(f"fixture and metadata sidecar are required: {fixture}")
+    if args.resume_every and args.mode != "batch-replay":
+        raise ValueError("--resume-every requires --mode batch-replay")
     if args.mode == "single-snapshot" and (args.frames is not None or args.indices):
         raise ValueError("single-snapshot mode always uses all fixture records; omit --frames/--indices")
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -843,6 +976,7 @@ def _run(args: argparse.Namespace) -> int:
         "--output-dir", str(output_dir), "--mode", args.mode,
         "--worker-metrics", str(worker_metrics), "--worker-measurements", str(worker_measurements),
         "--revision", args.revision or "",
+        "--timing", args.timing, "--resume-every", str(args.resume_every),
     ]
     if args.indices:
         command.extend(("--indices", args.indices))
@@ -871,6 +1005,11 @@ def _run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    sample = subparsers.add_parser("sample", help="create deterministic synthetic replay records")
+    sample.add_argument("--output-dir", type=Path, required=True)
+    sample.add_argument("--frames", type=int, default=24)
+    sample.add_argument("--profiles", type=int, default=8)
+    sample.add_argument("--points", type=int, default=2048)
     prepare = subparsers.add_parser("prepare", help="stream a v1 checkpoint into a compact JSONL fixture")
     prepare.add_argument("--checkpoint", type=Path, required=True)
     prepare.add_argument("--fixture", type=Path, required=True)
@@ -883,12 +1022,21 @@ def main() -> int:
     selection = run.add_mutually_exclusive_group()
     selection.add_argument("--frames", type=int, help="use the first N records in prefix or batch-replay mode")
     selection.add_argument("--indices", help="1-based ascending frame record indices, e.g. 1,6,12")
+    run.add_argument("--timing", choices=("stages", "outer"), default="stages",
+                     help="outer avoids conversion/I/O wrappers for timing-overhead checks")
+    run.add_argument("--resume-every", type=int, default=0,
+                     help="batch-replay only: retry every Nth frame in a synthetic partial checkpoint")
     run.add_argument("--revision", help="descriptive source revision label; file hashes are authoritative")
     run.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     run.add_argument("--worker-metrics", type=Path, help=argparse.SUPPRESS)
     run.add_argument("--worker-measurements", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
+        if args.command == "sample":
+            fixture = sample_fixture(args.output_dir, frames=args.frames,
+                                     profiles=args.profiles, points=args.points)
+            print(json.dumps({"fixture": str(fixture), "sample_kind": "synthetic"}))
+            return 0
         if args.command == "prepare":
             metadata = prepare_fixture(args.checkpoint, args.fixture, args.expected_frames)
             print(json.dumps({"fixture": str(args.fixture.resolve()), "metadata": str(metadata)}, ensure_ascii=False))
