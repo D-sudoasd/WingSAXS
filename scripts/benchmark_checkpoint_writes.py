@@ -319,20 +319,56 @@ def _instrument_batch_writer(batch: Any) -> tuple[Callable[..., Any], Callable[[
         "json_dumps": batch.json.dumps,
         "fsync": batch.os.fsync,
         "replace": batch.os.replace,
+        "fdopen": batch.os.fdopen,
     }
     current: dict[str, float] = {}
+    depth: dict[str, int] = {}
 
     def wrap(name: str, function: Callable[..., Any]) -> Callable[..., Any]:
         def measured(*args: Any, **kwargs: Any) -> Any:
+            if depth.get(name, 0):
+                return function(*args, **kwargs)
+            depth[name] = 1
+            if name == "checkpoint_safe":
+                # Let recursive calls use the original function directly:
+                # count inclusive roots once without per-scalar timer overhead.
+                batch._checkpoint_safe = function
             wall = time.perf_counter()
             cpu = time.process_time()
             try:
                 return function(*args, **kwargs)
             finally:
+                depth[name] = 0
+                if name == "checkpoint_safe":
+                    batch._checkpoint_safe = measured
                 current[name + "_wall_seconds"] = current.get(name + "_wall_seconds", 0.0) + time.perf_counter() - wall
                 current[name + "_cpu_seconds"] = current.get(name + "_cpu_seconds", 0.0) + time.process_time() - cpu
         return measured
 
+    class TimedFile:
+        def __init__(self, handle: Any):
+            self.handle = handle
+
+        def __enter__(self) -> Any:
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return wrap("file_close", self.handle.__exit__)(*args)
+
+        def write(self, value: str) -> Any:
+            return wrap("file_write", self.handle.write)(value)
+
+        def flush(self) -> Any:
+            return wrap("file_flush", self.handle.flush)()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+    def timed_fdopen(*args: Any, **kwargs: Any) -> Any:
+        return TimedFile(originals["fdopen"](*args, **kwargs))
+
+    batch.os.fdopen = timed_fdopen
     batch._json_safe = wrap("json_safe", originals["json_safe"])
     batch._checkpoint_safe = wrap("checkpoint_safe", originals["checkpoint_safe"])
     batch.json.dumps = wrap("json_dumps", originals["json_dumps"])
@@ -345,6 +381,7 @@ def _instrument_batch_writer(batch: Any) -> tuple[Callable[..., Any], Callable[[
         batch.json.dumps = originals["json_dumps"]
         batch.os.fsync = originals["fsync"]
         batch.os.replace = originals["replace"]
+        batch.os.fdopen = originals["fdopen"]
         return current.copy()
 
     return restore, lambda: current.copy()
@@ -358,6 +395,7 @@ def _instrument_run_batch(batch: Any) -> tuple[
     original_write = batch.write_checkpoint
     payload_events: list[dict[str, Any]] = []
     write_events: list[dict[str, Any]] = []
+    payload_end: dict[str, Any] = {}
 
     def measured_payload(*args: Any, **kwargs: Any) -> Any:
         stages_before = get_stages()
@@ -369,6 +407,7 @@ def _instrument_run_batch(batch: Any) -> tuple[
             wall = time.perf_counter() - wall_started
             cpu = time.process_time() - cpu_started
             stages_after = get_stages()
+            payload_end.update(wall=time.perf_counter(), stages=stages_after)
             payload_events.append({
                 "call_index": len(payload_events) + 1,
                 "wall_seconds": wall,
@@ -401,6 +440,10 @@ def _instrument_run_batch(batch: Any) -> tuple[
             "file_size_bytes": size_bytes,
             "cumulative_file_bytes": sum(item["file_size_bytes"] for item in write_events) + size_bytes,
             "writer_stages": stage_delta,
+            "retained_record_processing_wall_seconds": max(0., wall_started - payload_end["wall"]),
+            "retained_record_safe_wall_seconds": max(0.,
+                stages_before.get("checkpoint_safe_wall_seconds", 0.)
+                - payload_end["stages"].get("checkpoint_safe_wall_seconds", 0.)),
         }
         if io_before is not None and io_after is not None:
             event["logical_io"] = {
@@ -514,17 +557,41 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
         except KeyError as exc:
             raise KeyError(f"no stored result for frame identity {frame.key}") from exc
 
+    def reject_analysis(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("resume replay attempted scientific analysis")
+
     target = args.output_dir.resolve() / "checkpoint.json"
     if target.exists():
         raise FileExistsError(f"refusing to overwrite existing replay checkpoint: {target}")
+    resume_replay = args.mode in {"resume-replay", "partial-resume-replay"}
+    retry_count = max(1, len(records) // 2) if args.mode == "partial-resume-replay" else 0
+    profiler = None
+    if resume_replay:
+        # Seed an independently committed checkpoint through the same public
+        # orchestration, then time restoration without calling the analyzer.
+        batch.run_batch(refs, replay_analyzer, mode=mode, config=config,
+                        manifest=refs, checkpoint=target, retain_results=False,
+                        analyzer_identity=producer.get("analyzer"))
+        if retry_count:
+            seed_payload = batch.read_checkpoint(target)
+            for record in seed_payload["frames"][:retry_count]:
+                record.update(status="failed", result=None, error="RuntimeError: replay missing frame",
+                              traceback="synthetic partial recovery fixture")
+            batch.write_checkpoint(target, seed_payload)
+        import cProfile
+        profiler = cProfile.Profile()
+
     restore, payload_events, writes = _instrument_run_batch(batch)
     io_before = _windows_io()
     production_wall_started = time.perf_counter()
     production_cpu_started = time.process_time()
     try:
+        if profiler is not None:
+            profiler.enable()
         run_result = batch.run_batch(
             refs,
-            replay_analyzer,
+            reject_analysis if resume_replay and not retry_count else replay_analyzer,
+            resume=resume_replay,
             mode=mode,
             config=config,
             # A FrameRef sequence supplied as ``frames`` alone is naturally
@@ -540,16 +607,19 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
         production_cpu = time.process_time() - production_cpu_started
         io_after = _windows_io()
     finally:
+        if profiler is not None:
+            profiler.disable()
         stage_totals = restore()
 
-    if len(payload_events) != len(records) + 1 or len(writes) != len(records) + 1:
+    expected_writes = retry_count + 1 if resume_replay else len(records) + 1
+    if len(payload_events) != expected_writes or len(writes) != expected_writes:
         raise AssertionError(
             f"run_batch emitted {len(payload_events)} payloads and {len(writes)} writes; "
-            f"expected {len(records) + 1} of each"
+            f"expected {expected_writes} of each"
         )
     for write, payload_event in zip(writes, payload_events, strict=True):
         write["write_phase"] = (
-            "final_snapshot" if write["write_index"] == len(records) + 1 else "frame_prefix"
+            "final_snapshot" if write["write_index"] == expected_writes else "frame_prefix"
         )
         write["payload_construction"] = payload_event
 
@@ -565,7 +635,14 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
     metrics = {
         **identity,
         "fixture": fixture_identity,
-        "mode": "batch-replay",
+        "mode": args.mode,
+        "restoration_profile": (None if profiler is None else [
+            {"function": entry.code.co_name, "calls": entry.callcount,
+             "inclusive_wall_seconds": entry.totaltime, "self_wall_seconds": entry.inlinetime}
+            for entry in profiler.getstats() if hasattr(entry.code, "co_name")
+            and entry.code.co_name == "restore_checkpoint_item"
+        ]),
+        "profiling_overhead_included": profiler is not None,
         "workflow_scope": "batch.run_batch orchestration and checkpoint replay using stored frame results",
         "scientific_fit_performed": False,
         "report_or_package_performed": False,
@@ -575,8 +652,12 @@ def _run_batch_replay(args: argparse.Namespace, batch: Any, source: Path,
         "unique_input_path_count": len(source_paths),
         "checkpoint_path": str(target),
         "write_count": len(writes),
-        "expected_write_count": len(records) + 1,
+        "expected_write_count": expected_writes,
         "checkpoint_payload_count": len(payload_events),
+        "retained_record_processing_wall_seconds_sum": sum(
+            item["retained_record_processing_wall_seconds"] for item in writes),
+        "retained_record_safe_wall_seconds_sum": sum(
+            item["retained_record_safe_wall_seconds"] for item in writes),
         "checkpoint_payload_wall_seconds_sum": sum(item["wall_seconds"] for item in payload_events),
         "checkpoint_payload_cpu_seconds_sum": sum(item["cpu_seconds"] for item in payload_events),
         "checkpoint_wall_seconds_sum": sum(item["wall_seconds"] for item in writes),
@@ -711,10 +792,13 @@ def _worker(args: argparse.Namespace) -> int:
     if args.mode == "single-snapshot" and len(records) != record_count:
         raise ValueError("single-snapshot mode requires every checkpoint frame")
 
+    def reject_analysis(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("resume replay attempted scientific analysis")
+
     target = args.output_dir.resolve() / "checkpoint.json"
     if target.exists():
         raise FileExistsError(f"refusing to overwrite existing replay checkpoint: {target}")
-    if args.mode == "batch-replay":
+    if args.mode in {"batch-replay", "resume-replay", "partial-resume-replay"}:
         return _run_batch_replay(args, batch, source, identity, fixture_identity, records)
 
     payload_metadata = dict(checkpoint_metadata)
@@ -868,9 +952,44 @@ def _run(args: argparse.Namespace) -> int:
     return completed.returncode
 
 
+def create_synthetic_fixture(output: Path, frames: int = 24, points: int = 20000) -> Path:
+    """Create labeled scalar-profile records; never simulate scientific fitting."""
+    if frames < 1 or points < 1:
+        raise ValueError("frames and points must be positive")
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    records = []
+    for index in range(frames):
+        path = output / f"frame{index:02}.dat"
+        path.write_text(str(index), encoding="utf-8")
+        records.append({
+            "frame": {"path": str(path), "frame_id": f"F{index}", "time": float(index),
+                      "metadata": {}, "order": index, "source": "entry", "dataset": None, "frame": None},
+            "status": "ok", "error": None, "diagnostic": None, "traceback": None,
+            "warm_start_from": None, "elapsed_s": .5, "resumed": False,
+            "result": {"parameters": {"a": 1.},
+                       "profile": [float(value) / 7 for value in range(points)] + [-0.]},
+        })
+    source = output / "synthetic.json"
+    _write_json_new(source, {
+        "version": 1, "benchmark_synthetic": True, "mode": "independent",
+        "producer_identity": {"analyzer": "synthetic scalar-profile replay"},
+        "config": {"q_window": [.1, 1.]}, "cancelled": False,
+        "frame_count": frames, "processed_count": frames, "total_count": frames,
+        "frames": records,
+    })
+    fixture = output / "fixture.jsonl"
+    prepare_fixture(source, fixture, expected_frames=frames)
+    return fixture
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    synthetic = subparsers.add_parser("synthetic", help="create labeled scalar-profile replay records")
+    synthetic.add_argument("--output-dir", type=Path, required=True)
+    synthetic.add_argument("--frames", type=int, default=24)
+    synthetic.add_argument("--points", type=int, default=20000)
     prepare = subparsers.add_parser("prepare", help="stream a v1 checkpoint into a compact JSONL fixture")
     prepare.add_argument("--checkpoint", type=Path, required=True)
     prepare.add_argument("--fixture", type=Path, required=True)
@@ -879,7 +998,7 @@ def main() -> int:
     run.add_argument("--fixture", type=Path, required=True)
     run.add_argument("--source", type=Path, required=True, help="frozen source tree containing src/butterfly_saxs/batch.py")
     run.add_argument("--output-dir", type=Path, required=True, help="new, case-specific evidence directory")
-    run.add_argument("--mode", choices=("prefix", "single-snapshot", "batch-replay"), default="prefix")
+    run.add_argument("--mode", choices=("prefix", "single-snapshot", "batch-replay", "resume-replay", "partial-resume-replay"), default="prefix")
     selection = run.add_mutually_exclusive_group()
     selection.add_argument("--frames", type=int, help="use the first N records in prefix or batch-replay mode")
     selection.add_argument("--indices", help="1-based ascending frame record indices, e.g. 1,6,12")
@@ -889,6 +1008,9 @@ def main() -> int:
     run.add_argument("--worker-measurements", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
+        if args.command == "synthetic":
+            print(create_synthetic_fixture(args.output_dir, args.frames, args.points))
+            return 0
         if args.command == "prepare":
             metadata = prepare_fixture(args.checkpoint, args.fixture, args.expected_frames)
             print(json.dumps({"fixture": str(args.fixture.resolve()), "metadata": str(metadata)}, ensure_ascii=False))

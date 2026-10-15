@@ -99,15 +99,24 @@ def _checkpoint_safe(value: Any) -> Any:
             array = np.asarray(value)
             finite = array[np.isfinite(array)] if array.dtype.kind in "fciu" else np.asarray([])
             if finite.size:
-                summary["min"] = float(np.min(finite))
-                summary["max"] = float(np.max(finite))
+                for name, value in (("min", np.min(finite)), ("max", np.max(finite))):
+                    number = float(value)
+                    summary[name] = number if math.isfinite(number) else None
         except Exception:  # pragma: no cover - optional diagnostics only
             pass
         return summary
     if isinstance(value, Mapping):
         return {str(key): _checkpoint_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_checkpoint_safe(item) for item in value]
+        # Restart profiles are long lists of built-in scalars. Handle those
+        # leaves here rather than recursively dispatching each scalar again.
+        # Subclasses and nested/scientific objects keep the original boundary.
+        return [
+            item if item is None or type(item) in (str, bool, int)
+            else (item if math.isfinite(item) else None) if type(item) is float
+            else _checkpoint_safe(item)
+            for item in value
+        ]
     if is_dataclass(value):
         converted = {
             item.name: _checkpoint_safe(getattr(value, item.name))
@@ -1977,6 +1986,14 @@ def _call_analyzer(
     return analyze_frame(*args, **kwargs)
 
 
+class _CheckpointPayload(dict):
+    """Internal snapshot whose frame records already passed both JSON boundaries.
+
+    Never used for arbitrary public write_checkpoint inputs. No records survive
+    between snapshots: mutations by analyzers or sinks remain observable.
+    """
+
+
 def _checkpoint_payload(
     run: BatchRunResult,
     refs: Sequence[FrameRef],
@@ -1985,7 +2002,7 @@ def _checkpoint_payload(
 ) -> dict[str, Any]:
     frame_records: list[dict[str, Any]] = []
     for item in run.frame_results:
-        record = item.to_record(include_result=False)
+        record = _json_safe(item.to_record(include_result=False))
         safe_result = _checkpoint_safe(item.result)
         if isinstance(safe_result, Mapping):
             safe_result = dict(safe_result)
@@ -2001,7 +2018,7 @@ def _checkpoint_payload(
         record["result"] = safe_result
         frame_records.append(record)
     config_files = _config_with_file_fingerprints(config)
-    return {
+    payload = _CheckpointPayload(_json_safe({
         "version": 1,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "mode": run.mode,
@@ -2015,9 +2032,10 @@ def _checkpoint_payload(
         "processed_count": int(run.processed_count),
         "total_count": int(run.total_count),
         "elapsed_s": run.elapsed_s,
-        "frames": frame_records,
         "frame_count": len(refs),
-    }
+    }))
+    payload["frames"] = frame_records
+    return payload
 
 
 def write_checkpoint(path: str | os.PathLike[str], payload: Mapping[str, Any]) -> Path:
@@ -2038,7 +2056,7 @@ def write_checkpoint(path: str | os.PathLike[str], payload: Mapping[str, Any]) -
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(_json_safe(payload), ensure_ascii=False,
+            handle.write(json.dumps(payload if isinstance(payload, _CheckpointPayload) else _json_safe(payload), ensure_ascii=False,
                                     separators=(",", ":"), sort_keys=True, allow_nan=False))
             handle.write("\n")
             handle.flush()
@@ -2409,7 +2427,7 @@ def run_batch(
                     continue
                 if retained is None:
                     retained = FrameFitResult(frame=frame, status="skipped")
-                record = retained.to_record(include_result=False)
+                record = _json_safe(retained.to_record(include_result=False))
                 record["result"] = _checkpoint_safe(retained.result)
                 if index < len(records):
                     records[index] = record

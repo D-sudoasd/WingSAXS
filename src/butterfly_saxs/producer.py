@@ -8,19 +8,23 @@ import platform
 from collections.abc import Mapping
 
 
-# Only the reviewed pretty-JSON -> compact-JSON storage update may restore
+# Only the reviewed JSON storage and snapshot-conversion updates may restore
 # these older calculation identities. All other source bytes, dependencies
 # and analyzer evidence must still match. A later batch edit fails closed
 # until its compatibility has been established separately.
 _COMPACT_CHECKPOINT_BATCH_SHA256 = frozenset({
+    "251a28278620099c46a0f6a28423faafb1ff6c9eb9d55307076622124eee599a",
+    "d7597a2daa437577c3bab935825405cde87d53642f782231031541cfe7341428",
     "ef6238070ec330b5e585270692c60a74329e3752cc13582f31897be525237e0d",
     "4e424ac36a0006acdb1883aa11b3d4b571ff4284d26cf0fcaf05b52426d9b572",
 })
 _PRETTY_CHECKPOINT_SOURCES = frozenset({
+    ('4e424ac36a0006acdb1883aa11b3d4b571ff4284d26cf0fcaf05b52426d9b572', 'e479cd669d4b3eb88c89dd5ff1caf972945f14aab0cb957c22752b6559bfe62a'),
+    ('ef6238070ec330b5e585270692c60a74329e3752cc13582f31897be525237e0d', 'ece30c4a0b985fb0f62b1d7b1bd580fc41c6f09de15af0f276c5dbc9544a655d'),
     ("9d2451115cdd219bf26118b62f930a9ba350dc6237ee408d6fd81fa0c7a3c0fa", "e87ce353aaf1b07ef85c13243a9e1ffc7fd60f0034d03582a160c787fa891544"),
     ("bb12be937d5b105fd81714923ae9413f3388ab45d97c1b7578461b489cb7c9e3", "ff5cc51d19ca4438b0073b83e0741cc43791ded7656556b70259e515fc713049"),
 })
-_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "d7be191e8545fc04510b1a768dec86a55eb01a4e7a7ab0aab7131b6bafb81fbb"
+_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "117b2cb39a25302e3d4eae087fefdd7541629788e33d14503eef924973f2b081"
 
 
 def _reviewed_checkpoint_builder_hash(source: bytes) -> str | None:

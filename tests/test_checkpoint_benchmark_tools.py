@@ -124,7 +124,8 @@ def test_worker_commits_each_prefix_and_reads_back_final_snapshot(tmp_path: Path
     assert all(row["wall_seconds"] >= 0 and row["file_size_bytes"] > 0 for row in measurements)
 
 
-def test_batch_replay_uses_each_stored_result_and_preserves_identity_flags(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["batch-replay", "resume-replay", "partial-resume-replay"])
+def test_batch_replay_uses_each_stored_result_and_preserves_identity_flags(tmp_path: Path, mode: str) -> None:
     source_checkpoint = tmp_path / "source.json"
     fixture = tmp_path / "fixture.jsonl"
     records = []
@@ -152,7 +153,7 @@ def test_batch_replay_uses_each_stored_result_and_preserves_identity_flags(tmp_p
 
     result = _worker(SimpleNamespace(
         source=Path(__file__).resolve().parents[1], revision="test-source", fixture=fixture,
-        mode="batch-replay", indices=None, frames=None, output_dir=output,
+        mode=mode, indices=None, frames=None, output_dir=output,
         worker_metrics=metrics_path, worker_measurements=measurements_path,
     ))
 
@@ -163,10 +164,25 @@ def test_batch_replay_uses_each_stored_result_and_preserves_identity_flags(tmp_p
     assert metrics["scientific_fit_performed"] is False
     assert metrics["report_or_package_performed"] is False
     assert metrics["normal_run_batch_input_and_config_fingerprinting"] is True
-    assert metrics["write_count"] == metrics["checkpoint_payload_count"] == 3
+    expected_writes = {"resume-replay": 1, "partial-resume-replay": 2, "batch-replay": 3}[mode]
+    assert metrics["write_count"] == metrics["checkpoint_payload_count"] == expected_writes
     assert metrics["readback_verification"]["frame_identity_order_equal"] is True
     assert metrics["readback_verification"]["stable_status_and_diagnostic_flags_equal"] is True
     assert metrics["readback_verification"]["source_resumed_count"] == 2
-    assert metrics["readback_verification"]["target_resumed_count"] == 0
-    assert [row["write_phase"] for row in measurements] == ["frame_prefix", "frame_prefix", "final_snapshot"]
+    assert metrics["readback_verification"]["target_resumed_count"] == ({"resume-replay": 2, "partial-resume-replay": 1, "batch-replay": 0}[mode])
+    assert [row["write_phase"] for row in measurements] == (
+        ["frame_prefix"] * (expected_writes - 1) + ["final_snapshot"])
+    if mode == "resume-replay":
+        assert metrics["restoration_profile"][0]["calls"] == 2
     assert all("payload_construction" in row for row in measurements)
+
+
+def test_synthetic_fixture_is_explicitly_labeled(tmp_path):
+    from scripts.benchmark_checkpoint_writes import create_synthetic_fixture
+
+    fixture = create_synthetic_fixture(tmp_path / 'synthetic', frames=2, points=10)
+    metadata = json.loads(fixture.with_name(fixture.name + '.metadata.json').read_text())
+    assert metadata['checkpoint_metadata']['benchmark_synthetic'] is True
+    rows = [json.loads(row) for row in fixture.read_text().splitlines()]
+    assert len(rows) == 2 and len(rows[0]['result']['profile']) == 11
+    assert rows[0]['result']['profile'][-1].hex() == (-0.).hex()
