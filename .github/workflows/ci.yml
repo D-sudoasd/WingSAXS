@@ -77,6 +77,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Create isolated test environment
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import venv
+
+          # The desktop launcher also discovers this project-local environment.
+          environment = Path(os.environ["GITHUB_WORKSPACE"]) / ".venv-project"
+          venv.EnvBuilder(with_pip=True, system_site_packages=False).create(environment)
+          scripts = environment / ("Scripts" if os.name == "nt" else "bin")
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as handle:
+              handle.write(str(scripts) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"VIRTUAL_ENV={environment}\n")
+              handle.write("PYTHONNOUSERSITE=1\n")
+
       - name: Install Linux Qt runtime and CJK fonts
         if: runner.os == 'Linux'
         run: |
@@ -89,7 +106,16 @@ jobs:
           python -m pip install -c constraints/validation-py311-313.txt ".[all]"
 
       - name: Check dependencies
-        run: python -m pip check
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          assert sys.prefix != sys.base_prefix, sys.executable
+          assert Path(sys.prefix).resolve() == Path(os.environ["VIRTUAL_ENV"]).resolve()
+          subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
 
       - name: Test
         env:

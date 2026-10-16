@@ -16,11 +16,11 @@ from butterfly_saxs import batch, producer
 from butterfly_saxs.export import StreamingBatchExporter
 
 
-def _legacy_identity(current, *, compact=False):
+def _legacy_identity(current, *, compact=False, source_pair=None):
     old = copy.deepcopy(current)
     sources = (producer._PREVIOUS_COMPACT_CHECKPOINT_SOURCES if compact
                else producer._PRETTY_CHECKPOINT_SOURCES)
-    old_batch, old_producer = sorted(sources)[0]
+    old_batch, old_producer = source_pair or sorted(sources)[0]
     old["sources"].update({"batch.py": old_batch, "producer.py": old_producer})
     return old
 
@@ -84,15 +84,15 @@ def test_builder_source_pin_rejects_an_unreviewed_rule_change():
     assert producer._reviewed_checkpoint_builder_hash(changed) is None
 
 
-@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("source_pair", sorted(producer._PRETTY_CHECKPOINT_SOURCES | producer._PREVIOUS_COMPACT_CHECKPOINT_SOURCES))
 @pytest.mark.parametrize("partial", [False, True])
-def test_legacy_checkpoint_and_native_arrays_restore_without_refitting(tmp_path, monkeypatch, partial, compact):
+def test_legacy_checkpoint_and_native_arrays_restore_without_refitting(tmp_path, monkeypatch, partial, source_pair):
     paths = [tmp_path / f"frame_{index}.dat" for index in range(2)]
     for index, path in enumerate(paths):
         path.write_text(str(index))
     output, checkpoint = tmp_path / "bundle", tmp_path / "checkpoint.json"
     current = producer.producer_identity()
-    legacy = _legacy_identity(current, compact=compact)
+    legacy = _legacy_identity(current, source_pair=source_pair)
     stop = threading.Event()
 
     def analyze(frame):
@@ -149,8 +149,9 @@ def test_legacy_checkpoint_and_native_arrays_restore_without_refitting(tmp_path,
         }
 
 
+@pytest.mark.parametrize("prepared", [False, True])
 @pytest.mark.parametrize("boundary", ["fsync", "replace"])
-def test_real_process_exit_preserves_a_whole_checkpoint_generation(tmp_path, boundary):
+def test_real_process_exit_preserves_a_whole_checkpoint_generation(tmp_path, boundary, prepared):
     checkpoint = tmp_path / "checkpoint.json"
     prior = {"version": 1, "processed_count": 1, "frames": [{"result": {"a": -0.}}]}
     checkpoint.write_text(json.dumps(prior, indent=2), encoding="utf-8")
@@ -163,11 +164,14 @@ def stop(*args, **kwargs):
     result = original(*args, **kwargs)
     os._exit(99)
 setattr(batch.os, boundary, stop)
-batch.write_checkpoint(sys.argv[1], {"version": 1, "processed_count": 2,
-    "frames": [{"result": {"a": -0.}}, {"result": {"a": 1.0000000000000002}}]})
+payload = {"version": 1, "processed_count": 2,
+    "frames": [{"result": {"a": -0.}}, {"result": {"a": 1.0000000000000002}}]}
+if sys.argv[3] == "True":
+    payload = batch._CheckpointPayload(payload)
+batch.write_checkpoint(sys.argv[1], payload)
 """
     env = {**os.environ, "PYTHONPATH": str(Path(batch.__file__).resolve().parents[1])}
-    stopped = subprocess.run([sys.executable, "-c", code, str(checkpoint), boundary],
+    stopped = subprocess.run([sys.executable, "-c", code, str(checkpoint), boundary, str(prepared)],
                              env=env, capture_output=True, timeout=30)
     assert stopped.returncode == 99, stopped.stderr.decode(errors="replace")
     record = batch.read_checkpoint(checkpoint)
