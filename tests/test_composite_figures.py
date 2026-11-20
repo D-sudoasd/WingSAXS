@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import json
+from pathlib import Path
 import struct
 
 import matplotlib
@@ -15,13 +17,13 @@ from butterfly_saxs.composite_figures import (
     FigureSpec,
     PUBLICATION_FIGURE_SCHEMA,
     PanelSpec,
-    export_publication_figure,
     plot_azimuthal_fit_panel,
     plot_evolution_panel,
     plot_polar_q_chi_panel,
     plot_radial_kratky_panel,
     plot_saxs_2d_panel,
     plot_streak_width_panel,
+    render_sample_physics_dashboard,
 )
 from butterfly_saxs.journal_style import inches_to_mm
 
@@ -353,3 +355,249 @@ def test_export_publication_figure_writes_vector_raster_source_data_and_sha256_m
         "fig1_butterfly_source_data/panel_a.csv",
         "fig1_butterfly_source_data/panel_b.csv",
     }
+
+
+def test_2d_and_polar_panels_clean_colorbar_ticks_wrapped_rays_and_intensity_modes():
+    image, qx, qy, valid_mask = _synthetic_saxs_2d()
+    # Low-count raw intensity scale (~0.03..3.0) reproducing BL19B2 raw colorbar challenge.
+    low_img = 0.03 + 2.97 * ((image - np.nanmin(image)) / (np.nanmax(image) - np.nanmin(image)))
+
+    builder = CompositeFigureBuilder(preset="nature", width="double", height_mm=86.0, nrows=1, ncols=2, dpi=120)
+    ax2d = builder.add_panel("a", 0, 0)
+    axpol = builder.add_panel("b", 0, 1)
+
+    res2d = plot_saxs_2d_panel(
+        ax2d,
+        low_img,
+        qx,
+        qy,
+        valid_mask=valid_mask,
+        q_unit="nm^-1",
+        intensity_mode="raw_fallback",
+        norm_mode="asinh",
+        bisector_deg=2.0,
+        half_opening_deg=38.0,
+        title="2D SAXS (0.15 h, raw fb)",
+    )
+    assert res2d["rays_deg"] == pytest.approx([324.0, 40.0, 144.0, 220.0])
+    assert len(res2d["colorbar_ticks"]) >= 2
+    norm2d = res2d["norm"]
+    pos2d = [float(norm2d(t)) for t in res2d["colorbar_ticks"]]
+    assert all(pos2d[i + 1] - pos2d[i] >= 0.16 - 1e-6 for i in range(len(pos2d) - 1))
+    cbar2d_label = res2d["colorbar"].ax.get_ylabel()
+    assert "counts (raw fallback)" in cbar2d_label
+    assert "cm" not in cbar2d_label.lower()
+
+    # Polar map over [0, 360] with seam-crossing rays and raw intensity mode.
+    q_edges = np.linspace(0.11, 1.0, 21)
+    chi_edges = np.linspace(0.0, 360.0, 37)
+    polar_z = np.full((20, 36), 0.05)
+    polar_z[6:10, :] = 2.8
+    res_pol = plot_polar_q_chi_panel(
+        axpol,
+        polar_z,
+        q_edges,
+        chi_edges,
+        q_unit="nm^-1",
+        intensity_mode="raw_counts",
+        bisector_deg=2.0,
+        half_opening_deg=38.0,
+    )
+    assert res_pol["rays_deg"] == pytest.approx([324.0, 40.0, 144.0, 220.0])
+    assert sorted(res_pol["drawn_rays_deg"]) == pytest.approx([40.0, 144.0, 220.0, 324.0])
+    assert all(0.0 <= ang <= 360.0 for ang in res_pol["drawn_rays_deg"])
+    cbar_pol_label = res_pol["colorbar"].ax.get_ylabel()
+    assert "counts (raw)" in cbar_pol_label
+    assert "cm" not in cbar_pol_label.lower()
+    assert len(res_pol["colorbar_ticks"]) >= 2
+
+    builder.figure.canvas.draw()
+    builder.figure.clear()
+
+
+def _synthetic_dashboard_inputs(*, mixed: bool = False, q_unit: str = "nm^-1"):
+    image, qx, qy, valid_mask = _synthetic_saxs_2d()
+    q_edges = np.linspace(0.11, 1.0, 21)
+    chi_edges = np.linspace(0.0, 360.0, 37)
+    polar_z = np.full((20, 36), 4.0)
+    polar_z[6:10, :] = 90.0
+    q_grid = np.linspace(0.11, 1.0, 40)
+    iq1 = 1.5 + 30.0 * np.exp(-0.5 * ((q_grid - 0.35) / 0.07) ** 2)
+    iq2 = 1.5 + 80.0 * np.exp(-0.5 * ((q_grid - 0.30) / 0.06) ** 2)
+    chi_az = np.linspace(0.0, 360.0, 73)
+    bridge = 10.0 + 4.0 * np.cos(2.0 * np.deg2rad(chi_az - 2.0))
+    lobes = [
+        20.0 * np.exp(-0.5 * (((chi_az - mu + 180.0) % 360.0 - 180.0) / 14.0) ** 2)
+        for mu in (324.0, 40.0, 144.0, 220.0)
+    ]
+    fit_total = bridge + sum(lobes)
+    obs_az = fit_total + 0.3 * np.sin(np.deg2rad(chi_az * 3.0))
+
+    rows = [
+        {
+            "frame_index": 0,
+            "elapsed_h": 0.2,
+            "status": "ok",
+            "q_unit": q_unit,
+            "calibration_mode": "calibrated",
+            "L_star_direct_nm": 18.0 if q_unit == "nm^-1" else None,
+            "L_star_kratky_nm": 12.0 if q_unit == "nm^-1" else None,
+            "Q_win_sub": 2.5,
+            "a4": 0.18,
+            "wing_half_opening_deg": 38.0,
+            "lobe_fwhm_deg": 24.0,
+            "c2_r2": 0.92,
+        },
+        {
+            "frame_index": 1,
+            "elapsed_h": 1.0,
+            "status": "ok",
+            "q_unit": q_unit,
+            "calibration_mode": "calibrated",
+            "L_star_direct_nm": 20.5 if q_unit == "nm^-1" else None,
+            "L_star_kratky_nm": 14.0 if q_unit == "nm^-1" else None,
+            "Q_win_sub": 8.0,
+            "a4": 0.45,
+            "wing_half_opening_deg": 39.5,
+            "lobe_fwhm_deg": 22.0,
+            "c2_r2": 0.60,  # below 0.75 gate -> alpha/FWHM suppressed
+        },
+        {
+            "frame_index": 2,
+            "elapsed_h": 2.0,
+            "status": "ok",
+            "q_unit": q_unit,
+            "calibration_mode": "raw_fallback" if mixed else "calibrated",
+            "L_star_direct_nm": 22.0 if q_unit == "nm^-1" else None,
+            "L_star_kratky_nm": 15.2 if q_unit == "nm^-1" else None,
+            "Q_win_sub": 9999.0 if mixed else 12.4,
+            "a4": 0.56,
+            "wing_half_opening_deg": 40.2,
+            "lobe_fwhm_deg": 20.5,
+            "c2_r2": 0.95,
+        },
+    ]
+
+    radial_curves = [
+        {"label": "0.20 h", "q": q_grid, "intensity": iq1, "q_star_direct": 0.35, "calibration_mode": "calibrated"},
+        {"label": "1.00 h", "q": q_grid, "intensity": iq2, "q_star_direct": 0.30, "calibration_mode": "calibrated"},
+    ]
+    if mixed:
+        radial_curves.append(
+            {"label": "2.00 h raw", "q": q_grid, "intensity": iq2 * 100.0, "calibration_mode": "raw_fallback"}
+        )
+
+    cache = {
+        "q_unit": q_unit,
+        "endpoint_intensity_mode": "raw_fallback" if mixed else "calibrated",
+        "q_cutoffs": [{"q": 0.11, "label": "Beamstop", "shade_below": True}],
+        "endpoint_2d": {
+            "image": image,
+            "qx": qx,
+            "qy": qy,
+            "valid_mask": valid_mask,
+            "beamstop_q": 0.11,
+            "bisector_deg": 2.0,
+            "half_opening_deg": 38.0,
+        },
+        "endpoint_polar": {
+            "polar_intensity": polar_z,
+            "q_coords": q_edges,
+            "chi_coords_deg": chi_edges,
+            "bisector_deg": 2.0,
+            "half_opening_deg": 38.0,
+        },
+        "radial_curves": radial_curves,
+        "endpoint_azimuthal": {
+            "chi_deg": chi_az,
+            "observed": obs_az,
+            "fit_total": fit_total,
+            "c2_bridge": bridge,
+            "lobe_components": lobes,
+            "bisector_deg": 2.0,
+            "half_opening_deg": 38.0,
+            "r2": 0.991,
+            "lobe_fwhm_deg": 22.4,
+        },
+    }
+    return rows, cache
+
+
+def test_render_sample_physics_dashboard_exports_6_panels_source_data_and_respects_modes(tmp_path):
+    rows, cache = _synthetic_dashboard_inputs(mixed=False)
+    stem = tmp_path / "dash_cal"
+    manifest = render_sample_physics_dashboard(
+        rows,
+        cache,
+        stem,
+        sample_label="14_475C_02h_2026_run22_设定500C",
+        intensity_mode="calibrated",
+        journal_style="nature",
+        formats=("pdf", "svg", "png"),
+        dpi=150,
+    )
+    assert manifest["size_mm"][0] == pytest.approx(183.0, abs=0.05)
+    assert manifest["intensity_mode"] == "calibrated"
+    assert manifest["endpoint_intensity_mode"] == "calibrated"
+    assert manifest["panel_summary"]["panel_d"]["q_win_plotted"] is True
+    assert manifest["panel_summary"]["panel_e"]["n_r2_gated"] == 1
+
+    # Strict JSON and SHA-256 verification.
+    json.dumps(manifest, allow_nan=False)
+    for rel_path, expected_sha in manifest["sha256"].items():
+        actual_sha = hashlib.sha256((tmp_path / rel_path).read_bytes()).hexdigest()
+        assert actual_sha == expected_sha
+    assert (tmp_path / "dash_cal.pdf").is_file()
+    assert (tmp_path / "dash_cal.png").is_file()
+    svg_text = (tmp_path / "dash_cal.svg").read_text(encoding="utf-8")
+    # Zero CJK tofu glyphs inside SVG!
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in svg_text)
+
+    # Mixed mode: panel c filters raw curve out, panel d drops raw Q_win, panel a/b/f tagged raw_fallback.
+    rows_m, cache_m = _synthetic_dashboard_inputs(mixed=True)
+    stem_m = tmp_path / "dash_mixed"
+    man_m = render_sample_physics_dashboard(
+        rows_m,
+        cache_m,
+        stem_m,
+        sample_label="11_425C_02h_2026_run15",
+        intensity_mode="mixed",
+        formats=("svg",),
+        dpi=100,
+    )
+    assert man_m["endpoint_intensity_mode"] == "raw_fallback"
+    assert man_m["panel_summary"]["panel_c"]["calibrated_only_filtered"] is True
+    assert man_m["panel_summary"]["panel_c"]["excluded_raw_curves"] == 1
+    with (tmp_path / "dash_mixed_source_data" / "panel_d_spacing_invariant.csv").open(encoding="utf-8") as fh:
+        d_rows = list(csv.DictReader(fh))
+    assert d_rows[0]["Q_win_calibrated"] == "2.5"
+    assert d_rows[2]["Q_win_calibrated"] == ""  # raw fallback frame excluded!
+
+    # Pixel-q + raw-counts mode: no nm lengths and no calibrated Q_win plotted.
+    rows_p, cache_p = _synthetic_dashboard_inputs(mixed=False, q_unit="pixel-q")
+    for r in rows_p:
+        r["calibration_mode"] = "raw_counts"
+    cache_p["endpoint_intensity_mode"] = "raw_counts"
+    man_p = render_sample_physics_dashboard(
+        rows_p,
+        cache_p,
+        tmp_path / "dash_pixelq",
+        intensity_mode="raw_counts",
+        formats=("png",),
+        dpi=100,
+    )
+    assert man_p["panel_summary"]["panel_d"]["physical_q"] is False
+    assert man_p["panel_summary"]["panel_d"]["q_win_plotted"] is False
+
+
+def test_pub_polish_modules_are_qt_free_and_pyplot_free():
+    src_root = Path(__file__).resolve().parents[1] / "src" / "butterfly_saxs"
+    forbidden_prefixes = ("matplotlib.pyplot", "PyQt", "PySide", "qtpy")
+    for name in ("journal_style.py", "composite_figures.py", "comparison_report.py"):
+        tree = ast.parse((src_root / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith(forbidden_prefixes), f"{name} imports {alias.name}"
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                assert not node.module.startswith(forbidden_prefixes), f"{name} imports from {node.module}"

@@ -12,6 +12,8 @@ from butterfly_saxs.journal_style import (
     JournalPreset,
     apply_journal_style,
     format_axis_label,
+    format_clean_colorbar_ticks,
+    format_clean_tick_label,
     format_math_unit,
     get_journal_preset,
     get_okabe_ito_palette,
@@ -27,6 +29,7 @@ from butterfly_saxs.journal_style import (
     style_1d_axes,
     style_2d_axes,
     style_panel_label,
+    wrap_butterfly_ray_angles_deg,
 )
 
 
@@ -221,3 +224,96 @@ def test_style_panel_label_and_axes_helpers():
     txt_b = style_panel_label(ax2, "b", preset="nature", inside=True)
     assert txt_b.get_bbox_patch() is not None
     fig.clear()
+
+
+def test_format_clean_colorbar_ticks_prevents_bottom_collisions_across_norms():
+    # Low-count raw BL19B2 AsinhNorm case (previously suffered colliding 0.03/0.04 ticks).
+    asinh_low = AsinhNorm(linear_width=0.05, vmin=0.03, vmax=3.0)
+    ticks_low = format_clean_colorbar_ticks(asinh_low, 0.03, 3.0, min_visual_gap=0.16, max_ticks=5)
+    assert 2 <= len(ticks_low) <= 5
+    assert ticks_low == sorted(ticks_low)
+    assert all(0.03 <= t <= 3.0 for t in ticks_low)
+    pos_low = [float(asinh_low(t)) for t in ticks_low]
+    assert all(pos_low[i + 1] - pos_low[i] >= 0.16 - 1e-6 for i in range(len(pos_low) - 1))
+    assert not (0.03 in ticks_low and 0.04 in ticks_low)
+
+    # High-dynamic-range calibrated AsinhNorm (10..1e3 crisp decades).
+    asinh_hi = AsinhNorm(linear_width=10.0, vmin=2.0, vmax=1500.0)
+    ticks_hi = format_clean_colorbar_ticks(asinh_hi, 2.0, 1500.0, min_visual_gap=0.16, max_ticks=5)
+    assert 2 <= len(ticks_hi) <= 5
+    assert 10.0 in ticks_hi and 100.0 in ticks_hi and 1000.0 in ticks_hi
+    pos_hi = [float(asinh_hi(t)) for t in ticks_hi]
+    assert all(pos_hi[i + 1] - pos_hi[i] >= 0.16 - 1e-6 for i in range(len(pos_hi) - 1))
+
+    # LogNorm low-count and wide multi-decade cases.
+    log_low = LogNorm(vmin=0.03, vmax=3.5)
+    ticks_log_low = format_clean_colorbar_ticks(log_low, 0.03, 3.5, min_visual_gap=0.16, max_ticks=5)
+    assert 2 <= len(ticks_log_low) <= 5
+    pos_ll = [float(log_low(t)) for t in ticks_log_low]
+    assert all(pos_ll[i + 1] - pos_ll[i] >= 0.16 - 1e-6 for i in range(len(pos_ll) - 1))
+
+    log_wide = LogNorm(vmin=1e-2, vmax=1e4)
+    ticks_log_wide = format_clean_colorbar_ticks(log_wide, 1e-2, 1e4, min_visual_gap=0.16, max_ticks=5)
+    assert 2 <= len(ticks_log_wide) <= 5
+    pos_lw = [float(log_wide(t)) for t in ticks_log_wide]
+    assert all(pos_lw[i + 1] - pos_lw[i] >= 0.16 - 1e-6 for i in range(len(pos_lw) - 1))
+
+    # Linear Normalize (standard and narrow range).
+    lin_norm = Normalize(vmin=0.0, vmax=10.0)
+    ticks_lin = format_clean_colorbar_ticks(lin_norm, 0.0, 10.0, min_visual_gap=0.16, max_ticks=5)
+    assert 2 <= len(ticks_lin) <= 5
+    pos_lin = [float(lin_norm(t)) for t in ticks_lin]
+    assert all(pos_lin[i + 1] - pos_lin[i] >= 0.16 - 1e-6 for i in range(len(pos_lin) - 1))
+
+    narrow_norm = Normalize(vmin=1.1, vmax=1.9)
+    ticks_narrow = format_clean_colorbar_ticks(narrow_norm, 1.1, 1.9, min_visual_gap=0.16, max_ticks=5)
+    assert 2 <= len(ticks_narrow) <= 5
+    assert all(1.1 <= t <= 1.9 for t in ticks_narrow)
+
+    # Degenerate equal bounds and input validation.
+    assert format_clean_colorbar_ticks(Normalize(vmin=5.0, vmax=5.0), 5.0, 5.0) == [5.0]
+    with pytest.raises(ValueError):
+        format_clean_colorbar_ticks(lin_norm, float("nan"), 10.0)
+    with pytest.raises(ValueError):
+        format_clean_colorbar_ticks(lin_norm, 0.0, 10.0, min_visual_gap=0.0)
+    with pytest.raises(ValueError):
+        format_clean_colorbar_ticks(lin_norm, 0.0, 10.0, max_ticks=0)
+
+
+def test_format_clean_tick_label_compact_formatting():
+    assert format_clean_tick_label(0.0) == "0"
+    assert format_clean_tick_label(-0.0) == "0"
+    assert format_clean_tick_label(0.030000000000000004) == "0.03"
+    assert format_clean_tick_label(0.1) == "0.1"
+    assert format_clean_tick_label(0.25) == "0.25"
+    assert format_clean_tick_label(1.0) == "1"
+    assert format_clean_tick_label(10.0) == "10"
+    assert format_clean_tick_label(100.0) == "100"
+    assert format_clean_tick_label(1000.0) == "1e3"
+    assert format_clean_tick_label(2500.0) == "2.5e3"
+    assert format_clean_tick_label(0.001) == "1e-3"
+    assert format_clean_tick_label(-0.005) == "-5e-3"
+    assert format_clean_tick_label(float("nan")) == ""
+    with pytest.raises(ValueError):
+        format_clean_tick_label(True)
+
+
+def test_wrap_butterfly_ray_angles_deg_across_zero_seam():
+    # Crossing the 0/360 seam (equatorial bridge near 2 deg, half-opening 38 deg).
+    rays = wrap_butterfly_ray_angles_deg(2.0, 38.0)
+    assert rays == pytest.approx((324.0, 40.0, 144.0, 220.0))
+    assert all(0.0 <= a < 360.0 for a in rays)
+
+    # Vertical draw axis (90 deg +/- 38 deg).
+    assert wrap_butterfly_ray_angles_deg(90.0, 38.0) == pytest.approx((52.0, 128.0, 232.0, 308.0))
+
+    # Floating-point boundary near 0 / 360 never produces 360.0.
+    seam_rays = wrap_butterfly_ray_angles_deg(0.0, 1e-16)
+    assert all(0.0 <= a < 360.0 for a in seam_rays)
+
+    with pytest.raises(ValueError):
+        wrap_butterfly_ray_angles_deg(10.0, -5.0)
+    with pytest.raises(ValueError):
+        wrap_butterfly_ray_angles_deg(float("nan"), 30.0)
+    with pytest.raises(ValueError):
+        wrap_butterfly_ray_angles_deg(True, 30.0)

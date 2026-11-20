@@ -835,6 +835,319 @@ def make_saxs_norm(
     return AsinhNorm(linear_width=lw, vmin=lo, vmax=hi, clip=True)
 
 
+def _clean_tick_float(val: float) -> float:
+    cleaned = float(f"{float(val):.12g}")
+    return 0.0 if cleaned == 0.0 else cleaned
+
+
+def _eval_norm_position(norm: Any, val: float) -> float | None:
+    try:
+        raw = norm(float(val))
+    except (TypeError, ValueError, ZeroDivisionError, FloatingPointError):
+        return None
+    if np.ma.isMaskedArray(raw):
+        if bool(np.ma.is_masked(raw)):
+            return None
+        raw = np.ma.getdata(raw)
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.size != 1:
+        return None
+    pos = float(arr.reshape(-1)[0])
+    if not math.isfinite(pos) or pos < -1e-6 or pos > 1.0 + 1e-6:
+        return None
+    return min(1.0, max(0.0, pos))
+
+
+def format_clean_tick_label(val: float) -> str:
+    """Format a colorbar or axis tick value compactly without noisy float artifacts.
+
+    Examples:
+        ``0.0`` -> ``"0"``
+        ``0.030000000000000004`` -> ``"0.03"``
+        ``1000.0`` -> ``"1e3"``
+        ``0.001`` -> ``"1e-3"``
+    """
+    if isinstance(val, bool):
+        raise ValueError("val must be a real number, not bool")
+    try:
+        fval = float(val)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"val must be numeric, got {val!r}") from exc
+    if not math.isfinite(fval):
+        return ""
+    abs_v = abs(fval)
+    if abs_v < 1e-15:
+        return "0"
+    sign = "-" if fval < 0.0 else ""
+
+    rounded_fixed = round(abs_v, 4)
+    if 0.01 <= rounded_fixed < 1000.0 and abs_v >= 0.01 - 1e-12:
+        body = f"{rounded_fixed:.4f}".rstrip("0").rstrip(".")
+        return f"{sign}{body}"
+
+    exp = math.floor(math.log10(abs_v))
+    mant = abs_v / (10.0 ** exp)
+    mant_r = round(mant, 3)
+    if mant_r >= 10.0:
+        mant_r = round(mant_r / 10.0, 3)
+        exp += 1
+    if abs(mant_r - round(mant_r)) < 1e-9:
+        mant_str = str(int(round(mant_r)))
+    else:
+        mant_str = f"{mant_r:.3f}".rstrip("0").rstrip(".")
+    return f"{sign}{mant_str}e{exp}"
+
+
+def _linear_nice_ticks(
+    norm: Any,
+    lo: float,
+    hi: float,
+    *,
+    min_visual_gap: float,
+    max_ticks: int,
+) -> list[tuple[float, float]]:
+    span = hi - lo
+    if span <= 0.0:
+        pos = _eval_norm_position(norm, lo)
+        return [(_clean_tick_float(lo), pos)] if pos is not None else []
+    min_step = span * max(min_visual_gap, 1.0 / max(max_ticks, 1))
+    base_exp = math.floor(math.log10(max(min_step, 1e-30)))
+    eps = 1e-9 * span
+
+    for exp in range(base_exp - 1, base_exp + 4):
+        for mult in (1.0, 2.0, 2.5, 5.0):
+            step = mult * (10.0 ** exp)
+            if step <= 0.0 or not math.isfinite(step):
+                continue
+            k_start = math.ceil((lo - eps) / step)
+            k_end = math.floor((hi + eps) / step)
+            count = k_end - k_start + 1
+            if count < 1 or count > max_ticks:
+                continue
+            pts: list[tuple[float, float]] = []
+            ok = True
+            for k in range(k_start, k_end + 1):
+                tv = _clean_tick_float(k * step)
+                if tv < lo - eps or tv > hi + eps:
+                    continue
+                tv_clamped = min(hi, max(lo, tv))
+                pos = _eval_norm_position(norm, tv_clamped)
+                if pos is None:
+                    ok = False
+                    break
+                if pts and abs(pos - pts[-1][1]) < min_visual_gap - 1e-9:
+                    ok = False
+                    break
+                pts.append((_clean_tick_float(tv_clamped), pos))
+            if ok and len(pts) >= 2:
+                return pts
+    return []
+
+
+def format_clean_colorbar_ticks(
+    norm: Any,
+    vmin: float,
+    vmax: float,
+    *,
+    min_visual_gap: float = 0.16,
+    max_ticks: int = 5,
+) -> list[float]:
+    """Select crisp, non-overlapping numeric colorbar ticks filtered by normalized visual spacing.
+
+    Generates human-friendly ``1-2-5`` decades and subticks (with linear step fallback on
+    narrow ranges) and enforces ``|norm(t_i) - norm(t_j)| >= min_visual_gap`` so ``AsinhNorm``
+    and ``LogNorm`` colorbars never suffer colliding bottom tick labels.
+    """
+    if isinstance(vmin, bool) or isinstance(vmax, bool):
+        raise ValueError("vmin and vmax must be finite real numbers, not bool")
+    if isinstance(min_visual_gap, bool):
+        raise ValueError("min_visual_gap must be a positive real number, not bool")
+    if isinstance(max_ticks, bool) or not isinstance(max_ticks, int) or max_ticks < 1:
+        raise ValueError(f"max_ticks must be an integer >= 1, got {max_ticks!r}")
+
+    lo = float(vmin)
+    hi = float(vmax)
+    gap = float(min_visual_gap)
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError(f"vmin and vmax must be finite, got vmin={vmin!r}, vmax={vmax!r}")
+    if not math.isfinite(gap) or gap <= 0.0:
+        raise ValueError(f"min_visual_gap must be positive and finite, got {min_visual_gap!r}")
+    if hi < lo:
+        lo, hi = hi, lo
+    if math.isclose(lo, hi, rel_tol=0.0, abs_tol=1e-15):
+        pos = _eval_norm_position(norm, lo)
+        return [_clean_tick_float(lo)] if pos is not None else []
+
+    # Pure linear Normalize: prefer uniform nice linear 1-2-2.5-5 step ticks.
+    if type(norm) is Normalize:
+        lin_pts = _linear_nice_ticks(norm, lo, hi, min_visual_gap=gap, max_ticks=max_ticks)
+        if lin_pts:
+            return [val for val, _ in lin_pts]
+
+    span = hi - lo
+    eps = 1e-12 * max(span, abs(lo), abs(hi), 1.0)
+    tier0_raw: list[float] = []
+    tier1_raw: list[tuple[float, int]] = []
+    tier2_raw: list[tuple[float, int]] = []
+
+    if lo <= 0.0 <= hi:
+        tier0_raw.append(0.0)
+
+    def _add_side(side_lo: float, side_hi: float, sign: float) -> None:
+        if side_hi <= 0.0:
+            return
+        exp_max = math.ceil(math.log10(side_hi))
+        if side_lo > 0.0:
+            exp_min = math.floor(math.log10(side_lo)) - 1
+        else:
+            lw = getattr(norm, "linear_width", None)
+            if lw is not None and not isinstance(lw, bool):
+                try:
+                    lw_f = float(lw)
+                except (TypeError, ValueError):
+                    lw_f = 0.0
+            else:
+                lw_f = 0.0
+            ref_lo = min(side_hi, lw_f) * 0.1 if (math.isfinite(lw_f) and lw_f > 0.0) else side_hi * 1e-4
+            exp_min = math.floor(math.log10(max(ref_lo, 1e-30))) - 1
+        exp_min = max(exp_min, exp_max - 12)
+        for exp in range(exp_min, exp_max + 1):
+            base = 10.0 ** exp
+            v1 = _clean_tick_float(sign * base)
+            if lo - eps <= v1 <= hi + eps:
+                tier0_raw.append(min(hi, max(lo, v1)) if (v1 < lo or v1 > hi) else v1)
+            for mult, prio in ((5.0, 2), (2.0, 1)):
+                vm = _clean_tick_float(sign * mult * base)
+                if lo - eps <= vm <= hi + eps:
+                    tier1_raw.append((min(hi, max(lo, vm)) if (vm < lo or vm > hi) else vm, prio))
+            v3 = _clean_tick_float(sign * 3.0 * base)
+            if lo - eps <= v3 <= hi + eps:
+                tier2_raw.append((min(hi, max(lo, v3)) if (v3 < lo or v3 > hi) else v3, 0))
+
+    if hi > 0.0:
+        _add_side(max(lo, 0.0), hi, 1.0)
+    if lo < 0.0:
+        _add_side(max(-hi, 0.0), -lo, -1.0)
+
+    def _dedup_eval(items: list[tuple[float, int]]) -> list[tuple[float, float, int]]:
+        seen: dict[float, tuple[float, float, int]] = {}
+        for val, prio in items:
+            cval = _clean_tick_float(val)
+            if cval in seen:
+                continue
+            pos = _eval_norm_position(norm, cval)
+            if pos is None:
+                continue
+            seen[cval] = (cval, pos, prio)
+        return list(seen.values())
+
+    tier0 = _dedup_eval([(v, 3) for v in tier0_raw])
+    tier1 = _dedup_eval(tier1_raw)
+    tier2 = _dedup_eval(tier2_raw)
+
+    # Step 1: Filter pure decades (and 0) cleanly from top down, preferring 0 over sub-linear-width decades.
+    selected: list[tuple[float, float]] = []
+    zero_entry = next(((v, p) for v, p, _ in tier0 if v == 0.0), None)
+    if zero_entry is not None:
+        selected.append(zero_entry)
+
+    non_zero_t0 = sorted(((v, p) for v, p, _ in tier0 if v != 0.0), key=lambda item: item[1], reverse=True)
+    for val, pos in non_zero_t0:
+        if all(abs(pos - sp) >= gap - 1e-9 for _, sp in selected):
+            selected.append((val, pos))
+    selected.sort(key=lambda item: item[0])
+
+    # If pure decades alone exceed max_ticks, thin uniformly with integer stride keeping upper range.
+    if len(selected) > max_ticks:
+        if max_ticks == 1:
+            selected = [min(selected, key=lambda item: abs(item[1] - 0.5))]
+        else:
+            stride = math.ceil((len(selected) - 1) / float(max_ticks - 1))
+            thinned = selected[::-stride][::-1]
+            if len(thinned) > max_ticks:
+                thinned = thinned[-max_ticks:]
+            selected = thinned
+
+    def _insert_widest(pool: list[tuple[float, float, int]]) -> None:
+        while len(selected) < max_ticks:
+            best: tuple[float, int, float, float] | None = None
+            for val, pos, prio in pool:
+                if any(math.isclose(val, sv, rel_tol=0.0, abs_tol=1e-12) for sv, _ in selected):
+                    continue
+                if selected:
+                    min_dist = min(abs(pos - sp) for _, sp in selected)
+                else:
+                    min_dist = 1.0 - abs(pos - 0.5)
+                if min_dist < gap - 1e-9:
+                    continue
+                score = (round(min_dist, 6), prio, -abs(pos - 0.5), pos)
+                if best is None or score > best[:4]:
+                    best = (*score[:3], pos)
+                    best_item = (val, pos)
+            if best is None:
+                break
+            selected.append(best_item)
+            selected.sort(key=lambda item: item[0])
+
+    # Step 2: Insert 1-2-5 subticks (2, 5) into widest visual gaps.
+    _insert_widest(tier1)
+
+    # Step 3: If wide gaps remain where neither 2 nor 5 fit (e.g. ~2-decade log/asinh spans), allow 3*10^e.
+    if len(selected) < min(max_ticks, 4):
+        _insert_widest(tier2)
+
+    # Step 4: Narrow-range fallback when fewer than 2 ticks were found from decades/subticks.
+    if len(selected) < 2 and max_ticks >= 2:
+        lin_pts = _linear_nice_ticks(norm, lo, hi, min_visual_gap=gap, max_ticks=max_ticks)
+        if len(lin_pts) >= 2:
+            selected = lin_pts
+
+    # Final safety verification of strict visual spacing and sorting.
+    selected.sort(key=lambda item: item[0])
+    verified: list[tuple[float, float]] = []
+    for val, pos in selected:
+        if verified and abs(pos - verified[-1][1]) < gap - 1e-9:
+            continue
+        verified.append((val, pos))
+        if len(verified) >= max_ticks:
+            break
+    return [val for val, _ in verified]
+
+
+def wrap_butterfly_ray_angles_deg(
+    bisector_deg: float,
+    half_opening_deg: float,
+) -> tuple[float, float, float, float]:
+    """Compute exact ``[0, 360)`` wrapped 4-lobe butterfly ray angles across the ``0/360`` seam.
+
+    Returns ``((bisector - alpha) % 360, (bisector + alpha) % 360,
+    (bisector + 180 - alpha) % 360, (bisector + 180 + alpha) % 360)``.
+    """
+    if isinstance(bisector_deg, bool) or isinstance(half_opening_deg, bool):
+        raise ValueError("bisector_deg and half_opening_deg must be finite real numbers, not bool")
+    b = float(bisector_deg)
+    a = float(half_opening_deg)
+    if not (math.isfinite(b) and math.isfinite(a)):
+        raise ValueError(
+            f"bisector_deg and half_opening_deg must be finite, got ({bisector_deg!r}, {half_opening_deg!r})"
+        )
+    if a < 0.0:
+        raise ValueError(f"half_opening_deg must be non-negative, got {half_opening_deg!r}")
+
+    def _wrap360(angle: float) -> float:
+        wrapped = float(angle) % 360.0
+        if wrapped >= 360.0 or math.isclose(wrapped, 360.0, rel_tol=0.0, abs_tol=1e-12):
+            wrapped = 0.0
+        return 0.0 if wrapped == 0.0 else wrapped
+
+    return (
+        _wrap360(b - a),
+        _wrap360(b + a),
+        _wrap360(b + 180.0 - a),
+        _wrap360(b + 180.0 + a),
+    )
+
+
 __all__ = [
     "JOURNAL_PRESETS",
     "JournalPreset",
@@ -842,6 +1155,8 @@ __all__ = [
     "OKABE_ITO_NAMED",
     "apply_journal_style",
     "format_axis_label",
+    "format_clean_colorbar_ticks",
+    "format_clean_tick_label",
     "format_math_unit",
     "get_journal_preset",
     "get_okabe_ito_palette",
@@ -857,4 +1172,5 @@ __all__ = [
     "style_1d_axes",
     "style_2d_axes",
     "style_panel_label",
+    "wrap_butterfly_ray_angles_deg",
 ]

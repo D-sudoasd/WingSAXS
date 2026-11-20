@@ -41,6 +41,8 @@ from .csv_utils import safe_csv_cell
 from .journal_style import (
     JournalPreset,
     format_axis_label,
+    format_clean_colorbar_ticks,
+    format_clean_tick_label,
     format_math_unit,
     get_journal_preset,
     get_okabe_ito_palette,
@@ -55,6 +57,7 @@ from .journal_style import (
     style_1d_axes,
     style_2d_axes,
     style_panel_label,
+    wrap_butterfly_ray_angles_deg,
 )
 from .serialization import json_safe
 
@@ -217,6 +220,135 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+_SAFE_MPL_CHARS = frozenset("°±–—·×μµÅαβγδεθλσπχΔΩ²³⁻¹")
+
+
+def _matplotlib_safe_label(text: Any, *, fallback: str = "") -> str:
+    """Strip CJK / unsupported glyphs so Matplotlib titles/legends never render tofu boxes."""
+    raw = str(text or "").strip()
+    if not raw:
+        return fallback
+    chars: list[str] = []
+    for ch in raw:
+        code = ord(ch)
+        if 32 <= code <= 126 or ch in _SAFE_MPL_CHARS:
+            chars.append(ch)
+        else:
+            chars.append("_")
+    cleaned = "".join(chars)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    cleaned = re.sub(r"\s*_\s*", "_", cleaned)
+    cleaned = cleaned.strip(" _-:/")
+    return cleaned or fallback
+
+
+def _normalize_intensity_mode(mode: Any, intensity_unit: str | None = None) -> str:
+    if isinstance(mode, bool):
+        return "calibrated" if mode else "raw_counts"
+    if mode is not None and str(mode).strip():
+        key = str(mode).strip().lower().replace(" ", "_").replace("-", "_")
+        if key in {"raw_fallback", "counts_raw_fallback", "counts_(raw_fallback)", "fallback", "mixed_raw_fallback"}:
+            return "raw_fallback"
+        if key in {"raw", "raw_counts", "counts", "counts_raw", "counts_(raw)", "uncalibrated", "adu"}:
+            return "raw_counts"
+        if key in {"calibrated", "abs", "absolute", "abs2d", "cm_1", "cm^-1"}:
+            return "calibrated"
+        if key in {"mixed", "partial"}:
+            return "mixed"
+    if intensity_unit is not None and str(intensity_unit).strip():
+        u = str(intensity_unit).strip().lower()
+        if "fallback" in u:
+            return "raw_fallback"
+        if any(tok in u for tok in ("raw", "count", "adu", "uncal")):
+            return "raw_counts"
+        u_compact = u.replace(" ", "")
+        if u_compact in {"cm^-1", "cm-1", "1/cm", "cm⁻¹", "cm−1", "mm^-1", "m^-1"}:
+            return "calibrated"
+    return ""
+
+
+def _format_intensity_label(
+    quantity: str,
+    intensity_unit: str | None = None,
+    intensity_mode: str | None = None,
+    *,
+    default_label: str | None = None,
+) -> str:
+    """Format an intensity axis/colorbar label without scale confusion or nested parentheses."""
+    explicit_mode = _normalize_intensity_mode(intensity_mode, None)
+    if explicit_mode == "raw_fallback":
+        return f"{quantity} [counts (raw fallback)]"
+    if explicit_mode == "raw_counts":
+        return f"{quantity} [counts (raw)]"
+
+    if intensity_unit is not None and str(intensity_unit).strip():
+        raw_u = str(intensity_unit).strip()
+        u_mode = _normalize_intensity_mode(None, raw_u)
+        if u_mode == "raw_fallback":
+            return f"{quantity} [counts (raw fallback)]"
+        if u_mode == "raw_counts":
+            if "(" in raw_u:
+                return f"{quantity} [{raw_u}]"
+            return f"{quantity} [counts (raw)]"
+        if "(" in raw_u:
+            return f"{quantity} [{raw_u}]"
+        return format_axis_label(quantity, raw_u)
+
+    if explicit_mode == "calibrated":
+        return format_axis_label(quantity, "cm^-1")
+    return default_label if default_label is not None else f"{quantity} (a.u.)"
+
+
+def _apply_clean_colorbar_ticks(
+    cbar: Any,
+    norm: Any,
+    *,
+    min_visual_gap: float = 0.16,
+    max_ticks: int = 5,
+) -> list[float]:
+    """Apply visually spaced, cleanly formatted ticks to a Matplotlib colorbar."""
+    vmin = getattr(norm, "vmin", None)
+    vmax = getattr(norm, "vmax", None)
+    if vmin is None or vmax is None:
+        return []
+    try:
+        lo, hi = float(vmin), float(vmax)
+    except (TypeError, ValueError):
+        return []
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+        return []
+    ticks = format_clean_colorbar_ticks(
+        norm,
+        lo,
+        hi,
+        min_visual_gap=min_visual_gap,
+        max_ticks=max_ticks,
+    )
+    if ticks:
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([format_clean_tick_label(t) for t in ticks])
+        cbar.ax.minorticks_off()
+    return ticks
+
+
+def _wrap_angle_into_domain(angle_deg: float, lo: float, hi: float) -> list[float]:
+    """Map an angle (deg) modulo 360 into every equivalent value within ``[lo, hi]``."""
+    if not (math.isfinite(angle_deg) and math.isfinite(lo) and math.isfinite(hi)) or hi < lo:
+        return []
+    eps = 1e-9
+    base = lo + ((float(angle_deg) - lo) % 360.0)
+    results: list[float] = []
+    val = base
+    while val <= hi + eps:
+        if val >= lo - eps:
+            clamped = min(hi, max(lo, val))
+            if not any(math.isclose(clamped, prev, rel_tol=0.0, abs_tol=1e-6) for prev in results):
+                results.append(clamped)
+        val += 360.0
+    return results
 
 
 @dataclass(frozen=True)
@@ -428,12 +560,16 @@ def plot_saxs_2d_panel(
     ridge_points: Any | None = None,
     rays_deg: Sequence[float] | None = None,
     bisector_deg: float | None = None,
+    half_opening_deg: float | None = None,
     q_circles: Sequence[float | Mapping[str, Any]] | None = None,
     q_lim: float | tuple[float, float] | None = None,
     scalebar_q: float | None = None,
     colorbar: bool = True,
     colorbar_label: str | None = None,
     intensity_unit: str | None = None,
+    intensity_mode: str | None = None,
+    colorbar_min_gap: float = 0.16,
+    colorbar_max_ticks: int = 5,
     title: str | None = None,
     legend_loc: str = "upper right",
     annotation: str | None = None,
@@ -529,17 +665,30 @@ def plot_saxs_2d_panel(
                 )
                 ax.add_patch(circle)
                 if c_label:
+                    leg_color = "#555555" if c_color.strip().lower() in {"#ffffff", "#fff", "white", "w"} else c_color
                     legend_handles.append(
-                        Line2D([0], [0], color=c_color, ls=c_ls, lw=c_lw, label=str(c_label))
+                        Line2D([0], [0], color=leg_color, ls=c_ls, lw=c_lw, label=str(c_label))
                     )
 
-        # Butterfly wing ray overlays.
-        if rays_deg:
-            ray_added = False
+        # Butterfly wing ray overlays (cleanly wrapped across the 0/360 deg seam).
+        effective_rays: list[float] = []
+        if rays_deg is not None:
             for angle in rays_deg:
                 ang = float(angle)
-                if not math.isfinite(ang):
-                    continue
+                if math.isfinite(ang):
+                    wrapped = ang % 360.0
+                    effective_rays.append(0.0 if math.isclose(wrapped, 360.0, abs_tol=1e-12) else wrapped)
+        elif (
+            bisector_deg is not None
+            and half_opening_deg is not None
+            and math.isfinite(float(bisector_deg))
+            and math.isfinite(float(half_opening_deg))
+            and float(half_opening_deg) >= 0.0
+        ):
+            effective_rays = list(wrap_butterfly_ray_angles_deg(float(bisector_deg), float(half_opening_deg)))
+
+        if effective_rays:
+            for ang in effective_rays:
                 rad = math.radians(ang)
                 x0, y0 = 0.12 * r_max * math.cos(rad), 0.12 * r_max * math.sin(rad)
                 x1, y1 = 0.92 * r_max * math.cos(rad), 0.92 * r_max * math.sin(rad)
@@ -552,11 +701,9 @@ def plot_saxs_2d_panel(
                     alpha=0.95,
                     zorder=5,
                 )
-                ray_added = True
-            if ray_added:
-                legend_handles.append(
-                    Line2D([0], [0], color="#00E5FF", ls="--", lw=0.85, label="Wing rays")
-                )
+            legend_handles.append(
+                Line2D([0], [0], color="#00E5FF", ls="--", lw=0.85, label="Wing rays")
+            )
 
         # Friedel symmetry bisector overlay.
         if bisector_deg is not None and math.isfinite(float(bisector_deg)):
@@ -706,11 +853,24 @@ def plot_saxs_2d_panel(
             ax.set_title(str(title), fontsize=resolved.axis_title_size, pad=3.0)
 
         cbar = None
+        cbar_ticks: list[float] = []
+        resolved_mode = _normalize_intensity_mode(intensity_mode, intensity_unit)
         if colorbar:
             cbar = ax.figure.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03, shrink=0.88)
             label_text = colorbar_label
             if label_text is None:
-                label_text = format_axis_label(r"$I$", intensity_unit) if intensity_unit else "Intensity (a.u.)"
+                label_text = _format_intensity_label(
+                    r"$I$",
+                    intensity_unit=intensity_unit,
+                    intensity_mode=intensity_mode,
+                    default_label="Intensity (a.u.)",
+                )
+            cbar_ticks = _apply_clean_colorbar_ticks(
+                cbar,
+                norm,
+                min_visual_gap=colorbar_min_gap,
+                max_ticks=colorbar_max_ticks,
+            )
             cbar.set_label(label_text, fontsize=resolved.tick_label_size, labelpad=2.0)
             cbar.ax.tick_params(labelsize=max(resolved.tick_label_size - 0.5, 5.0), width=resolved.tick_width)
             cbar.outline.set_linewidth(resolved.spine_linewidth)
@@ -720,6 +880,9 @@ def plot_saxs_2d_panel(
         "mesh": mesh,
         "norm": norm,
         "colorbar": cbar,
+        "colorbar_ticks": cbar_ticks,
+        "rays_deg": effective_rays,
+        "intensity_mode": resolved_mode,
         "q_unit": q_unit,
     }
 
@@ -740,10 +903,15 @@ def plot_polar_q_chi_panel(
     ridge_q: Any | None = None,
     q_cutoffs: Sequence[float | Mapping[str, Any]] | None = None,
     bisector_deg: float | None = None,
+    half_opening_deg: float | None = None,
+    rays_deg: Sequence[float] | None = None,
     orientation: str = "chi_x",
     colorbar: bool = True,
     colorbar_label: str | None = None,
     intensity_unit: str | None = None,
+    intensity_mode: str | None = None,
+    colorbar_min_gap: float = 0.16,
+    colorbar_max_ticks: int = 5,
     title: str | None = None,
     preset: str | JournalPreset = "nature",
 ) -> dict[str, Any]:
@@ -840,17 +1008,57 @@ def plot_polar_q_chi_panel(
                 else:
                     ax.axvline(q_val, color=c_color, linestyle=c_ls, linewidth=0.85, alpha=0.95, zorder=5)
                 if c_label:
-                    legend_handles.append(Line2D([0], [0], color=c_color, ls=c_ls, lw=0.85, label=str(c_label)))
+                    leg_color = "#555555" if c_color.strip().lower() in {"#ffffff", "#fff", "white", "w"} else c_color
+                    legend_handles.append(Line2D([0], [0], color=leg_color, ls=c_ls, lw=0.85, label=str(c_label)))
+
+        chi_lo = float(min(chi_edges[0], chi_edges[-1]))
+        chi_hi = float(max(chi_edges[0], chi_edges[-1]))
 
         if bisector_deg is not None and math.isfinite(float(bisector_deg)):
             b_deg = float(bisector_deg)
-            if orientation == "chi_x":
-                ax.axvline(b_deg, color="#F0E442", linestyle=":", linewidth=0.9, alpha=0.95, zorder=5)
-            else:
-                ax.axhline(b_deg, color="#F0E442", linestyle=":", linewidth=0.9, alpha=0.95, zorder=5)
-            legend_handles.append(
-                Line2D([0], [0], color="#F0E442", ls=":", lw=0.9, label=rf"$\chi_{{\mathrm{{sym}}}} = {b_deg:.1f}^\circ$")
-            )
+            bisector_targets = [b_deg]
+            if (chi_hi - chi_lo) > 180.0 + 1e-6:
+                bisector_targets.append(b_deg + 180.0)
+            b_drawn = False
+            for bt in bisector_targets:
+                for mapped in _wrap_angle_into_domain(bt, chi_lo, chi_hi):
+                    if orientation == "chi_x":
+                        ax.axvline(mapped, color="#F0E442", linestyle=":", linewidth=0.9, alpha=0.95, zorder=5)
+                    else:
+                        ax.axhline(mapped, color="#F0E442", linestyle=":", linewidth=0.9, alpha=0.95, zorder=5)
+                    b_drawn = True
+            if b_drawn:
+                legend_handles.append(
+                    Line2D([0], [0], color="#F0E442", ls=":", lw=0.9, label=rf"$\chi_{{\mathrm{{sym}}}} = {b_deg:.1f}^\circ$")
+                )
+
+        polar_rays_raw: list[float] = []
+        if rays_deg is not None:
+            for angle in rays_deg:
+                ang = float(angle)
+                if math.isfinite(ang):
+                    wrapped = ang % 360.0
+                    polar_rays_raw.append(0.0 if math.isclose(wrapped, 360.0, abs_tol=1e-12) else wrapped)
+        elif (
+            bisector_deg is not None
+            and half_opening_deg is not None
+            and math.isfinite(float(bisector_deg))
+            and math.isfinite(float(half_opening_deg))
+            and float(half_opening_deg) >= 0.0
+        ):
+            polar_rays_raw = list(wrap_butterfly_ray_angles_deg(float(bisector_deg), float(half_opening_deg)))
+
+        drawn_polar_rays: list[float] = []
+        if polar_rays_raw:
+            for ang in polar_rays_raw:
+                for mapped in _wrap_angle_into_domain(ang, chi_lo, chi_hi):
+                    if orientation == "chi_x":
+                        ax.axvline(mapped, color="#00E5FF", linestyle="--", linewidth=0.8, alpha=0.9, zorder=5)
+                    else:
+                        ax.axhline(mapped, color="#00E5FF", linestyle="--", linewidth=0.8, alpha=0.9, zorder=5)
+                    drawn_polar_rays.append(mapped)
+            if drawn_polar_rays:
+                legend_handles.append(Line2D([0], [0], color="#00E5FF", ls="--", lw=0.8, label="Wing rays"))
 
         if legend_handles:
             leg = ax.legend(
@@ -870,11 +1078,24 @@ def plot_polar_q_chi_panel(
             ax.set_title(str(title), fontsize=resolved.axis_title_size, pad=3.0)
 
         cbar = None
+        cbar_ticks: list[float] = []
+        resolved_mode = _normalize_intensity_mode(intensity_mode, intensity_unit)
         if colorbar:
             cbar = ax.figure.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03, shrink=0.88)
             label_text = colorbar_label
             if label_text is None:
-                label_text = format_axis_label(r"$I$", intensity_unit) if intensity_unit else "Intensity (a.u.)"
+                label_text = _format_intensity_label(
+                    r"$I$",
+                    intensity_unit=intensity_unit,
+                    intensity_mode=intensity_mode,
+                    default_label="Intensity (a.u.)",
+                )
+            cbar_ticks = _apply_clean_colorbar_ticks(
+                cbar,
+                norm,
+                min_visual_gap=colorbar_min_gap,
+                max_ticks=colorbar_max_ticks,
+            )
             cbar.set_label(label_text, fontsize=resolved.tick_label_size, labelpad=2.0)
             cbar.ax.tick_params(labelsize=max(resolved.tick_label_size - 0.5, 5.0), width=resolved.tick_width)
             cbar.outline.set_linewidth(resolved.spine_linewidth)
@@ -884,6 +1105,10 @@ def plot_polar_q_chi_panel(
         "mesh": mesh,
         "norm": norm,
         "colorbar": cbar,
+        "colorbar_ticks": cbar_ticks,
+        "rays_deg": polar_rays_raw,
+        "drawn_rays_deg": drawn_polar_rays,
+        "intensity_mode": resolved_mode,
     }
 
 
@@ -1375,9 +1600,14 @@ def plot_radial_kratky_panel(
                     width=resolved.tick_width,
                     labelsize=resolved.tick_label_size,
                 )
-            q_unit_fmt = format_math_unit(q_unit)
+            q_unit_low = str(q_unit or "").strip().lower().replace(" ", "")
             if i_unit_fmt and is_physical_q_unit(q_unit):
-                k_ylabel = rf"$q^2 I(q)$ ({i_unit_fmt} $\cdot$ {q_unit_fmt}$^2$)"
+                q_sq_fmt = (
+                    r"$\mathrm{\AA}^{-2}$"
+                    if any(tok in q_unit_low for tok in ("å", "angstrom", "a^-1", "a-1", "1/a"))
+                    else r"$\mathrm{nm}^{-2}$"
+                )
+                k_ylabel = rf"$q^2 I(q)$ ({i_unit_fmt} $\cdot$ {q_sq_fmt})"
             else:
                 k_ylabel = r"$q^2 I(q)$ (a.u.)"
             ax_k.set_ylabel(k_ylabel, fontsize=resolved.axis_label_size)
@@ -1402,6 +1632,7 @@ def plot_azimuthal_fit_panel(
     half_opening_deg: float | None = None,
     metrics: Mapping[str, Any] | None = None,
     intensity_unit: str | None = None,
+    intensity_mode: str | None = None,
     title: str | None = None,
     preset: str | JournalPreset = "nature",
 ) -> dict[str, Any]:
@@ -1482,48 +1713,87 @@ def plot_azimuthal_fit_panel(
 
         if bisector_deg is not None and math.isfinite(float(bisector_deg)):
             b = float(bisector_deg)
-            ax_main.axvline(b, color="#444444", linestyle="-.", linewidth=0.75, alpha=0.8, zorder=2)
-            if half_opening_deg is not None and math.isfinite(float(half_opening_deg)):
-                a = abs(float(half_opening_deg))
-                ax_main.axvline(b - a, color="#888888", linestyle=":", linewidth=0.7, alpha=0.75, zorder=2)
-                ax_main.axvline(b + a, color="#888888", linestyle=":", linewidth=0.7, alpha=0.75, zorder=2)
+            finite_chi = chi[np.isfinite(chi)]
+            if finite_chi.size >= 2:
+                chi_lo = float(np.min(finite_chi))
+                chi_hi = float(np.max(finite_chi))
+                b_targets = [b, b + 180.0] if (chi_hi - chi_lo) > 180.0 + 1e-6 else [b]
+                for bt in b_targets:
+                    for mapped in _wrap_angle_into_domain(bt, chi_lo, chi_hi):
+                        ax_main.axvline(mapped, color="#444444", linestyle="-.", linewidth=0.75, alpha=0.8, zorder=2)
+                if half_opening_deg is not None and math.isfinite(float(half_opening_deg)):
+                    a = abs(float(half_opening_deg))
+                    for ray in wrap_butterfly_ray_angles_deg(b, a):
+                        for mapped in _wrap_angle_into_domain(ray, chi_lo, chi_hi):
+                            ax_main.axvline(mapped, color="#888888", linestyle=":", linewidth=0.7, alpha=0.75, zorder=2)
+            else:
+                ax_main.axvline(b, color="#444444", linestyle="-.", linewidth=0.75, alpha=0.8, zorder=2)
+                if half_opening_deg is not None and math.isfinite(float(half_opening_deg)):
+                    a = abs(float(half_opening_deg))
+                    ax_main.axvline(b - a, color="#888888", linestyle=":", linewidth=0.7, alpha=0.75, zorder=2)
+                    ax_main.axvline(b + a, color="#888888", linestyle=":", linewidth=0.7, alpha=0.75, zorder=2)
 
-        if metrics:
-            lines: list[str] = []
-            if metrics.get("r2") is not None and math.isfinite(float(metrics["r2"])):
-                lines.append(rf"$R^2 = {float(metrics['r2']):.3f}$")
-            if metrics.get("half_opening_deg") is not None and math.isfinite(float(metrics["half_opening_deg"])):
-                lines.append(rf"$\alpha = {float(metrics['half_opening_deg']):.1f}^\circ$")
-            if metrics.get("lobe_fwhm_deg") is not None and math.isfinite(float(metrics["lobe_fwhm_deg"])):
-                lines.append(rf"$\Delta\chi = {float(metrics['lobe_fwhm_deg']):.1f}^\circ$")
-            if lines:
-                ax_main.text(
-                    0.03,
-                    0.95,
-                    "\n".join(lines),
-                    transform=ax_main.transAxes,
-                    ha="left",
-                    va="top",
-                    fontsize=max(resolved.tick_label_size - 0.3, 5.0),
-                    color="#111111",
-                    bbox={
-                        "facecolor": "#FFFFFF",
-                        "edgecolor": "#CCCCCC",
-                        "linewidth": 0.4,
-                        "alpha": 0.90,
-                        "pad": 1.6,
-                    },
-                    zorder=8,
-                )
-
-        i_label = format_axis_label(r"$I(\chi)$", intensity_unit) if intensity_unit else r"$I(\chi)$ (a.u.)"
+        i_label = _format_intensity_label(
+            r"$I(\chi)$",
+            intensity_unit=intensity_unit,
+            intensity_mode=intensity_mode,
+            default_label=r"$I(\chi)$ (a.u.)",
+        )
         ax_main.set_ylabel(i_label, fontsize=resolved.axis_label_size)
         if title:
             ax_main.set_title(str(title), fontsize=resolved.axis_title_size, pad=3.0)
         style_1d_axes(ax_main, preset=resolved, grid=True)
         handles, labels = ax_main.get_legend_handles_labels()
         if handles:
-            ax_main.legend(handles, labels, loc="upper right", fontsize=max(resolved.legend_fontsize - 0.3, 5.0))
+            y_lo, y_hi = ax_main.get_ylim()
+            if math.isfinite(y_lo) and math.isfinite(y_hi) and y_hi > y_lo:
+                ax_main.set_ylim(y_lo, y_hi + 0.24 * (y_hi - y_lo))
+            ax_main.legend(
+                handles,
+                labels,
+                loc="upper right",
+                ncol=2 if len(handles) >= 3 else 1,
+                fontsize=max(resolved.legend_fontsize - 0.8, 4.6),
+                handlelength=1.0,
+                columnspacing=0.6,
+                handletextpad=0.35,
+                borderpad=0.25,
+                labelspacing=0.2,
+            )
+
+        if metrics:
+            r2_str: str | None = None
+            angle_parts: list[str] = []
+            if metrics.get("r2") is not None and math.isfinite(float(metrics["r2"])):
+                r2_str = rf"$R^2={float(metrics['r2']):.3f}$"
+            if metrics.get("half_opening_deg") is not None and math.isfinite(float(metrics["half_opening_deg"])):
+                angle_parts.append(rf"$\alpha={float(metrics['half_opening_deg']):.1f}^\circ$")
+            if metrics.get("lobe_fwhm_deg") is not None and math.isfinite(float(metrics["lobe_fwhm_deg"])):
+                angle_parts.append(rf"$\Delta\chi={float(metrics['lobe_fwhm_deg']):.1f}^\circ$")
+            lines: list[str] = []
+            if r2_str is not None:
+                lines.append(r2_str)
+            if angle_parts:
+                lines.append(", ".join(angle_parts))
+            if lines:
+                ax_main.text(
+                    0.03,
+                    0.04 if handles else 0.95,
+                    "\n".join(lines),
+                    transform=ax_main.transAxes,
+                    ha="left",
+                    va="bottom" if handles else "top",
+                    fontsize=max(resolved.tick_label_size - 0.7, 4.6),
+                    color="#111111",
+                    bbox={
+                        "facecolor": "#FFFFFF",
+                        "edgecolor": "#CCCCCC",
+                        "linewidth": 0.4,
+                        "alpha": 0.92,
+                        "pad": 1.3,
+                    },
+                    zorder=8,
+                )
 
         # Dedicated residual strip below main plot.
         if resid_arr is not None:
@@ -1914,6 +2184,771 @@ def export_publication_figure(
     }
 
 
+def _row_num(row: Mapping[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        val = row.get(key)
+        if val is None or isinstance(val, bool):
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        try:
+            num = float(val)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(num):
+            return num
+    return None
+
+
+def _row_time_axis(rows: Sequence[Mapping[str, Any]]) -> tuple[np.ndarray, str, bool]:
+    times: list[float | None] = []
+    units: set[str] = set()
+    for idx, row in enumerate(rows):
+        t_h = _row_num(row, "elapsed_h", "time_h")
+        if t_h is not None:
+            times.append(t_h)
+            units.add("h")
+            continue
+        t_min = _row_num(row, "elapsed_min", "time_min")
+        if t_min is not None:
+            times.append(t_min / 60.0)
+            units.add("h")
+            continue
+        t_s = _row_num(row, "elapsed_s", "time_s")
+        if t_s is not None:
+            times.append(t_s / 3600.0)
+            units.add("h")
+            continue
+        t_raw = _row_num(row, "time")
+        if t_raw is not None:
+            unit = str(row.get("time_unit") or "").strip().lower()
+            if unit in {"h", "hr", "hrs", "hour", "hours"}:
+                times.append(t_raw)
+                units.add("h")
+            elif unit in {"min", "mins", "minute", "minutes"}:
+                times.append(t_raw / 60.0)
+                units.add("h")
+            elif unit in {"s", "sec", "secs", "second", "seconds"}:
+                times.append(t_raw / 3600.0)
+                units.add("h")
+            else:
+                times.append(t_raw)
+                units.add(unit or "unspecified")
+            continue
+        times.append(None)
+
+    if rows and all(t is not None for t in times) and len(units) == 1:
+        unit = next(iter(units))
+        label = "Time (h)" if unit == "h" else (f"Time ({unit})" if unit != "unspecified" else "Time")
+        return np.asarray(times, dtype=np.float64), label, True
+
+    indices = [
+        _row_num(row, "frame_index") if _row_num(row, "frame_index") is not None else float(idx)
+        for idx, row in enumerate(rows)
+    ]
+    return np.asarray(indices, dtype=np.float64), "Frame index", False
+
+
+def render_sample_physics_dashboard(
+    per_frame_rows: Sequence[Mapping[str, Any]],
+    plotting_cache: Mapping[str, Any],
+    output_stem: str | Path,
+    *,
+    sample_label: str = "",
+    intensity_mode: str = "calibrated",
+    journal_style: str | JournalPreset = "nature",
+    formats: Sequence[str] = ("pdf", "svg", "png"),
+    dpi: int = 600,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Render a reusable 6-panel 183 mm Nature-styled single-sample SAXS physics dashboard.
+
+    Panels:
+      - ``a``: Endpoint 2D SAXS intensity map with beamstop circle, wrapped wing rays, and clean colorbar ticks.
+      - ``b``: Endpoint unwrapped polar ``(q, chi)`` map with ``q`` cutoffs and wrapped ray guides.
+      - ``c``: Radial ``I(q)`` (log) and Kratky ``q^2 I(q)`` evolution curves with cutoff lines (calibrated-only on mixed runs).
+      - ``d``: Time evolution of ``L*_dir`` / ``L*_krat`` (calibrated physical ``q`` only) and calibrated-only ``Q_win,sub``.
+      - ``e``: Time evolution of 4-fold order ``A_4``, wing half-opening ``alpha``, and lobe FWHM ``Delta chi``.
+      - ``f``: Endpoint ``C2``-bridge + 4-lobe azimuthal fit with aligned residual strip.
+
+    Exports vector PDF, editable SVG, 600 dpi PNG, Nature Source Data CSVs, and a strict-JSON
+    SHA-256 manifest. Strictly Qt-free and ``matplotlib.pyplot``-free.
+    """
+    resolved = get_journal_preset(journal_style)
+    rows = [dict(r) for r in per_frame_rows if isinstance(r, Mapping)]
+    cache = dict(plotting_cache) if isinstance(plotting_cache, Mapping) else {}
+
+    chronology_mode = _normalize_intensity_mode(intensity_mode, cache.get("intensity_unit")) or "calibrated"
+    ep_mode_raw = cache.get("endpoint_intensity_mode")
+    ep_unit_raw = cache.get("endpoint_intensity_unit")
+    if ep_mode_raw is not None:
+        endpoint_mode = _normalize_intensity_mode(ep_mode_raw, ep_unit_raw) or chronology_mode
+    elif chronology_mode == "mixed":
+        endpoint_mode = _normalize_intensity_mode(None, ep_unit_raw) or "raw_fallback"
+    else:
+        endpoint_mode = chronology_mode
+
+    q_unit = str(cache.get("q_unit") or (rows[0].get("q_unit") if rows else None) or "nm^-1").strip() or "nm^-1"
+    physical_q = is_physical_q_unit(q_unit)
+    safe_sample = _matplotlib_safe_label(sample_label, fallback="")
+    default_q_cutoffs = cache.get("q_cutoffs")
+
+    # Resolve nested or flat cache sections.
+    ep2d = dict(cache["endpoint_2d"]) if isinstance(cache.get("endpoint_2d"), Mapping) else cache
+    ep_pol = dict(cache["endpoint_polar"]) if isinstance(cache.get("endpoint_polar"), Mapping) else cache
+    ep_az = dict(cache["endpoint_azimuthal"]) if isinstance(cache.get("endpoint_azimuthal"), Mapping) else cache
+    radial_curves_raw = cache.get("radial_curves", cache.get("radial_evolution"))
+    radial_curves = [dict(c) for c in radial_curves_raw if isinstance(c, Mapping)] if isinstance(radial_curves_raw, Sequence) else []
+
+    x_arr, x_label, has_time_axis = _row_time_axis(rows)
+    ep_time_h = _row_num(cache, "endpoint_time_h", "time_h")
+    if ep_time_h is None and has_time_axis and x_arr.size > 0 and np.isfinite(x_arr[-1]):
+        ep_time_h = float(x_arr[-1])
+
+    builder = CompositeFigureBuilder(
+        preset=resolved,
+        width="double",
+        height_mm=132.0,
+        nrows=2,
+        ncols=3,
+        dpi=dpi,
+        layout="constrained",
+    )
+
+    oi = get_okabe_ito_palette()
+    panel_summary: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Panel a: Endpoint 2D SAXS with beamstop, wrapped rays & clean ticks
+    # ------------------------------------------------------------------
+    ax_a = builder.add_panel("a", 0, 0)
+    img_2d = ep2d.get("image", ep2d.get("endpoint_image"))
+    qx_2d = ep2d.get("qx")
+    qy_2d = ep2d.get("qy")
+    ep_2d_src: list[dict[str, Any]] = []
+    if img_2d is not None and qx_2d is not None and qy_2d is not None:
+        q_circles: list[Any] = list(ep2d.get("q_circles") or [])
+        bs_q = _row_num(ep2d, "beamstop_q") if _row_num(ep2d, "beamstop_q") is not None else _row_num(cache, "beamstop_q")
+        if bs_q is not None and bs_q > 0.0 and not q_circles:
+            q_circles.append({"q": bs_q, "label": "Beamstop", "color": "#FFFFFF", "ls": "--"})
+        bisector_2d = _row_num(ep2d, "bisector_deg", "friedel_bisector_deg")
+        alpha_2d = _row_num(ep2d, "half_opening_deg", "wing_half_opening_deg", "alpha_deg")
+        rays_2d = ep2d.get("rays_deg")
+        if ep2d.get("title"):
+            title_a = _matplotlib_safe_label(ep2d["title"], fallback="2D SAXS")
+        else:
+            t_tag = f"{ep_time_h:.2f} h" if ep_time_h is not None else "endpoint"
+            mode_tag = ", raw fb" if endpoint_mode == "raw_fallback" else (", raw" if endpoint_mode == "raw_counts" else "")
+            title_a = f"2D SAXS ({t_tag}{mode_tag})"
+
+        res_a = plot_saxs_2d_panel(
+            ax_a,
+            img_2d,
+            qx_2d,
+            qy_2d,
+            valid_mask=ep2d.get("valid_mask"),
+            q_unit=str(ep2d.get("q_unit") or q_unit),
+            norm_mode=str(ep2d.get("norm_mode") or "asinh"),
+            vmin=_row_num(ep2d, "vmin"),
+            vmax=_row_num(ep2d, "vmax"),
+            cmap=ep2d.get("cmap"),
+            ridge_points=ep2d.get("ridge_points"),
+            rays_deg=rays_2d,
+            bisector_deg=bisector_2d,
+            half_opening_deg=alpha_2d,
+            q_circles=q_circles or None,
+            q_lim=ep2d.get("q_lim"),
+            scalebar_q=_row_num(ep2d, "scalebar_q"),
+            colorbar=True,
+            colorbar_label=ep2d.get("colorbar_label"),
+            intensity_unit=ep2d.get("intensity_unit", ep_unit_raw),
+            intensity_mode=endpoint_mode,
+            title=title_a,
+            annotation=ep2d.get("annotation"),
+            preset=resolved,
+        )
+        ep_2d_src.append({
+            "endpoint_time_h": ep_time_h,
+            "q_unit": str(ep2d.get("q_unit") or q_unit),
+            "intensity_mode": endpoint_mode,
+            "beamstop_q": bs_q,
+            "bisector_deg": bisector_2d,
+            "half_opening_deg": alpha_2d,
+            "rays_deg": ",".join(f"{r:.2f}" for r in res_a["rays_deg"]),
+            "colorbar_ticks": ",".join(format_clean_tick_label(t) for t in res_a["colorbar_ticks"]),
+        })
+        panel_summary["panel_a"] = {
+            "rendered": True,
+            "intensity_mode": endpoint_mode,
+            "rays_deg": res_a["rays_deg"],
+            "colorbar_ticks": res_a["colorbar_ticks"],
+        }
+    else:
+        with journal_rc_context(resolved):
+            ax_a.text(0.5, 0.5, "Endpoint 2D SAXS unavailable", transform=ax_a.transAxes, ha="center", va="center", color="#666666")
+            ax_a.set_title("2D SAXS", fontsize=resolved.axis_title_size, pad=3.0)
+            style_2d_axes(ax_a, preset=resolved, equal_aspect=False)
+        panel_summary["panel_a"] = {"rendered": False}
+
+    # ------------------------------------------------------------------
+    # Panel b: Endpoint polar (q, chi) map with wrapped rays & clean ticks
+    # ------------------------------------------------------------------
+    ax_b = builder.add_panel("b", 0, 1)
+    pol_z = ep_pol.get("polar_intensity", ep_pol.get("intensity") if ep_pol is not cache else None)
+    pol_q = ep_pol.get("q_coords", ep_pol.get("q_edges", ep_pol.get("q")))
+    pol_chi = ep_pol.get("chi_coords_deg", ep_pol.get("chi_edges", ep_pol.get("chi_deg")))
+    ep_pol_src: list[dict[str, Any]] = []
+    if pol_z is not None and pol_q is not None and pol_chi is not None:
+        bisector_pol = _row_num(ep_pol, "bisector_deg", "friedel_bisector_deg")
+        if bisector_pol is None:
+            bisector_pol = _row_num(ep2d, "bisector_deg", "friedel_bisector_deg")
+        alpha_pol = _row_num(ep_pol, "half_opening_deg", "wing_half_opening_deg", "alpha_deg")
+        if alpha_pol is None:
+            alpha_pol = _row_num(ep2d, "half_opening_deg", "wing_half_opening_deg", "alpha_deg")
+        title_b = _matplotlib_safe_label(ep_pol.get("title"), fallback=r"Polar $(q, \chi)$")
+        res_b = plot_polar_q_chi_panel(
+            ax_b,
+            pol_z,
+            pol_q,
+            pol_chi,
+            q_unit=str(ep_pol.get("q_unit") or q_unit),
+            norm_mode=str(ep_pol.get("norm_mode") or "asinh"),
+            vmin=_row_num(ep_pol, "vmin"),
+            vmax=_row_num(ep_pol, "vmax"),
+            cmap=ep_pol.get("cmap"),
+            ridge_chi_deg=ep_pol.get("ridge_chi_deg"),
+            ridge_q=ep_pol.get("ridge_q"),
+            q_cutoffs=ep_pol.get("q_cutoffs", default_q_cutoffs),
+            bisector_deg=bisector_pol,
+            half_opening_deg=alpha_pol,
+            rays_deg=ep_pol.get("rays_deg"),
+            colorbar=True,
+            colorbar_label=ep_pol.get("colorbar_label"),
+            intensity_unit=ep_pol.get("intensity_unit", ep_unit_raw),
+            intensity_mode=endpoint_mode,
+            title=title_b,
+            preset=resolved,
+        )
+        ep_pol_src.append({
+            "q_unit": str(ep_pol.get("q_unit") or q_unit),
+            "intensity_mode": endpoint_mode,
+            "bisector_deg": bisector_pol,
+            "half_opening_deg": alpha_pol,
+            "rays_deg": ",".join(f"{r:.2f}" for r in res_b["rays_deg"]),
+            "colorbar_ticks": ",".join(format_clean_tick_label(t) for t in res_b["colorbar_ticks"]),
+        })
+        panel_summary["panel_b"] = {
+            "rendered": True,
+            "intensity_mode": endpoint_mode,
+            "rays_deg": res_b["rays_deg"],
+            "colorbar_ticks": res_b["colorbar_ticks"],
+        }
+    else:
+        with journal_rc_context(resolved):
+            ax_b.text(0.5, 0.5, "Polar (q, chi) map unavailable", transform=ax_b.transAxes, ha="center", va="center", color="#666666")
+            ax_b.set_title(r"Polar $(q, \chi)$", fontsize=resolved.axis_title_size, pad=3.0)
+            style_2d_axes(ax_b, preset=resolved, equal_aspect=False)
+        panel_summary["panel_b"] = {"rendered": False}
+
+    # ------------------------------------------------------------------
+    # Panel c: Radial I(q) & Kratky q^2 I(q) evolution (never mixing cal & raw)
+    # ------------------------------------------------------------------
+    sub_c = builder.add_subgrid(0, 2, 2, 1, height_ratios=[1.12, 1.0], hspace=0.08)
+    with journal_rc_context(resolved):
+        ax_c_iq = builder.figure.add_subplot(sub_c[0, 0])
+        ax_c_k = builder.figure.add_subplot(sub_c[1, 0], sharex=ax_c_iq)
+        style_panel_label(ax_c_iq, "c", preset=resolved, x=-0.20, y=1.05)
+    builder.panels["c"] = ax_c_iq
+    builder.panels["c_kratky"] = ax_c_k
+
+    # Enforce strict calibration separation on radial I(q) curves.
+    cal_curves: list[dict[str, Any]] = []
+    raw_curves: list[dict[str, Any]] = []
+    for c_idx, curve in enumerate(radial_curves):
+        c_mode = _normalize_intensity_mode(
+            curve.get("intensity_mode", curve.get("calibration_mode", curve.get("calibrated"))),
+            curve.get("intensity_unit"),
+        )
+        if not c_mode:
+            c_mode = "calibrated" if chronology_mode == "calibrated" else (
+                "calibrated" if chronology_mode == "mixed" else chronology_mode
+            )
+        cleaned_curve = dict(curve)
+        if not cleaned_curve.get("label"):
+            t_c = _row_num(cleaned_curve, "time_h", "elapsed_h")
+            cleaned_curve["label"] = f"{t_c:.2f} h" if t_c is not None else f"t{c_idx + 1}"
+        else:
+            cleaned_curve["label"] = _matplotlib_safe_label(cleaned_curve["label"], fallback=f"t{c_idx + 1}")
+        if c_mode == "calibrated":
+            cal_curves.append(cleaned_curve)
+        else:
+            raw_curves.append(cleaned_curve)
+
+    panel_c_cal_only = False
+    if cal_curves and (raw_curves or chronology_mode == "mixed"):
+        chosen_curves = cal_curves
+        panel_c_cal_only = True
+        panel_c_unit = "cm^-1"
+    elif cal_curves:
+        chosen_curves = cal_curves
+        panel_c_unit = str(cache.get("intensity_unit") or "cm^-1")
+    else:
+        chosen_curves = raw_curves
+        panel_c_unit = "counts, raw"
+
+    radial_src_rows: list[dict[str, Any]] = []
+    if chosen_curves:
+        title_c = "Radial / Kratky (cal.)" if panel_c_cal_only else (
+            "Radial / Kratky (raw)" if not cal_curves else "Radial & Kratky"
+        )
+        plot_radial_kratky_panel(
+            (ax_c_iq, ax_c_k),
+            chosen_curves,
+            mode="both",
+            q_unit=q_unit,
+            intensity_unit=panel_c_unit,
+            q_cutoffs=cache.get("radial_q_cutoffs", default_q_cutoffs),
+            show_q_star=True,
+            log_y=True,
+            title=title_c,
+            legend_loc="upper right",
+            preset=resolved,
+        )
+        ax_c_iq.set_xlabel("")
+        ax_c_iq.tick_params(labelbottom=False)
+        if ax_c_k.get_legend() is not None:
+            ax_c_k.get_legend().remove()
+        for curve in chosen_curves:
+            q_c = _to_float_array(curve.get("q"))
+            i_c = _to_float_array(curve.get("intensity", curve.get("I")))
+            k_c = _to_float_array(curve.get("kratky")) if curve.get("kratky") is not None else (q_c ** 2) * i_c
+            for qv, iv, kv in zip(q_c, i_c, k_c):
+                radial_src_rows.append({
+                    "curve": curve["label"],
+                    "intensity_unit": panel_c_unit,
+                    "q": None if not np.isfinite(qv) else float(qv),
+                    "I_q": None if not np.isfinite(iv) else float(iv),
+                    "q2_I_q": None if not np.isfinite(kv) else float(kv),
+                })
+        panel_summary["panel_c"] = {
+            "rendered": True,
+            "n_curves": len(chosen_curves),
+            "calibrated_only_filtered": panel_c_cal_only,
+            "excluded_raw_curves": len(raw_curves) if panel_c_cal_only else 0,
+            "intensity_unit": panel_c_unit,
+        }
+    else:
+        with journal_rc_context(resolved):
+            ax_c_iq.text(0.5, 0.5, "Radial curves unavailable", transform=ax_c_iq.transAxes, ha="center", va="center", color="#666666")
+            ax_c_iq.set_title("Radial & Kratky evolution", fontsize=resolved.axis_title_size, pad=3.0)
+            style_1d_axes(ax_c_iq, preset=resolved)
+            style_1d_axes(ax_c_k, preset=resolved)
+        panel_summary["panel_c"] = {"rendered": False, "n_curves": 0}
+
+    # ------------------------------------------------------------------
+    # Panel d: L*_dir / L*_krat (physical q only) & calibrated-only Q_win,sub
+    # ------------------------------------------------------------------
+    ax_d = builder.add_panel("d", 1, 0)
+    l_dir_vals: list[float] = []
+    l_dir_st: list[str] = []
+    l_krat_vals: list[float] = []
+    l_krat_st: list[str] = []
+    qwin_vals: list[float] = []
+    qwin_st: list[str] = []
+    qwin_is_sub = False
+    has_any_calibrated_frame = False
+    panel_d_src: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(rows):
+        row_q_unit = str(row.get("q_unit") or q_unit)
+        row_phys = is_physical_q_unit(row_q_unit)
+        row_status = _classify_point_status(row.get("frame_status", row.get("status", "estimate")))
+        row_cal = _normalize_intensity_mode(
+            row.get("calibration_mode", row.get("intensity_mode", row.get("calibrated"))),
+            row.get("intensity_unit"),
+        )
+        if not row_cal:
+            row_cal = "calibrated" if chronology_mode == "calibrated" else chronology_mode
+        frame_is_cal = row_cal == "calibrated"
+        if frame_is_cal:
+            has_any_calibrated_frame = True
+
+        ld: float | None = None
+        lk: float | None = None
+        if row_phys and row_status != "failed":
+            ld = _row_num(row, "L_star_direct_nm", "L_star_nm", "L_dir_nm", "L_from_observed_radius_nm")
+            if ld is None:
+                qd = _row_num(row, "q_star_direct", "q_star")
+                ld = q_to_period_nm(qd, row_q_unit) if qd is not None else None
+            lk = _row_num(row, "L_star_kratky_nm", "L_krat_nm")
+            if lk is None:
+                qk = _row_num(row, "q_star_kratky", "q_star_krat")
+                lk = q_to_period_nm(qk, row_q_unit) if qk is not None else None
+
+        ld_st = _classify_point_status(row.get("L_star_direct_status", row.get("evidence_status", row_status))) if ld is not None else ("failed" if row_status == "failed" else "missing")
+        lk_st = _classify_point_status(row.get("L_star_kratky_status", row.get("evidence_status", row_status))) if lk is not None else ("failed" if row_status == "failed" else "missing")
+
+        qw: float | None = None
+        if frame_is_cal and row_status != "failed":
+            qw = _row_num(row, "Q_win_sub", "q_win_sub", "Q_win_subtracted", "q_win_invariant_sub")
+            if qw is not None:
+                qwin_is_sub = True
+            else:
+                qw = _row_num(row, "q_win_invariant", "Q_win", "scattering_invariant", "porod_invariant_window")
+        qw_st = row_status if qw is not None else ("failed" if row_status == "failed" else "missing")
+
+        l_dir_vals.append(float("nan") if ld is None else ld)
+        l_dir_st.append(ld_st)
+        l_krat_vals.append(float("nan") if lk is None else lk)
+        l_krat_st.append(lk_st)
+        qwin_vals.append(float("nan") if qw is None else qw)
+        qwin_st.append(qw_st)
+
+        panel_d_src.append({
+            "frame_index": row.get("frame_index", idx),
+            "x": None if not np.isfinite(x_arr[idx]) else float(x_arr[idx]),
+            "calibration_mode": row_cal,
+            "q_unit": row_q_unit,
+            "L_star_direct_nm": ld,
+            "L_star_direct_status": ld_st,
+            "L_star_kratky_nm": lk,
+            "L_star_kratky_status": lk_st,
+            "Q_win_calibrated": qw,
+        })
+
+    l_series: list[dict[str, Any]] = []
+    if physical_q and np.any(np.isfinite(l_dir_vals)):
+        l_series.append({
+            "label": r"$L^*_{\mathrm{dir}}$",
+            "x": x_arr,
+            "y": l_dir_vals,
+            "status": l_dir_st,
+            "color": oi[0],
+            "marker": "o",
+            "markersize": 2.8,
+        })
+    if physical_q and np.any(np.isfinite(l_krat_vals)):
+        l_series.append({
+            "label": r"$L^*_{\mathrm{krat}}$",
+            "x": x_arr,
+            "y": l_krat_vals,
+            "status": l_krat_st,
+            "color": oi[2],
+            "marker": "s",
+            "markersize": 2.6,
+        })
+
+    qwin_arr = np.asarray(qwin_vals, dtype=np.float64)
+    has_qwin_cal = bool(has_any_calibrated_frame and np.any(np.isfinite(qwin_arr)))
+
+    with journal_rc_context(resolved):
+        if l_series:
+            plot_evolution_panel(
+                ax_d,
+                l_series,
+                xlabel=x_label,
+                ylabel=r"Spacing $L^*$",
+                y_unit="nm",
+                title=r"$L^*(t)$ & $Q_{\mathrm{win}}(t)$",
+                show_legend=False,
+                show_missing_ticks=True,
+                preset=resolved,
+            )
+        else:
+            msg_d = "Uncalibrated pixel-q (nm unavailable)" if not physical_q else "No finite L* estimates"
+            ax_d.text(0.5, 0.5, msg_d, transform=ax_d.transAxes, ha="center", va="center", color="#666666")
+            ax_d.set_xlabel(x_label, fontsize=resolved.axis_label_size)
+            ax_d.set_ylabel(r"Spacing $L^*$ ($\mathrm{nm}$)" if physical_q else r"$L^*$", fontsize=resolved.axis_label_size)
+            ax_d.set_title(r"$L^*(t)$ & $Q_{\mathrm{win}}(t)$", fontsize=resolved.axis_title_size, pad=3.0)
+            style_1d_axes(ax_d, preset=resolved, grid=True)
+
+        handles_d, labels_d = ax_d.get_legend_handles_labels()
+        if has_qwin_cal:
+            ax_d_r = ax_d.twinx()
+            q_label = r"$Q_{\mathrm{win,sub}}$" if qwin_is_sub else r"$Q_{\mathrm{win}}$"
+            ax_d_r.plot(
+                x_arr,
+                qwin_arr,
+                color=oi[1],
+                linestyle="-",
+                linewidth=resolved.line_linewidth * 0.95,
+                marker="^",
+                markersize=2.6,
+                label=q_label,
+                zorder=3,
+            )
+            ax_d_r.set_ylabel(f"{q_label} (cal.)", color=oi[1], fontsize=resolved.axis_label_size)
+            ax_d_r.spines["top"].set_visible(False)
+            ax_d_r.spines["right"].set_visible(True)
+            ax_d_r.spines["right"].set_linewidth(resolved.spine_linewidth)
+            ax_d_r.tick_params(
+                axis="y",
+                direction=resolved.tick_direction,
+                length=resolved.tick_length,
+                width=resolved.tick_width,
+                labelsize=resolved.tick_label_size,
+                colors=oi[1],
+            )
+            hr, lr = ax_d_r.get_legend_handles_labels()
+            handles_d.extend(hr)
+            labels_d.extend(lr)
+        elif chronology_mode in {"raw_counts", "raw_fallback"}:
+            ax_d.text(
+                0.03,
+                0.04,
+                r"$Q_{\mathrm{win}}$ omitted (raw counts)",
+                transform=ax_d.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=max(resolved.tick_label_size - 0.6, 4.8),
+                color="#555555",
+                bbox={"facecolor": "#FFFFFF", "edgecolor": "#DDDDDD", "alpha": 0.9, "pad": 1.3},
+            )
+        if handles_d:
+            ax_d.legend(handles_d, labels_d, loc="upper left", fontsize=max(resolved.legend_fontsize - 0.5, 5.0))
+
+    panel_summary["panel_d"] = {
+        "rendered": True,
+        "physical_q": physical_q,
+        "q_win_plotted": has_qwin_cal,
+        "q_win_channel": ("Q_win_sub" if qwin_is_sub else "Q_win") if has_qwin_cal else None,
+    }
+
+    # ------------------------------------------------------------------
+    # Panel e: A4 (left) & alpha / Delta_chi_lobe (right, R^2 >= 0.75 gated)
+    # ------------------------------------------------------------------
+    ax_e = builder.add_panel("e", 1, 1)
+    a4_vals: list[float] = []
+    a4_st: list[str] = []
+    alpha_vals: list[float] = []
+    fwhm_vals: list[float] = []
+    panel_e_src: list[dict[str, Any]] = []
+    r2_threshold = 0.75
+    n_r2_gated = 0
+
+    for idx, row in enumerate(rows):
+        row_status = _classify_point_status(row.get("frame_status", row.get("status", "estimate")))
+        a4_v = _row_num(row, "a4", "A4", "four_fold_amplitude") if row_status != "failed" else None
+        r2_v = _row_num(row, "c2_r2", "azimuthal_fit_r2", "fit_r2", "r2")
+        alpha_raw = _row_num(row, "wing_half_opening_deg", "half_opening_deg", "alpha_deg", "c2_half_opening_deg") if row_status != "failed" else None
+        fwhm_raw = _row_num(row, "lobe_fwhm_deg", "azimuthal_fwhm_deg", "delta_chi_deg", "c2_lobe_fwhm_deg") if row_status != "failed" else None
+
+        passes_r2 = r2_v is None or r2_v >= r2_threshold
+        if not passes_r2 and (alpha_raw is not None or fwhm_raw is not None):
+            n_r2_gated += 1
+        alpha_v = alpha_raw if passes_r2 else None
+        fwhm_v = fwhm_raw if passes_r2 else None
+
+        a4_vals.append(float("nan") if a4_v is None else a4_v)
+        a4_st.append(row_status if a4_v is not None else ("failed" if row_status == "failed" else "missing"))
+        alpha_vals.append(float("nan") if alpha_v is None else alpha_v)
+        fwhm_vals.append(float("nan") if fwhm_v is None else fwhm_v)
+        panel_e_src.append({
+            "frame_index": row.get("frame_index", idx),
+            "x": None if not np.isfinite(x_arr[idx]) else float(x_arr[idx]),
+            "A4": a4_v,
+            "fit_r2": r2_v,
+            "alpha_deg": alpha_v,
+            "lobe_fwhm_deg": fwhm_v,
+            "r2_gate_passed": passes_r2,
+        })
+
+    a4_arr = np.asarray(a4_vals, dtype=np.float64)
+    alpha_arr = np.asarray(alpha_vals, dtype=np.float64)
+    fwhm_arr = np.asarray(fwhm_vals, dtype=np.float64)
+
+    with journal_rc_context(resolved):
+        if np.any(np.isfinite(a4_arr)):
+            plot_evolution_panel(
+                ax_e,
+                [{"label": r"$A_4$", "x": x_arr, "y": a4_arr, "status": a4_st, "color": oi[0], "marker": "o", "markersize": 2.8}],
+                xlabel=x_label,
+                ylabel=r"4-fold order $A_4$",
+                title=r"Order $A_4$ & wing geometry",
+                show_legend=False,
+                show_missing_ticks=True,
+                preset=resolved,
+            )
+            ax_e.tick_params(axis="y", colors=oi[0])
+            ax_e.yaxis.label.set_color(oi[0])
+        else:
+            ax_e.set_xlabel(x_label, fontsize=resolved.axis_label_size)
+            ax_e.set_ylabel(r"4-fold order $A_4$", color=oi[0], fontsize=resolved.axis_label_size)
+            ax_e.set_title(r"Order $A_4$ & wing geometry", fontsize=resolved.axis_title_size, pad=3.0)
+            style_1d_axes(ax_e, preset=resolved, grid=True)
+
+        handles_e, labels_e = ax_e.get_legend_handles_labels()
+        has_wings = bool(np.any(np.isfinite(alpha_arr)) or np.any(np.isfinite(fwhm_arr)))
+        if has_wings:
+            ax_e_r = ax_e.twinx()
+            if np.any(np.isfinite(alpha_arr)):
+                ax_e_r.plot(
+                    x_arr,
+                    alpha_arr,
+                    color=oi[1],
+                    linestyle="-",
+                    linewidth=resolved.line_linewidth * 0.95,
+                    marker="^",
+                    markersize=2.6,
+                    label=r"$\alpha$",
+                    zorder=3,
+                )
+            if np.any(np.isfinite(fwhm_arr)):
+                ax_e_r.plot(
+                    x_arr,
+                    fwhm_arr,
+                    color=oi[3],
+                    linestyle="--",
+                    linewidth=resolved.line_linewidth * 0.9,
+                    marker="D",
+                    markersize=2.4,
+                    label=r"$\Delta\chi_{\mathrm{lobe}}$",
+                    zorder=3,
+                )
+            ax_e_r.set_ylabel(format_axis_label("Angle", "deg"), color=oi[1], fontsize=resolved.axis_label_size)
+            ax_e_r.spines["top"].set_visible(False)
+            ax_e_r.spines["right"].set_visible(True)
+            ax_e_r.spines["right"].set_linewidth(resolved.spine_linewidth)
+            ax_e_r.tick_params(
+                axis="y",
+                direction=resolved.tick_direction,
+                length=resolved.tick_length,
+                width=resolved.tick_width,
+                labelsize=resolved.tick_label_size,
+                colors=oi[1],
+            )
+            h_er, l_er = ax_e_r.get_legend_handles_labels()
+            handles_e.extend(h_er)
+            labels_e.extend(l_er)
+        elif not np.any(np.isfinite(a4_arr)):
+            ax_e.text(0.5, 0.5, "No azimuthal order/wing data", transform=ax_e.transAxes, ha="center", va="center", color="#666666")
+        if handles_e:
+            ax_e.legend(handles_e, labels_e, loc="best", fontsize=max(resolved.legend_fontsize - 0.5, 5.0))
+
+    panel_summary["panel_e"] = {
+        "rendered": True,
+        "r2_threshold": r2_threshold,
+        "n_r2_gated": n_r2_gated,
+    }
+
+    # ------------------------------------------------------------------
+    # Panel f: Endpoint C2-bridge + 4-lobe azimuthal fit + aligned residual strip
+    # ------------------------------------------------------------------
+    sub_f = builder.add_subgrid(1, 2, 2, 1, height_ratios=[3.0, 1.0], hspace=0.06)
+    with journal_rc_context(resolved):
+        ax_f_main = builder.figure.add_subplot(sub_f[0, 0])
+        ax_f_resid = builder.figure.add_subplot(sub_f[1, 0], sharex=ax_f_main)
+        style_panel_label(ax_f_main, "f", preset=resolved)
+    builder.panels["f"] = ax_f_main
+    builder.panels["f_resid"] = ax_f_resid
+
+    az_chi = ep_az.get("chi_deg", ep_az.get("angle_deg"))
+    az_obs = ep_az.get("observed", ep_az.get("intensity") if ep_az is not cache else None)
+    az_src_rows: list[dict[str, Any]] = []
+    if az_chi is not None and az_obs is not None:
+        az_fit = ep_az.get("fit_total", ep_az.get("model", ep_az.get("fitted")))
+        az_bridge = ep_az.get("c2_bridge", ep_az.get("bridge"))
+        az_lobes = ep_az.get("lobe_components", ep_az.get("lobes"))
+        az_resid = ep_az.get("residual")
+        az_metrics = dict(ep_az.get("metrics") or {})
+        if "r2" not in az_metrics and _row_num(ep_az, "r2", "c2_r2") is not None:
+            az_metrics["r2"] = _row_num(ep_az, "r2", "c2_r2")
+        if "half_opening_deg" not in az_metrics and _row_num(ep_az, "half_opening_deg", "alpha_deg") is not None:
+            az_metrics["half_opening_deg"] = _row_num(ep_az, "half_opening_deg", "alpha_deg")
+        if "lobe_fwhm_deg" not in az_metrics and _row_num(ep_az, "lobe_fwhm_deg", "delta_chi_deg") is not None:
+            az_metrics["lobe_fwhm_deg"] = _row_num(ep_az, "lobe_fwhm_deg", "delta_chi_deg")
+
+        az_bisector = _row_num(ep_az, "bisector_deg", "friedel_bisector_deg")
+        az_alpha = _row_num(ep_az, "half_opening_deg", "alpha_deg")
+        title_f = _matplotlib_safe_label(ep_az.get("title"), fallback=r"$C_2$ + 4-lobe fit")
+
+        plot_azimuthal_fit_panel(
+            ax_f_main,
+            az_chi,
+            az_obs,
+            fit_total=az_fit,
+            c2_bridge=az_bridge,
+            lobe_components=az_lobes,
+            residual=az_resid,
+            ax_resid=ax_f_resid if (az_fit is not None or az_resid is not None) else None,
+            bisector_deg=az_bisector,
+            half_opening_deg=az_alpha,
+            metrics=az_metrics or None,
+            intensity_unit=ep_az.get("intensity_unit", ep_unit_raw),
+            intensity_mode=endpoint_mode,
+            title=title_f,
+            preset=resolved,
+        )
+        if az_fit is None and az_resid is None:
+            ax_f_resid.set_visible(False)
+
+        chi_a = _to_float_array(az_chi)
+        obs_a = _to_float_array(az_obs)
+        fit_a = _to_float_array(az_fit) if az_fit is not None else np.full_like(chi_a, np.nan)
+        br_a = _to_float_array(az_bridge) if az_bridge is not None else np.full_like(chi_a, np.nan)
+        res_a_arr = _to_float_array(az_resid) if az_resid is not None else (obs_a - fit_a)
+        for idx_c in range(min(chi_a.size, obs_a.size)):
+            az_src_rows.append({
+                "chi_deg": None if not np.isfinite(chi_a[idx_c]) else float(chi_a[idx_c]),
+                "observed": None if not np.isfinite(obs_a[idx_c]) else float(obs_a[idx_c]),
+                "fit_total": None if (idx_c >= fit_a.size or not np.isfinite(fit_a[idx_c])) else float(fit_a[idx_c]),
+                "c2_bridge": None if (idx_c >= br_a.size or not np.isfinite(br_a[idx_c])) else float(br_a[idx_c]),
+                "residual": None if (idx_c >= res_a_arr.size or not np.isfinite(res_a_arr[idx_c])) else float(res_a_arr[idx_c]),
+            })
+        panel_summary["panel_f"] = {"rendered": True, "intensity_mode": endpoint_mode}
+    else:
+        with journal_rc_context(resolved):
+            ax_f_main.text(0.5, 0.5, "Azimuthal fit unavailable", transform=ax_f_main.transAxes, ha="center", va="center", color="#666666")
+            ax_f_main.set_title(r"$C_2$ + 4-lobe fit", fontsize=resolved.axis_title_size, pad=3.0)
+            style_1d_axes(ax_f_main, preset=resolved)
+            ax_f_resid.set_visible(False)
+        panel_summary["panel_f"] = {"rendered": False}
+
+    if safe_sample:
+        with journal_rc_context(resolved):
+            builder.figure.suptitle(
+                safe_sample,
+                fontsize=resolved.axis_title_size + 0.5,
+                fontweight="bold",
+                color="#111111",
+            )
+
+    builder.register_source_data("panel_a_endpoint_2d_summary", ep_2d_src)
+    builder.register_source_data("panel_b_endpoint_polar_summary", ep_pol_src)
+    builder.register_source_data("panel_c_radial_kratky", radial_src_rows)
+    builder.register_source_data("panel_d_spacing_invariant", panel_d_src)
+    builder.register_source_data("panel_e_order_wings", panel_e_src)
+    builder.register_source_data("panel_f_azimuthal_fit", az_src_rows)
+
+    merged_meta: dict[str, Any] = {
+        "title": f"WingSAXS Sample Physics Dashboard: {safe_sample}" if safe_sample else "WingSAXS Sample Physics Dashboard",
+        "sample_label": str(sample_label),
+        "display_sample_label": safe_sample,
+        "intensity_mode": chronology_mode,
+        "endpoint_intensity_mode": endpoint_mode,
+        "q_unit": q_unit,
+        "n_frames": len(rows),
+        "panel_summary": panel_summary,
+    }
+    if metadata:
+        merged_meta.update(dict(metadata))
+
+    manifest = builder.export(
+        output_stem,
+        formats=formats,
+        dpi=dpi,
+        metadata=merged_meta,
+    )
+    builder.figure.clear()
+    return json_safe({
+        **manifest,
+        "sample_label": str(sample_label),
+        "intensity_mode": chronology_mode,
+        "endpoint_intensity_mode": endpoint_mode,
+        "panel_summary": panel_summary,
+    })
+
+
 __all__ = [
     "CompositeFigureBuilder",
     "FigureSpec",
@@ -1926,4 +2961,5 @@ __all__ = [
     "plot_radial_kratky_panel",
     "plot_saxs_2d_panel",
     "plot_streak_width_panel",
+    "render_sample_physics_dashboard",
 ]
