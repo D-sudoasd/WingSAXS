@@ -398,3 +398,63 @@ def test_summary_long_observables_keep_full_bbox_at_980_and_1600(qtbot, tmp_path
         assert page.quality_summary.state.engineering_status == "WARN"
         assert page.save_screenshot(tmp_path / f"quality-summary-{name}.png").exists()
     window.close()
+
+
+def test_build_quality_remediation_bilingual_and_strict_json() -> None:
+    import json
+    from butterfly_saxs.butterfly_quality import build_quality_remediation
+
+    flags = [
+        "annular_outer_window_truncated",
+        "low_q_edge_hit",
+        "axis_ratio_at_bound",
+        "mixed_radial_populations",
+        "near_circular_axis_angle_unconstrained",
+        "near_circular_ellipse_axis_unidentifiable",
+        "orthogonal_axis_flip",
+        "duplicate_frames_detected",
+        "beamstop_unmasked_low_q",
+        "custom_unknown_flag",
+    ]
+    metrics = {
+        "q_min": 0.25,
+        "q_max": 1.35,
+        "recommended_q_min": 0.11,
+        "recommended_mask_radius_px": 12.0,
+        "beam_center_xy": [739.7, 733.5],
+        "friedel_bisector_deg": 96.2,
+        "bound_collapse_rate": 0.72,
+        "duplicate_frame_count": 377,
+        "unique_ratio": 10.0 / 387.0,
+        "nonfinite_ignored": float("nan"),
+    }
+    items = build_quality_remediation(flags, metrics=metrics)
+    assert len(items) == len(flags)
+    json.dumps(items, allow_nan=False)
+
+    by_flag = {item["flag"]: item for item in items}
+    for flag in flags:
+        item = by_flag[flag]
+        assert set(item.keys()) >= {
+            "flag",
+            "severity",
+            "summary_en",
+            "summary_zh",
+            "recommended_action",
+            "suggested_parameters",
+        }
+        assert item["summary_en"].strip()
+        assert item["summary_zh"].strip()
+        assert item["recommended_action"].strip()
+        assert isinstance(item["suggested_parameters"], dict)
+
+    assert by_flag["annular_outer_window_truncated"]["suggested_parameters"]["q_max"] > 1.35
+    assert by_flag["low_q_edge_hit"]["suggested_parameters"]["q_min"] == pytest.approx(0.11)
+    assert by_flag["low_q_edge_hit"]["suggested_parameters"]["apply_beamstop_mask"] is True
+    assert by_flag["beamstop_unmasked_low_q"]["suggested_parameters"]["beamstop_mask_radius_px"] == pytest.approx(12.0)
+    assert by_flag["orthogonal_axis_flip"]["suggested_parameters"]["draw_axis_deg"] == pytest.approx(96.2)
+    assert by_flag["duplicate_frames_detected"]["suggested_parameters"]["quarantine_duplicates"] is True
+    assert by_flag["near_circular_axis_angle_unconstrained"]["suggested_parameters"]["publish_shape"] == "ring"
+    assert by_flag["axis_ratio_at_bound"]["suggested_parameters"]["treat_ellipse_axes_as_candidate_only"] is True
+    assert build_quality_remediation([]) == []
+

@@ -448,3 +448,449 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
             "flags": sorted({reason for row in rows.values() for reason in row["reasons"]}),
         },
     }
+
+
+def _remediation_json_value(value):
+    """Convert numeric/container values into strict JSON-safe scalars."""
+    if isinstance(value, np.generic):
+        return _remediation_json_value(value.item())
+    if isinstance(value, np.ndarray):
+        return [_remediation_json_value(item) for item in value.tolist()]
+    if isinstance(value, Mapping):
+        return {str(k): _remediation_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_remediation_json_value(item) for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, (int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return str(value)
+
+
+def _metric_float(metrics: Mapping[str, object] | None, *keys: str) -> float | None:
+    if not isinstance(metrics, Mapping):
+        return None
+    for key in keys:
+        if key in metrics:
+            val = _finite(metrics[key])
+            if val is not None:
+                return val
+    return None
+
+
+def _round_param(value: float | None, digits: int = 4) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return round(float(value), digits)
+
+
+def build_quality_remediation(
+    flags: Sequence[str],
+    metrics: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    """Map quality flags and observed metrics to concrete bilingual remediation steps.
+
+    Returns a deterministic, strict-JSON-serializable list of auditable action
+    objects. Each item preserves the originating ``flag`` and provides
+    ``severity``, ``summary_en``, ``summary_zh``, ``recommended_action``, and
+    ``suggested_parameters``.
+    """
+
+    tokens = _flag_tokens(flags)
+    if not tokens:
+        return []
+    metric_map = metrics if isinstance(metrics, Mapping) else {}
+    items: list[dict[str, object]] = []
+
+    q_min = _metric_float(metric_map, "q_min", "window_q_min")
+    q_max = _metric_float(metric_map, "q_max", "window_q_max")
+    q_window = metric_map.get("q_window")
+    if (q_min is None or q_max is None) and isinstance(q_window, (list, tuple)) and len(q_window) == 2:
+        q_min = _finite(q_window[0]) if q_min is None else q_min
+        q_max = _finite(q_window[1]) if q_max is None else q_max
+    observed_q_extent = _metric_float(metric_map, "observed_q_extent", "candidate_centered_q_extent")
+    rec_q_min = _metric_float(metric_map, "recommended_q_min", "q_beamstop_safe", "beamstop_safe_q_min")
+    rec_mask_radius = _metric_float(metric_map, "recommended_mask_radius_px", "beamstop_mask_radius_px")
+    bisector_deg = _metric_float(metric_map, "friedel_bisector_deg", "recommended_draw_axis_deg", "detected_axis_deg")
+    axis_ratio_val = _metric_float(metric_map, "axis_ratio", "axis_ratio_b_over_a")
+    collapse_rate = _metric_float(metric_map, "bound_collapse_rate", "axis_ratio_bound_collapse_rate")
+    dup_count = _metric_float(metric_map, "duplicate_frame_count")
+    unique_ratio = _metric_float(metric_map, "unique_ratio")
+
+    for flag in tokens:
+        severity = "info"
+        summary_en = f"Review quality flag '{flag}' against observed intensity and analysis settings."
+        summary_zh = f"请结合观测强度与分析设置复核质量标记 '{flag}'。"
+        recommended_action = f"Inspect diagnostics for '{flag}' before reporting quantitative estimates."
+        suggested_parameters: dict[str, object] = {}
+
+        if flag == "annular_outer_window_truncated":
+            severity = "high"
+            target_q_max = None
+            base_hi = q_max if q_max is not None else observed_q_extent
+            if base_hi is not None and base_hi > 0:
+                target_q_max = _round_param(base_hi * 1.25)
+            summary_en = (
+                "Butterfly wings reach the outer q-window boundary, leaving the major-axis tip unobserved."
+            )
+            summary_zh = "蝴蝶花瓣延伸至分析 q 窗口外边界，长轴端点未被完整观测。"
+            recommended_action = (
+                f"Widen q_max (e.g., to ~{target_q_max}) if detector coverage remains valid, "
+                "or retain major axis 'a' as a constrained candidate."
+                if target_q_max is not None
+                else "Widen q_max if valid detector signal extends further, or keep major axis 'a' as a constrained candidate."
+            )
+            suggested_parameters = {
+                "widen_q_max": True,
+                "treat_major_axis_as_candidate": True,
+            }
+            if target_q_max is not None:
+                suggested_parameters["q_max"] = target_q_max
+
+        elif flag == "low_q_edge_hit":
+            severity = "high"
+            target_q_min = _round_param(rec_q_min)
+            if target_q_min is None and q_min is not None and q_min > 0:
+                target_q_min = _round_param(max(q_min * 0.5, 0.01))
+            summary_en = (
+                "Radial peak candidates pile up at the inner q_min boundary, indicating low-q peak clipping."
+            )
+            summary_zh = "径向峰候选值堆积在 q_min 内边界，表明低 q 相关峰被窗口截断。"
+            recommended_action = (
+                f"Apply an explicit circular beamstop exclusion mask and lower q_min toward {target_q_min} "
+                "to recover the low-q correlation peak."
+                if target_q_min is not None
+                else "Apply an explicit circular beamstop exclusion mask, then lower q_min to recover the clipped low-q peak."
+            )
+            suggested_parameters = {"apply_beamstop_mask": True, "lower_q_min": True}
+            if target_q_min is not None:
+                suggested_parameters["q_min"] = target_q_min
+            if rec_mask_radius is not None:
+                suggested_parameters["beamstop_mask_radius_px"] = _round_param(rec_mask_radius, 2)
+
+        elif flag == "high_q_edge_hit":
+            severity = "medium"
+            target_q_max = _round_param(q_max * 1.25) if (q_max is not None and q_max > 0) else None
+            summary_en = "Peak candidates pile up at the outer q_max boundary."
+            summary_zh = "峰候选值堆积在 q_max 外边界。"
+            recommended_action = (
+                f"Increase q_max toward {target_q_max} if valid detector pixels exist at higher q."
+                if target_q_max is not None
+                else "Increase q_max if valid detector coverage extends to higher q."
+            )
+            suggested_parameters = {"widen_q_max": True}
+            if target_q_max is not None:
+                suggested_parameters["q_max"] = target_q_max
+
+        elif flag in {"axis_ratio_at_bound", "axis_ratio_collapsed_to_line"}:
+            severity = "high"
+            rate_note_en = (
+                f" ({collapse_rate * 100.0:.1f}% of frames collapsed)"
+                if collapse_rate is not None
+                else ""
+            )
+            rate_note_zh = (
+                f"（{collapse_rate * 100.0:.1f}% 帧坍缩至下界）"
+                if collapse_rate is not None
+                else ""
+            )
+            summary_en = (
+                f"Ellipse axis ratio b/a hit its explicit bound{rate_note_en}; origin-centered ellipse "
+                "minor axis and Ln are degenerate for straight radial butterfly streaks."
+            )
+            summary_zh = (
+                f"椭圆轴比 b/a 触及拟合下界{rate_note_zh}；对于过原点的直射线状蝴蝶翼，原点中心椭圆短轴与 Ln 存在几何简并。"
+            )
+            recommended_action = (
+                "Keep ellipse a/b/Ln as constrained candidates only; report model-free wing ray opening "
+                "angle, azimuthal harmonics (A2, A4), and sector radial q* / L* separately."
+            )
+            suggested_parameters = {
+                "treat_ellipse_axes_as_candidate_only": True,
+                "report_model_free_ray_angles": True,
+                "recommended_workflow": "annular",
+                "ellipse_preset": "flat_ellipse",
+            }
+            if axis_ratio_val is not None:
+                suggested_parameters["observed_axis_ratio"] = _round_param(axis_ratio_val, 6)
+
+        elif flag == "mixed_radial_populations":
+            severity = "medium"
+            summary_en = (
+                "Multiple separated radial trajectory populations were detected within the active q_window."
+            )
+            summary_zh = "当前分析 q 窗口内检测到分离的多组径向轨迹群。"
+            recommended_action = (
+                "Split q_window into separate radial sub-windows around each population and compare fits "
+                "independently instead of merging orders."
+            )
+            suggested_parameters = {
+                "split_q_window": True,
+                "compare_subwindow_fits": True,
+            }
+
+        elif flag in {
+            "near_circular_axis_angle_unconstrained",
+            "near_circular_ellipse_axis_unidentifiable",
+        }:
+            severity = "medium"
+            summary_en = (
+                "Near-circular scattering pattern (b/a >= 0.95) has no identifiable ellipse major-axis orientation."
+            )
+            summary_zh = "近圆形散射图样（b/a >= 0.95）的椭圆主轴方向不可辨识。"
+            recommended_action = (
+                "Publish ring q* and L = 2*pi/q* (when physical q is calibrated) only; suppress ellipse "
+                "theta_deg and conditional Ln/Lz."
+            )
+            suggested_parameters = {
+                "publish_shape": "ring",
+                "report_ellipse_theta": False,
+                "recommended_workflow": "sector",
+            }
+
+        elif flag == "orthogonal_axis_flip":
+            severity = "high"
+            axis_note_en = f" (~{bisector_deg:.1f} deg)" if bisector_deg is not None else ""
+            axis_note_zh = f"（约 {bisector_deg:.1f}°）" if bisector_deg is not None else ""
+            summary_en = (
+                f"Principal symmetry axis{axis_note_en} is rotated ~90 deg relative to nominal_draw_axis_deg."
+            )
+            summary_zh = f"主对称轴{axis_note_zh}相对标称拉伸轴 nominal_draw_axis_deg 旋转约 90°。"
+            recommended_action = (
+                "Verify sample mounting orientation vs physical habit-plane switching before pooling with "
+                "other runs; align angular analysis to the detected Friedel bisector."
+            )
+            suggested_parameters = {
+                "verify_sample_mounting_orientation": True,
+                "use_detected_friedel_bisector": True,
+            }
+            if bisector_deg is not None:
+                suggested_parameters["draw_axis_deg"] = _round_param(bisector_deg, 2)
+
+        elif flag == "duplicate_frames_detected":
+            severity = "high"
+            dup_note_en = (
+                f" ({int(dup_count)} duplicate frames, unique ratio {unique_ratio:.3f})"
+                if dup_count is not None and unique_ratio is not None
+                else ""
+            )
+            dup_note_zh = (
+                f"（{int(dup_count)} 帧重复，唯一帧占比 {unique_ratio:.3f}）"
+                if dup_count is not None and unique_ratio is not None
+                else ""
+            )
+            summary_en = (
+                f"Identical/frozen pixel frames detected in sequence{dup_note_en}."
+            )
+            summary_zh = f"序列中检测到像素完全相同的冻结/重复帧{dup_note_zh}。"
+            recommended_action = (
+                "Quarantine duplicate frames to QC/SI diagnostics and exclude them from kinetic fitting "
+                "without interpolating or fabricating replacement frames."
+            )
+            suggested_parameters = {
+                "quarantine_duplicates": True,
+                "exclude_from_kinetics": True,
+            }
+
+        elif flag == "beamstop_unmasked_low_q":
+            severity = "high"
+            summary_en = (
+                "Unmasked central beamstop shadow/rim detected inside the valid detector region."
+            )
+            summary_zh = "有效探测器区域内存在未掩膜的中心束挡阴影或边缘伪影。"
+            recommended_action = (
+                f"Mask a circular exclusion region of radius >= {rec_mask_radius:.1f} px around the beam "
+                "center before lowering q_min."
+                if rec_mask_radius is not None
+                else "Apply a circular beamstop exclusion mask with a safety margin around the beam center before lowering q_min."
+            )
+            suggested_parameters = {"apply_beamstop_mask": True}
+            if rec_mask_radius is not None:
+                suggested_parameters["beamstop_mask_radius_px"] = _round_param(rec_mask_radius, 2)
+            beam_center = metric_map.get("beam_center_xy")
+            if isinstance(beam_center, (list, tuple)) and len(beam_center) == 2:
+                cx, cy = _finite(beam_center[0]), _finite(beam_center[1])
+                if cx is not None and cy is not None:
+                    suggested_parameters["beam_center_xy"] = [_round_param(cx, 2), _round_param(cy, 2)]
+            if rec_q_min is not None:
+                suggested_parameters["q_min"] = _round_param(rec_q_min)
+
+        elif flag == "major_axis_exceeds_observed_extent":
+            severity = "high"
+            summary_en = (
+                "Fitted ellipse major semi-axis 'a' extrapolates beyond the observed q-space extent."
+            )
+            summary_zh = "拟合椭圆半长轴 a 超出观测 q 空间范围，属于外推值。"
+            recommended_action = (
+                "Widen q_max if butterfly intensity continues outward; otherwise keep 'a' and Ln as "
+                "extrapolated candidates only."
+            )
+            suggested_parameters = {
+                "treat_major_axis_as_candidate": True,
+                "widen_q_max": True,
+            }
+            if observed_q_extent is not None and observed_q_extent > 0:
+                suggested_parameters["q_max"] = _round_param(observed_q_extent * 1.25)
+
+        elif flag == "parameter_at_explicit_bound":
+            severity = "medium"
+            summary_en = "One or more fitted ellipse parameters reached an explicit optimizer bound."
+            summary_zh = "一个或多个拟合椭圆参数触及显式优化边界。"
+            recommended_action = (
+                "Inspect bound_flags; widen bounds only if physically supported by observed arcs, "
+                "and retain the fit as a constrained candidate."
+            )
+            suggested_parameters = {"review_bound_flags": True, "keep_candidate_label": True}
+
+        elif flag == "minor_axis_not_resolved_against_localization":
+            severity = "medium"
+            summary_en = "Minor semi-axis 'b' is smaller than 2x the ridge localization uncertainty."
+            summary_zh = "拟合短半轴 b 小于 2 倍脊线定位不确定度，尚未被空间分辨。"
+            recommended_action = (
+                "Retain b and Ln as unresolved candidates; report ray opening angle and sector q* instead."
+            )
+            suggested_parameters = {"treat_minor_axis_as_candidate": True}
+
+        elif flag == "first_order_q_hint_ambiguous":
+            severity = "medium"
+            summary_en = "Automatic first-order peak selection is ambiguous across multiple radial peaks."
+            summary_zh = "自动首阶峰提示存在多峰歧义。"
+            recommended_action = (
+                "Restrict q_window to the primary first-order scattering band and verify via sector I(q)."
+            )
+            suggested_parameters = {"narrow_q_window_to_first_order": True, "verify_sector_profile": True}
+
+        elif flag in {"insufficient_occupied_sides", "insufficient_independent_side_support"}:
+            severity = "high"
+            summary_en = "Too few independent butterfly quadrants/sides have observed arc support."
+            summary_zh = "具有有效观测弧支持的独立象限/侧边数量不足。"
+            recommended_action = (
+                "Inspect detector gap masks and q_window; if only two lobes exist, switch to sector/two-lobe analysis "
+                "without mirroring missing quadrants."
+            )
+            suggested_parameters = {
+                "inspect_mask_gaps": True,
+                "do_not_mirror_missing_quadrants": True,
+                "recommended_workflow": "sector",
+            }
+
+        elif flag in {"ill_conditioned_geometry", "poor_match", "solver_or_arc_support_unavailable"}:
+            severity = "high"
+            summary_en = "Ellipse geometry fit is ill-conditioned, poorly matched, or lacks arc support."
+            summary_zh = "椭圆几何拟合病态、失配或缺少有效弧线支持。"
+            recommended_action = (
+                "Verify mask polarity, beamstop exclusion, q_window, and draw_axis_deg; do not promote "
+                "the fit to quantitative estimates."
+            )
+            suggested_parameters = {
+                "verify_mask_and_q_window": True,
+                "keep_candidate_label": True,
+            }
+
+        elif flag in {
+            "residual_exceeds_localization_scale",
+            "per_arc_normal_residual_exceeds_localization_scale",
+        }:
+            severity = "medium"
+            summary_en = "Geometric fit residuals exceed 3x the observed ridge localization uncertainty."
+            summary_zh = "几何拟合残差超过观测脊线定位不确定度的 3 倍。"
+            recommended_action = (
+                "Check for straight-streak vs ellipse model mismatch, unmasked parasitic streaks, "
+                "or mixed radial populations."
+            )
+            suggested_parameters = {"inspect_fit_residuals": True, "check_model_mismatch": True}
+
+        elif flag in {
+            "annular_trajectory_support_limited",
+            "disconnected_observed_support",
+            "short_observed_arc",
+            "observed_support_infeasible",
+            "arc_endpoint_or_manual_bound_dependent",
+        }:
+            severity = "medium"
+            summary_en = "Observed arc support is short, disconnected, or endpoint-dependent."
+            summary_zh = "观测弧支持较短、不连续或依赖端点/手动边界。"
+            recommended_action = (
+                "Adjust annular_radial_bins / annular_angle_bins to match detector Nyquist sampling "
+                "and inspect detector gap intersections."
+            )
+            suggested_parameters = {"check_nyquist_binning": True, "inspect_mask_gaps": True}
+
+        elif flag in {"uncalibrated_pixel_q", "spacing_unavailable_unknown_q_unit"}:
+            severity = "info"
+            summary_en = "Coordinates are in pixel-q or unknown q units; physical spacing L in nm is unavailable."
+            summary_zh = "当前为未标定 pixel-q 或未知 q 单位，无法计算物理周期 L（nm）。"
+            recommended_action = "Supply a calibrated pyFAI .poni file to convert q to nm^-1 and obtain nm spacings."
+            suggested_parameters = {"require_poni_calibration": True}
+
+        elif flag == "mixed_intensity_units":
+            severity = "high"
+            summary_en = "Sequence mixes calibrated absolute-intensity (e.g. cm^-1) and raw-count frames."
+            summary_zh = "序列混杂了绝对强度标定帧（如 cm^-1）与原始计数帧。"
+            recommended_action = (
+                "Separate calibrated and raw-count runs; restrict raw-count frames to dimensionless "
+                "normalized observables (q*, L*, A2, A4, angles) and never pool raw counts into Q_win."
+            )
+            suggested_parameters = {
+                "separate_calibrated_and_raw_frames": True,
+                "raw_frames_dimensionless_only": True,
+            }
+
+        elif flag == "timestamp_anomaly":
+            severity = "medium"
+            summary_en = "Sequence timestamps exhibit acquisition gaps, stalls, or non-monotonic chronology."
+            summary_zh = "序列时间戳存在采集断档、停滞或非单调顺序异常。"
+            recommended_action = (
+                "Audit beamline acquisition logs and keep gaps explicit in kinetic plots without interpolating."
+            )
+            suggested_parameters = {"keep_time_gaps_explicit": True, "do_not_interpolate_gaps": True}
+
+        elif flag == "coverage_drop":
+            severity = "medium"
+            summary_en = "Significant detector or azimuthal coverage drop detected in one or more frames."
+            summary_zh = "部分帧出现显著的探测器或方位角有效覆盖率下降。"
+            recommended_action = (
+                "Inspect shutter drop, mask mismatch, or dead detector modules on flagged frames."
+            )
+            suggested_parameters = {"inspect_flagged_frame_masks": True}
+
+        elif flag == "abrupt_orientation_transition":
+            severity = "medium"
+            summary_en = "Abrupt frame-to-frame orientation jump or regime shift detected in the sequence."
+            summary_zh = "序列中检测到帧间主轴取向突变或结构机制转换。"
+            recommended_action = (
+                "Inspect the transition frames to distinguish true structural reorientation from mounting "
+                "shifts or warm-start branch jumps; consider independent mode across the boundary."
+            )
+            suggested_parameters = {"batch_mode": "independent", "inspect_transition_frames": True}
+
+        elif flag == "streak_contaminated":
+            severity = "medium"
+            summary_en = "Sharp parasitic radial streak detected; may bias azimuthal harmonics and ellipse fits."
+            summary_zh = "检测到尖锐寄生径向条纹，可能干扰方位角谐波与椭圆拟合。"
+            recommended_action = (
+                "Mask the parasitic streak sector/ROI explicitly and re-run geometry analysis."
+            )
+            suggested_parameters = {"mask_parasitic_streak_roi": True, "recommended_workflow": "sector"}
+
+        elif flag == "low_signal":
+            severity = "high"
+            summary_en = "Observed scattering intensity has very low signal-to-noise ratio in the detector domain."
+            summary_zh = "观测散射图样信噪比过低，难以可靠提取特征峰或弧线。"
+            recommended_action = (
+                "Verify beam exposure/frame integrity or use coarser radial/angular binning for diagnostic checks."
+            )
+            suggested_parameters = {"recommended_workflow": "sector", "verify_beam_exposure": True}
+
+        items.append(
+            {
+                "flag": str(flag),
+                "severity": severity,
+                "summary_en": summary_en,
+                "summary_zh": summary_zh,
+                "recommended_action": recommended_action,
+                "suggested_parameters": _remediation_json_value(suggested_parameters),
+            }
+        )
+    return items
+

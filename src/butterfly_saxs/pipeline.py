@@ -1889,12 +1889,15 @@ def inspect_frame(
     mask_frame: int | None = None,
     mask_dataset: str | None = None,
     fit_ellipse: bool = False,
+    recommend: bool = False,
+    nominal_draw_axis_deg: float = 90.0,
 ) -> dict[str, Any]:
-    """Return frame/q-space diagnostics, with ellipse fitting explicit.
+    """Return frame/q-space diagnostics, with ellipse fitting and advisor opt-in.
 
     Inspection is intentionally lightweight by default.  Pass
     ``fit_ellipse=True`` (or set ``analysis.fit_ellipse=true``) when the
-    diagnostic report should include the canonical ellipse solver output.
+    diagnostic report should include the canonical ellipse solver output, and
+    ``recommend=True`` to attach smart beamstop/q-window/symmetry guidance.
     """
 
     bundle = _read_frame_bundle(
@@ -1936,7 +1939,7 @@ def inspect_frame(
         fit_ellipse=requested_fit_ellipse,
         analysis_domain=domain,
     )
-    return {
+    report: dict[str, Any] = {
         "metadata": metadata,
         "shape": list(image.shape),
         "dtype": str(image.dtype),
@@ -1965,6 +1968,26 @@ def inspect_frame(
             ),
         },
     }
+    requested_recommend = bool(recommend or _config_value(config, "recommend", False))
+    if requested_recommend:
+        from .auto_advisor import advise_from_arrays
+
+        chi_deg = np.degrees(np.arctan2(qy, qx)) % 360.0
+        advisor_valid = (
+            domain.non_window_valid_mask
+            if np.any(domain.non_window_valid_mask)
+            else domain.fit_valid_mask
+        )
+        advisor = advise_from_arrays(
+            image,
+            q,
+            chi_deg,
+            advisor_valid,
+            q_unit=_qmap_unit(qmap_obj, config),
+            nominal_draw_axis_deg=float(nominal_draw_axis_deg),
+        )
+        report["advisor"] = _jsonable(advisor, array_summary=False)
+    return report
 
 
 def analyze_frame(
