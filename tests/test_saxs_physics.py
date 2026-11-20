@@ -615,3 +615,139 @@ def test_measure_frame_wires_all_saxs_physics_metrics_and_gates_pixel_q():
     assert px["summary"]["q_star_direct"] is not None
     assert px["summary"]["L_star_direct_nm"] is None
     assert px["summary"]["L_star_kratky_nm"] is None
+
+
+# ---------------------------------------------------------------------------
+# 7. Real BL19B2 Edge-Case Regressions (BUG 3 & BUG 4)
+# ---------------------------------------------------------------------------
+
+
+def test_bright_axis_convention_reference_vs_draw_and_custom_expected():
+    # NO50S-like equatorial-bridged butterfly: vertical wire draw_axis=90 deg,
+    # bright bridge / acute bisector along reference_axis=0 deg (normal),
+    # and orthogonally flipped butterfly with bright bridge along 90 deg (run22-like).
+    img_normal, qx, qy = _make_butterfly_2d(chi_sym_deg=1.5, alpha_deg=38.0, c0=12.0, c2=6.0)
+    img_flipped, _, _ = _make_butterfly_2d(chi_sym_deg=85.0, alpha_deg=33.0, c0=12.0, c2=6.0)
+
+    # Under bright_axis_convention="reference" (nominal_draw_axis_deg=90 -> expected=0):
+    norm_ref = compute_azimuthal_harmonics_and_order(
+        img_normal,
+        qx,
+        qy,
+        q_window=(0.25, 0.50),
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+        bright_axis_convention="reference",
+    )
+    flip_ref = compute_azimuthal_harmonics_and_order(
+        img_flipped,
+        qx,
+        qy,
+        q_window=(0.25, 0.50),
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+        bright_axis_convention="reference",
+    )
+    _assert_strict_json(norm_ref)
+    _assert_strict_json(flip_ref)
+
+    assert norm_ref["bright_axis_convention"] == "reference"
+    assert norm_ref["expected_bright_axis_deg"] == pytest.approx(0.0)
+    assert abs(norm_ref["angle_to_reference_axis_deg"]) < 3.0
+    assert abs(abs(norm_ref["angle_to_draw_axis_deg"]) - 90.0) < 3.0
+    assert norm_ref["orthogonal_rotation_detected"] is False
+
+    assert flip_ref["orthogonal_rotation_detected"] is True
+    assert abs(flip_ref["angle_to_reference_axis_deg"]) > 75.0
+    assert abs(flip_ref["angle_to_draw_axis_deg"]) < 10.0
+
+    # Default bright_axis_convention="draw" preserves legacy behavior (expected=90 deg)
+    norm_draw = compute_azimuthal_harmonics_and_order(
+        img_normal, qx, qy, q_window=(0.25, 0.50), q_unit="nm^-1", nominal_draw_axis_deg=90.0
+    )
+    assert norm_draw["bright_axis_convention"] == "draw"
+    assert norm_draw["expected_bright_axis_deg"] == pytest.approx(90.0)
+    assert norm_draw["orthogonal_rotation_detected"] is True
+
+    # Explicit expected_bright_axis_deg overrides convention
+    custom = compute_azimuthal_harmonics_and_order(
+        img_flipped,
+        qx,
+        qy,
+        q_window=(0.25, 0.50),
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+        expected_bright_axis_deg=85.0,
+    )
+    assert custom["expected_bright_axis_deg"] == pytest.approx(85.0)
+    assert custom["orthogonal_rotation_detected"] is False
+
+    with pytest.raises(ValueError, match="bright_axis_convention"):
+        compute_azimuthal_harmonics_and_order(
+            img_normal, qx, qy, q_window=(0.25, 0.50), bright_axis_convention="invalid"
+        )
+
+
+def test_radial_coarsening_flat_diffuse_floor_and_run02_kratky_guard():
+    # Replicate BL19B2 run02 (375C): correlation peak at q=0.39 nm^-1 sitting on
+    # a flat 6.0 cm^-1 diffuse background + outer zero-padded dead region at q > 1.45.
+    rng = np.random.default_rng(123)
+    axis = np.linspace(-1.6, 1.6, 261)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    chi = np.mod(np.degrees(np.arctan2(qy, qx)), 360.0)
+    I_bg_true = 6.0
+    angular = 0.6 + 0.4 * np.cos(2.0 * np.deg2rad(chi)) + np.exp(-0.5 * ((np.abs(((chi % 180.0) - 90.0)) - 52.0) / 10.0) ** 2)
+    img = I_bg_true + 32.0 * np.exp(-0.5 * ((q - 0.39) / 0.065) ** 2) * angular + rng.normal(0.0, 0.25, size=q.shape)
+    # Zero-padded outer corners (like abs2d_v4 H5 beyond circular active region)
+    img[q > 1.45] = 0.0
+    valid = q >= 0.09
+
+    res = measure_radial_coarsening_observables(
+        img, qx, qy, valid_mask=valid, q_window=(0.11, 1.55), q_unit="nm^-1", n_radial_bins=120
+    )
+    _assert_strict_json(res)
+    assert res["kratky_background_subtracted"] is True
+    assert res["I_bg_estimate"] == pytest.approx(I_bg_true, abs=0.5)
+    assert "outer_zero_padded_shells_excluded" in res["flags"]
+    assert res["q_star_direct"] == pytest.approx(0.39, abs=0.02)
+    # Kratky MUST stay near the true ~0.40-0.43 nm^-1 peak, NOT climb to 1.15-1.45 on the diffuse floor!
+    assert res["q_star_kratky"] is not None
+    assert 0.38 <= res["q_star_kratky"] <= 0.46
+    assert res["L_star_kratky_nm"] == pytest.approx(2.0 * math.pi / res["q_star_kratky"], rel=1e-6)
+    # Raw q^2 I(q) profile remains preserved alongside subtracted Kratky
+    assert "q2_I_q" in res["full_azimuth"]
+    assert "q2_I_sub_q" in res["full_azimuth"]
+
+
+def test_radial_coarsening_steep_low_q_decay_with_noisy_flat_tail_rejects_ripple_run22_like():
+    # Replicate BL19B2 run22 (475C): steep low-q decay (5000+ cm^-1 at q=0.11)
+    # down to a noisy 6.9 cm^-1 flat diffuse floor, with a real Kratky shoulder at q~0.16 nm^-1.
+    rng = np.random.default_rng(77)
+    axis = np.linspace(-1.45, 1.45, 261)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    I_bg_true = 6.9
+    qc = 0.16
+    # Debye-Bueche low-q scattering (~5200 at q=0.11) + flat diffuse floor + statistical noise
+    signal = 11500.0 / (1.0 + (q / qc) ** 2) ** 2
+    img = I_bg_true + signal + rng.normal(0.0, 0.35, size=q.shape)
+    valid = q >= 0.09
+
+    res = measure_radial_coarsening_observables(
+        img, qx, qy, valid_mask=valid, q_window=(0.11, 1.35), q_unit="nm^-1", n_radial_bins=120
+    )
+    _assert_strict_json(res)
+    expected_tail = I_bg_true + 11500.0 / (1.0 + (1.25 / qc) ** 2) ** 2
+    assert res["I_bg_estimate"] == pytest.approx(expected_tail, abs=0.8)
+    # Direct I(q) MUST NOT pick a tiny statistical ripple in the flat 6.9 cm^-1 tail
+    assert res["q_star_direct"] is None
+    assert res["L_star_direct_nm"] is None
+    assert res["edge_hit_direct"] is True
+    assert res["direct_low_q_edge_hit"] is True
+    # Baseline-subtracted Kratky MUST recover the true ~0.16 nm^-1 correlation shoulder
+    assert res["q_star_kratky"] is not None
+    assert res["q_star_kratky"] == pytest.approx(qc, abs=0.025)
+    assert res["L_star_kratky_nm"] == pytest.approx(2.0 * math.pi / res["q_star_kratky"], rel=1e-6)
+    assert res["kratky_low_q_edge_hit"] is False
+

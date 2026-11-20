@@ -479,6 +479,8 @@ def compute_azimuthal_harmonics_and_order(
     q_unit: str = "unknown",
     n_bins: int = 360,
     nominal_draw_axis_deg: float = 90.0,
+    bright_axis_convention: str = "draw",
+    expected_bright_axis_deg: float | None = None,
     angle_deg: Any = None,
     intensity: Any = None,
     counts: Any = None,
@@ -490,9 +492,28 @@ def compute_azimuthal_harmonics_and_order(
     ``q_window``) OR a pre-binned 1D angular profile ``(angle_deg, intensity)``.
     All quantities are derived strictly from observed pixels/bins; masked gaps
     are never filled or mirrored.
+
+    ``bright_axis_convention`` controls the expected axis for ``orthogonal_rotation_detected``
+    and ``mounting_tilt_deg`` when ``expected_bright_axis_deg`` is omitted:
+    - ``"draw"`` (default): expects the bright C2 bridge / acute lobe bisector along
+      ``nominal_draw_axis_deg``.
+    - ``"reference"``: expects the bright C2 bridge / acute lobe bisector along
+      ``(nominal_draw_axis_deg - 90) % 180`` (WingSAXS ``reference_axis_deg``, matching
+      equatorial-bridged butterflies such as NO50S with vertical wire ``draw_axis_deg=90``).
     """
     q_unit_label, _, _ = _q_unit_info(q_unit)
     nominal_axis = float(nominal_draw_axis_deg) % 180.0
+    nominal_reference_axis = float((nominal_axis - 90.0) % 180.0)
+    convention = str(bright_axis_convention or "draw").strip().lower()
+    if convention not in {"draw", "reference"}:
+        raise ValueError("bright_axis_convention must be 'draw' or 'reference'")
+    if expected_bright_axis_deg is not None:
+        exp_val = float(expected_bright_axis_deg)
+        if not math.isfinite(exp_val):
+            raise ValueError("expected_bright_axis_deg must be finite when provided")
+        expected_axis = float(exp_val % 180.0)
+    else:
+        expected_axis = nominal_axis if convention == "draw" else nominal_reference_axis
     flags: list[str] = []
     quadrant_means: dict[str, float | None] = {"QI": None, "QII": None, "QIII": None, "QIV": None}
     q_bounds: tuple[float | None, float | None] = (None, None)
@@ -556,6 +577,9 @@ def compute_azimuthal_harmonics_and_order(
             "n_total_bins": int(ang.size),
             "angular_coverage": 0.0,
             "nominal_draw_axis_deg": nominal_axis,
+            "nominal_reference_axis_deg": nominal_reference_axis,
+            "bright_axis_convention": convention,
+            "expected_bright_axis_deg": expected_axis,
             "A0": None,
             "A2": None,
             "A4": None,
@@ -571,6 +595,10 @@ def compute_azimuthal_harmonics_and_order(
             "phi4_unwrapped_draw_deg": None,
             "friedel_bisector_deg": None,
             "orthogonal_axis_deg": None,
+            "bright_bridge_axis_deg": None,
+            "dark_notch_axis_deg": None,
+            "angle_to_draw_axis_deg": None,
+            "angle_to_reference_axis_deg": None,
             "mounting_tilt_deg": None,
             "orthogonal_rotation_detected": False,
             "wing_half_opening_estimate_deg": None,
@@ -677,9 +705,9 @@ def compute_azimuthal_harmonics_and_order(
                 friedel_bisector_deg = psi_b_deg
                 wing_half_opening_est = 90.0 - alpha_a
             else:
-                # Near-square 45 deg butterfly: tie-break by proximity to nominal draw axis
-                da = abs(float(_periodic_dist_deg(psi_a_deg, nominal_axis, 180.0)))
-                db = abs(float(_periodic_dist_deg(psi_b_deg, nominal_axis, 180.0)))
+                # Near-square 45 deg butterfly: tie-break by proximity to expected bright axis
+                da = abs(float(_periodic_dist_deg(psi_a_deg, expected_axis, 180.0)))
+                db = abs(float(_periodic_dist_deg(psi_b_deg, expected_axis, 180.0)))
                 friedel_bisector_deg = psi_a_deg if da <= db else psi_b_deg
                 wing_half_opening_est = alpha_a if da <= db else (90.0 - alpha_a)
         elif c2 is not None and s2 is not None and A2 is not None and A2 > amp_tol:
@@ -687,21 +715,29 @@ def compute_azimuthal_harmonics_and_order(
             proj_a = c2 * math.cos(2.0 * math.radians(psi_a_deg)) + s2 * math.sin(2.0 * math.radians(psi_a_deg))
             friedel_bisector_deg = psi_a_deg if proj_a >= 0.0 else psi_b_deg
         else:
-            da = abs(float(_periodic_dist_deg(psi_a_deg, nominal_axis, 180.0)))
-            db = abs(float(_periodic_dist_deg(psi_b_deg, nominal_axis, 180.0)))
+            da = abs(float(_periodic_dist_deg(psi_a_deg, expected_axis, 180.0)))
+            db = abs(float(_periodic_dist_deg(psi_b_deg, expected_axis, 180.0)))
             friedel_bisector_deg = psi_a_deg if da <= db else psi_b_deg
 
         orthogonal_axis_deg = float((friedel_bisector_deg + 90.0) % 180.0)
     else:
         flags.append("isotropic_symmetry_axis_undefined")
 
+    angle_to_draw_axis_deg: float | None = None
+    angle_to_reference_axis_deg: float | None = None
     mounting_tilt_deg: float | None = None
+    bright_bridge_axis_deg: float | None = None
+    dark_notch_axis_deg: float | None = None
     orthogonal_rotation_detected = False
     if friedel_bisector_deg is not None:
-        mounting_tilt_deg = float(_periodic_dist_deg(friedel_bisector_deg, nominal_axis, 180.0))
+        angle_to_draw_axis_deg = float(_periodic_dist_deg(friedel_bisector_deg, nominal_axis, 180.0))
+        angle_to_reference_axis_deg = float(_periodic_dist_deg(friedel_bisector_deg, nominal_reference_axis, 180.0))
+        mounting_tilt_deg = float(_periodic_dist_deg(friedel_bisector_deg, expected_axis, 180.0))
         if abs(mounting_tilt_deg) >= 65.0:
             orthogonal_rotation_detected = True
             flags.append("orthogonal_symmetry_axis_rotation")
+        bright_bridge_axis_deg = phi2_raw if phi2_raw is not None else friedel_bisector_deg
+        dark_notch_axis_deg = float((bright_bridge_axis_deg + 90.0) % 180.0)
 
     f2_nominal, f4_nominal = _hermans_order(ang_obs, y_obs, nominal_axis)
     if friedel_bisector_deg is not None:
@@ -722,6 +758,9 @@ def compute_azimuthal_harmonics_and_order(
         "n_total_bins": int(ang.size),
         "angular_coverage": _finite(angular_coverage),
         "nominal_draw_axis_deg": nominal_axis,
+        "nominal_reference_axis_deg": nominal_reference_axis,
+        "bright_axis_convention": convention,
+        "expected_bright_axis_deg": expected_axis,
         "A0": A0,
         "A2": A2,
         "A4": A4,
@@ -737,6 +776,10 @@ def compute_azimuthal_harmonics_and_order(
         "phi4_unwrapped_draw_deg": _finite(phi4_unwrapped_draw),
         "friedel_bisector_deg": _finite(friedel_bisector_deg),
         "orthogonal_axis_deg": _finite(orthogonal_axis_deg),
+        "bright_bridge_axis_deg": _finite(bright_bridge_axis_deg),
+        "dark_notch_axis_deg": _finite(dark_notch_axis_deg),
+        "angle_to_draw_axis_deg": _finite(angle_to_draw_axis_deg),
+        "angle_to_reference_axis_deg": _finite(angle_to_reference_axis_deg),
         "mounting_tilt_deg": _finite(mounting_tilt_deg),
         "orthogonal_rotation_detected": orthogonal_rotation_detected,
         "wing_half_opening_estimate_deg": _finite(wing_half_opening_est),
@@ -1307,6 +1350,86 @@ def _integrate_observed_segments(x: np.ndarray, y: np.ndarray, dx_bins: np.ndarr
     return _finite(total)
 
 
+def _estimate_local_noise_sigma(values: np.ndarray, valid: np.ndarray) -> float:
+    """Estimate local bin-to-bin noise via 3rd differences (annihilates quadratic curvature)."""
+    if int(np.count_nonzero(valid)) < 16:
+        return 0.0
+    diffs: list[np.ndarray] = []
+    for a, b in _contiguous_segments(valid):
+        if b - a >= 4:
+            ys = values[a:b]
+            d3 = ys[3:] - 3.0 * ys[2:-1] + 3.0 * ys[1:-2] - ys[:-3]
+            finite_d3 = d3[np.isfinite(d3)]
+            if finite_d3.size:
+                diffs.append(np.abs(finite_d3))
+    if not diffs:
+        return 0.0
+    all_d3 = np.concatenate(diffs)
+    if all_d3.size < 4:
+        return 0.0
+    return float(1.4826 * float(np.median(all_d3)) / math.sqrt(20.0))
+
+
+def _estimate_radial_background_and_active_mask(
+    q_centers: np.ndarray,
+    I_q: np.ndarray,
+    counts: np.ndarray,
+    *,
+    zero_pixel_fraction: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, float, int]:
+    """Exclude outer zero-padded dead shells and estimate the active high-q diffuse floor.
+
+    Returns ``(active_mask, I_bg_estimate, tail_noise_mad, n_dead_outer_bins)``.
+    """
+    obs = np.isfinite(q_centers) & np.isfinite(I_q) & (counts > 0)
+    if not np.any(obs):
+        return obs, 0.0, 0.0, 0
+
+    obs_idx = np.flatnonzero(obs)
+    max_val = float(np.max(I_q[obs_idx]))
+    dead_outer = np.zeros(q_centers.shape, dtype=bool)
+
+    if max_val > 1.0e-9 and obs_idx.size >= 4:
+        if zero_pixel_fraction is not None:
+            pos = obs_idx.size - 1
+            while pos >= 0 and float(zero_pixel_fraction[obs_idx[pos]]) > 0.90:
+                dead_outer[obs_idx[pos]] = True
+                pos -= 1
+            if np.any(dead_outer) and pos >= 0 and float(zero_pixel_fraction[obs_idx[pos]]) > 0.50:
+                dead_outer[obs_idx[pos]] = True
+        else:
+            # 1D-profile fallback: detect trailing exact-zero shells preceded by a sharp cliff
+            pos = obs_idx.size - 1
+            while pos >= 0 and abs(float(I_q[obs_idx[pos]])) <= 1.0e-12:
+                pos -= 1
+            n_trailing_zero = (obs_idx.size - 1) - pos
+            if n_trailing_zero >= 1 and pos >= 0:
+                prev_val = float(I_q[obs_idx[pos]])
+                if prev_val > max(1.0e-4 * max_val, 1.0e-6):
+                    for k in range(pos + 1, obs_idx.size):
+                        dead_outer[obs_idx[k]] = True
+
+    active = obs & ~dead_outer
+    if not np.any(active):
+        active = obs
+        dead_outer[:] = False
+    n_dead = int(np.count_nonzero(dead_outer))
+
+    y_act = I_q[active]
+    if y_act.size >= 5:
+        n_tail = max(5, int(round(0.15 * y_act.size)))
+        tail_vals = y_act[-n_tail:]
+        tail_med = float(np.median(tail_vals))
+        tail_mad = float(1.4826 * float(np.median(np.abs(tail_vals - tail_med))))
+        # Cap at 25th percentile of active profile so a peak near q_max is never subtracted as floor
+        p25_global = float(np.percentile(y_act, 25.0))
+        I_bg = max(0.0, min(tail_med, p25_global))
+    else:
+        I_bg = max(0.0, float(np.min(y_act)))
+        tail_mad = 0.0
+    return active, I_bg, tail_mad, n_dead
+
+
 def _extract_radial_peak_from_profile(
     q_centers: np.ndarray,
     values: np.ndarray,
@@ -1315,9 +1438,17 @@ def _extract_radial_peak_from_profile(
     q_scale_nm_inv: float | None,
     q_unit_label: str,
     channel_name: str,
+    active_mask: np.ndarray | None = None,
+    floor_value: float | None = None,
+    noise_sigma_per_bin: np.ndarray | None = None,
+    min_rel_prominence: float = 0.02,
+    min_rel_height: float = 0.05,
+    min_snr: float = 5.0,
 ) -> dict[str, Any]:
     """Extract peak q*, L*_nm, FWHM, prominence, and edge-hit status from a 1D observed profile."""
     valid = np.isfinite(q_centers) & np.isfinite(values) & (counts > 0)
+    if active_mask is not None:
+        valid = valid & np.asarray(active_mask, dtype=bool)
     n_obs = int(np.count_nonzero(valid))
     caveats: list[str] = []
     if q_scale_nm_inv is None:
@@ -1344,7 +1475,9 @@ def _extract_radial_peak_from_profile(
     y_obs = values[obs_indices]
     global_max_pos = int(obs_indices[int(np.argmax(y_obs))])
     global_max_val = float(values[global_max_pos])
-    y_range = float(np.max(y_obs) - np.min(y_obs))
+    floor = float(floor_value) if (floor_value is not None and math.isfinite(float(floor_value))) else float(np.min(y_obs))
+    y_range = max(global_max_val - floor, 0.0)
+    local_d3_sigma = _estimate_local_noise_sigma(values, valid)
 
     # Search for genuine interior peaks inside each contiguous observed segment
     candidates: list[tuple[float, float, int, int, int]] = []  # (prominence, height, global_idx, seg_a, seg_b)
@@ -1358,8 +1491,21 @@ def _extract_radial_peak_from_profile(
             continue
         proms, _, _ = peak_prominences(ys, pks)
         for pk_local, prom in zip(pks, proms):
-            if math.isfinite(float(prom)) and float(prom) > 0.0:
-                candidates.append((float(prom), float(ys[pk_local]), a + int(pk_local), a, b))
+            prom_f = float(prom)
+            if not math.isfinite(prom_f) or prom_f <= 0.0:
+                continue
+            pk_global_i = a + int(pk_local)
+            height_f = float(ys[pk_local])
+            bin_noise = (
+                float(noise_sigma_per_bin[pk_global_i])
+                if (noise_sigma_per_bin is not None and math.isfinite(float(noise_sigma_per_bin[pk_global_i])))
+                else 0.0
+            )
+            eff_noise = max(local_d3_sigma, bin_noise)
+            prom_thresh = max(min_snr * eff_noise, min_rel_prominence * y_range)
+            height_thresh = max(min_snr * eff_noise, min_rel_height * y_range)
+            if prom_f >= prom_thresh and (height_f - floor) >= height_thresh:
+                candidates.append((prom_f, height_f, pk_global_i, a, b))
 
     if not candidates or y_range <= 1.0e-15:
         edge_side = None
@@ -1456,24 +1602,60 @@ def _summarize_radial_channel(
     q_scale_nm_inv: float | None,
     q_unit_label: str,
     channel_name: str,
+    zero_pixel_fraction: np.ndarray | None = None,
+    background_level: float | None = None,
 ) -> dict[str, Any]:
     q_centers = 0.5 * (q_edges[:-1] + q_edges[1:])
     dq_bins = q_edges[1:] - q_edges[:-1]
-    kratky = np.where(np.isfinite(I_q) & (counts > 0), (q_centers ** 2) * I_q, np.nan)
+    obs_mask = np.isfinite(I_q) & (counts > 0)
+    active_mask, I_bg_auto, tail_mad, n_dead_outer = _estimate_radial_background_and_active_mask(
+        q_centers, I_q, counts, zero_pixel_fraction=zero_pixel_fraction
+    )
+    if background_level is not None:
+        bg_val = float(background_level)
+        if not math.isfinite(bg_val) or bg_val < 0.0:
+            raise ValueError("background_level must be finite and non-negative when provided")
+        I_bg = bg_val
+    else:
+        I_bg = I_bg_auto
+    kratky_raw = np.where(obs_mask, (q_centers ** 2) * I_q, np.nan)
+    I_excess = np.where(active_mask, np.maximum(I_q - I_bg, 0.0), np.nan)
+    kratky_sub = np.where(active_mask, (q_centers ** 2) * I_excess, np.nan)
     coverage = np.divide(
         counts,
         candidate_counts,
         out=np.full(q_centers.shape, np.nan, dtype=float),
         where=candidate_counts > 0,
     )
+    direct_noise = np.full(q_centers.shape, tail_mad, dtype=float)
+    kratky_noise = (q_centers ** 2) * tail_mad
     direct_peak = _extract_radial_peak_from_profile(
-        q_centers, I_q, counts, q_scale_nm_inv=q_scale_nm_inv, q_unit_label=q_unit_label, channel_name=f"{channel_name}_direct"
+        q_centers,
+        I_q,
+        counts,
+        q_scale_nm_inv=q_scale_nm_inv,
+        q_unit_label=q_unit_label,
+        channel_name=f"{channel_name}_direct",
+        active_mask=active_mask,
+        floor_value=I_bg,
+        noise_sigma_per_bin=direct_noise,
     )
     kratky_peak = _extract_radial_peak_from_profile(
-        q_centers, kratky, counts, q_scale_nm_inv=q_scale_nm_inv, q_unit_label=q_unit_label, channel_name=f"{channel_name}_kratky"
+        q_centers,
+        kratky_sub,
+        counts,
+        q_scale_nm_inv=q_scale_nm_inv,
+        q_unit_label=q_unit_label,
+        channel_name=f"{channel_name}_kratky",
+        active_mask=active_mask,
+        floor_value=0.0,
+        noise_sigma_per_bin=kratky_noise,
     )
-    q_win = _integrate_observed_segments(q_centers, kratky, dq_bins)
-    obs_bins = int(np.count_nonzero(np.isfinite(I_q) & (counts > 0)))
+    kratky_peak["kratky_background_subtracted"] = True
+    kratky_peak["I_bg_estimate"] = _finite(I_bg)
+    q_win = _integrate_observed_segments(q_centers, kratky_raw, dq_bins)
+    q_win_bg_sub = _integrate_observed_segments(q_centers, kratky_sub, dq_bins)
+    obs_bins = int(np.count_nonzero(obs_mask))
     cand_bins = int(np.count_nonzero(candidate_counts > 0))
     radial_cov = float(obs_bins / cand_bins) if cand_bins > 0 else 0.0
 
@@ -1482,7 +1664,12 @@ def _summarize_radial_channel(
         "q_centers": _finite_list(q_centers),
         "q_edges": _finite_list(q_edges),
         "I_q": _finite_list(I_q),
-        "q2_I_q": _finite_list(kratky),
+        "q2_I_q": _finite_list(kratky_raw),
+        "q2_I_sub_q": _finite_list(kratky_sub),
+        "I_bg_estimate": _finite(I_bg),
+        "I_bg_noise_mad": _finite(tail_mad),
+        "kratky_background_subtracted": True,
+        "n_outer_zero_padded_bins_excluded": n_dead_outer,
         "counts": [int(c) for c in counts],
         "candidate_counts": [int(c) for c in candidate_counts],
         "coverage": _finite_list(coverage),
@@ -1490,6 +1677,7 @@ def _summarize_radial_channel(
         "direct_peak": direct_peak,
         "kratky_peak": kratky_peak,
         "q_win_invariant": q_win,
+        "q_win_bg_subtracted": q_win_bg_sub,
     }
 
 
@@ -1657,6 +1845,7 @@ def measure_radial_coarsening_observables(
     lobe_angles_deg: Sequence[float] | None = None,
     sector_half_width_deg: float = 15.0,
     nominal_draw_axis_deg: float = 90.0,
+    background_level: float | None = None,
     compute_correlation: bool = False,
     r_max_nm: float | None = None,
     n_r: int = 128,
@@ -1698,16 +1887,21 @@ def measure_radial_coarsening_observables(
     q_idx = np.searchsorted(q_edges, q_mag, side="right") - 1
     q_idx[q_mag == q_edges[-1]] = n_bins - 1
 
-    def _bin_radial(cand_sel: np.ndarray, obs_sel: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _bin_radial(
+        cand_sel: np.ndarray, obs_sel: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         c_cnt = np.bincount(q_idx[cand_sel], minlength=n_bins).astype(np.int64)
         o_cnt = np.bincount(q_idx[obs_sel], minlength=n_bins).astype(np.int64)
         o_sum = np.bincount(q_idx[obs_sel], weights=img[obs_sel], minlength=n_bins).astype(float)
         o_mean = np.full(n_bins, np.nan, dtype=float)
         np.divide(o_sum, o_cnt, out=o_mean, where=o_cnt > 0)
-        return o_mean, o_cnt, c_cnt
+        z_sel = obs_sel & (np.abs(img) <= 1.0e-12)
+        z_cnt = np.bincount(q_idx[z_sel], minlength=n_bins).astype(np.int64)
+        z_frac = np.divide(z_cnt, o_cnt, out=np.zeros(n_bins, dtype=float), where=o_cnt > 0)
+        return o_mean, o_cnt, c_cnt, z_frac
 
     # Full-azimuth channel
-    full_I, full_cnt, full_cand = _bin_radial(geometry & in_q, usable & in_q)
+    full_I, full_cnt, full_cand, full_zfrac = _bin_radial(geometry & in_q, usable & in_q)
     full_summary = _summarize_radial_channel(
         q_edges,
         full_I,
@@ -1716,6 +1910,8 @@ def measure_radial_coarsening_observables(
         q_scale_nm_inv=q_scale_nm_inv,
         q_unit_label=q_unit_label,
         channel_name="full_azimuth",
+        zero_pixel_fraction=full_zfrac,
+        background_level=background_level,
     )
 
     # Lobe-sectored channel
@@ -1738,7 +1934,7 @@ def measure_radial_coarsening_observables(
         for ray_deg in sector_angles:
             in_sector |= np.abs(_periodic_dist_deg(angles_deg, ray_deg, 360.0)) <= half_w
         in_sector &= q_mag > 0.0
-        lobe_I, lobe_cnt, lobe_cand = _bin_radial(geometry & in_q & in_sector, usable & in_q & in_sector)
+        lobe_I, lobe_cnt, lobe_cand, lobe_zfrac = _bin_radial(geometry & in_q & in_sector, usable & in_q & in_sector)
         lobe_summary = _summarize_radial_channel(
             q_edges,
             lobe_I,
@@ -1747,6 +1943,8 @@ def measure_radial_coarsening_observables(
             q_scale_nm_inv=q_scale_nm_inv,
             q_unit_label=q_unit_label,
             channel_name="lobe_sectored",
+            zero_pixel_fraction=lobe_zfrac,
+            background_level=background_level,
         )
         lobe_summary["lobe_angles_deg"] = sector_angles
         lobe_summary["sector_half_width_deg"] = half_w
@@ -1795,6 +1993,8 @@ def measure_radial_coarsening_observables(
         "Q_win is a window-bounded scattering invariant proxy over observed [q_min, q_max] only; "
         "it does not estimate scattering-length-density contrast delta_rho or volume fraction.",
         "Ring/sector q* and L* = 2*pi/q* are distinct from ellipse geometry (a, b/a, theta_deg, conditional Ln/Lz).",
+        "Kratky peak q_star_kratky is extracted from high-q diffuse-floor-subtracted q^2 * max(I(q) - I_bg, 0); "
+        "raw q^2 * I(q) is retained in full_azimuth/lobe_sectored['q2_I_q'] and Q_win.",
     ]
     if unit_caveat is not None:
         caveats.append(unit_caveat)
@@ -1808,25 +2008,36 @@ def measure_radial_coarsening_observables(
         flags.append(f"kratky_peak_edge_hit_{kratky_pk['edge_hit_side']}")
     if (full_summary.get("radial_bin_coverage") or 0.0) < 1.0:
         flags.append("incomplete_radial_coverage")
+    if (full_summary.get("n_outer_zero_padded_bins_excluded") or 0) > 0:
+        flags.append("outer_zero_padded_shells_excluded")
+
+    direct_low_q_edge_hit = bool(direct_pk["edge_hit"] and direct_pk["edge_hit_side"] == "low_q")
+    kratky_low_q_edge_hit = bool(kratky_pk["edge_hit"] and kratky_pk["edge_hit_side"] == "low_q")
 
     return json_safe({
         "status": "estimated" if full_summary["status"] == "estimated" else "unavailable",
         "q_unit": q_unit_label,
         "q_window": [q_min, q_max],
         "peak_channel_source": primary_source,
+        "I_bg_estimate": primary.get("I_bg_estimate"),
+        "I_bg_noise_mad": primary.get("I_bg_noise_mad"),
+        "kratky_background_subtracted": True,
         "q_star_direct": direct_pk["q_star"],
         "L_star_direct_nm": direct_pk["L_star_nm"],
         "fwhm_direct_q": direct_pk["fwhm_q"],
         "prominence_direct": direct_pk["prominence"],
         "edge_hit_direct": direct_pk["edge_hit"],
         "edge_hit_direct_side": direct_pk["edge_hit_side"],
+        "direct_low_q_edge_hit": direct_low_q_edge_hit,
         "q_star_kratky": kratky_pk["q_star"],
         "L_star_kratky_nm": kratky_pk["L_star_nm"],
         "fwhm_kratky_q": kratky_pk["fwhm_q"],
         "prominence_kratky": kratky_pk["prominence"],
         "edge_hit_kratky": kratky_pk["edge_hit"],
         "edge_hit_kratky_side": kratky_pk["edge_hit_side"],
+        "kratky_low_q_edge_hit": kratky_low_q_edge_hit,
         "q_win_invariant": full_summary["q_win_invariant"],
+        "q_win_bg_subtracted": full_summary["q_win_bg_subtracted"],
         "q_win_units": f"intensity * ({q_unit_label})^3",
         "full_azimuth": full_summary,
         "lobe_sectored": lobe_summary,
