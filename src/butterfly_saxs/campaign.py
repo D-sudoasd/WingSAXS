@@ -28,7 +28,7 @@ from .csv_utils import safe_csv_cell
 from .file_identity import stream_digest
 from .path_utils import IMAGE_SUFFIXES, is_supported_image_path
 from .project import ProjectConfig, ProjectConfigError, _toml_value
-from .settings import deep_merge_mapping
+from .settings import deep_merge_mapping, strict_int
 
 
 CAMPAIGN_CONFIG_SCHEMA = "wingsaxs.campaign_config.v1"
@@ -575,6 +575,37 @@ def _normalize_sample_entry(entry: Any, index: int) -> dict[str, Any]:
     raise ValueError(f"unsupported campaign sample entry at index {index}: {type(entry).__name__}")
 
 
+def _validate_beamstop_radius_px(value: Any) -> float | str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("beamstop_radius_px must be a finite non-negative number or 'auto'")
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            return None
+        if token.casefold() == "auto":
+            return "auto"
+        try:
+            numeric = float(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"beamstop_radius_px must be a finite non-negative number or 'auto', got {value!r}"
+            ) from exc
+    else:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"beamstop_radius_px must be a finite non-negative number or 'auto', got {value!r}"
+            ) from exc
+    if not math.isfinite(numeric) or numeric < 0.0:
+        raise ValueError(
+            f"beamstop_radius_px must be a finite non-negative number or 'auto', got {value!r}"
+        )
+    return float(numeric)
+
+
 def init_campaign_config(
     samples: Sequence[Any],
     output_path: str | os.PathLike[str],
@@ -587,6 +618,9 @@ def init_campaign_config(
     report: bool = False,
     journal_style: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    beamstop_radius_px: float | str | None = None,
+    max_workers: int = 1,
+    deduplicate_identical_frames: bool = False,
 ) -> Path:
     """Create a validated multi-sample campaign TOML file.
 
@@ -594,6 +628,8 @@ def init_campaign_config(
     """
 
     canonical_preset = canonical_workflow_preset(preset)
+    workers = strict_int(max_workers, "max_workers", minimum=1)
+    validated_beamstop = _validate_beamstop_radius_px(beamstop_radius_px)
     destination = Path(output_path).expanduser()
     if destination.exists() and not force:
         raise FileExistsError(f"输出已存在，未覆盖：{destination}（需要 --force）")
@@ -612,6 +648,10 @@ def init_campaign_config(
         seen_names.add(name)
         if "preset" in sample and sample["preset"] is not None:
             sample["preset"] = canonical_workflow_preset(str(sample["preset"]))
+        if "beamstop_radius_px" in sample and sample["beamstop_radius_px"] is not None:
+            sample["beamstop_radius_px"] = _validate_beamstop_radius_px(
+                sample["beamstop_radius_px"]
+            )
 
     lines: list[str] = [
         "# WingSAXS multi-sample campaign configuration",
@@ -621,6 +661,10 @@ def init_campaign_config(
         f"preset = {_toml_value(canonical_preset)}",
         f"report = {_toml_value(bool(report))}",
     ]
+    if workers > 1:
+        lines.append(f"max_workers = {_toml_value(workers)}")
+    if deduplicate_identical_frames:
+        lines.append(f"deduplicate_identical_frames = {_toml_value(True)}")
     if journal_style is not None and str(journal_style).strip() and str(journal_style) != "default":
         lines.append(f"journal_style = {_toml_value(str(journal_style))}")
     lines.append("")
@@ -635,6 +679,8 @@ def init_campaign_config(
         if len(bounds) != 2 or not all(math.isfinite(v) for v in bounds) or bounds[0] >= bounds[1]:
             raise ValueError("q_window must be a finite [q_min, q_max] pair with q_min < q_max")
         defaults["q_window"] = bounds
+    if validated_beamstop is not None:
+        defaults["beamstop_radius_px"] = validated_beamstop
     if defaults:
         lines.append("[defaults]")
         for key, value in defaults.items():
@@ -756,16 +802,42 @@ def load_campaign_config(path: str | os.PathLike[str]) -> dict[str, Any]:
             "ridge_method",
             "ellipse",
             "butterfly",
+            "beamstop_radius_px",
+            "uncertainty_dataset",
+            "include_physics",
+            "intensity_mode",
+            "bright_axis_convention",
         ):
             if key in merged and merged[key] is not None:
                 if isinstance(merged[key], Mapping) and isinstance(analysis.get(key), Mapping):
                     analysis[key] = deep_merge_mapping(analysis[key], merged[key])
                 else:
                     analysis[key] = copy.deepcopy(merged[key])
+        sample_beamstop_raw = merged.get("beamstop_radius_px", analysis.get("beamstop_radius_px"))
+        sample_beamstop = (
+            _validate_beamstop_radius_px(sample_beamstop_raw)
+            if sample_beamstop_raw is not None
+            else None
+        )
+        if sample_beamstop is not None:
+            analysis["beamstop_radius_px"] = sample_beamstop
         if mask_path is not None:
             analysis["mask"] = mask_path
         if valid_mask_path is not None:
             analysis["valid_mask"] = valid_mask_path
+
+        sample_dedup = bool(
+            merged.get(
+                "deduplicate_identical_frames",
+                merged.get(
+                    "deduplicate_frames",
+                    campaign_section.get(
+                        "deduplicate_identical_frames",
+                        campaign_section.get("deduplicate_frames", False),
+                    ),
+                ),
+            )
+        )
 
         samples.append(
             {
@@ -791,10 +863,28 @@ def load_campaign_config(path: str | os.PathLike[str]) -> dict[str, Any]:
                 "stop": merged.get("stop"),
                 "stride": int(merged.get("stride", 1)),
                 "frame_range": merged.get("frame_range", merged.get("range")),
+                "beamstop_radius_px": sample_beamstop,
+                "deduplicate_identical_frames": sample_dedup,
                 "analysis": analysis,
                 "metadata": copy.deepcopy(dict(merged.get("metadata") or {})),
             }
         )
+
+    campaign_max_workers = strict_int(
+        campaign_section.get("max_workers", 1), "campaign.max_workers", minimum=1
+    )
+    campaign_dedup = bool(
+        campaign_section.get(
+            "deduplicate_identical_frames",
+            campaign_section.get("deduplicate_frames", False),
+        )
+    )
+    default_beamstop_raw = defaults_section.get("beamstop_radius_px")
+    default_beamstop = (
+        _validate_beamstop_radius_px(default_beamstop_raw)
+        if default_beamstop_raw is not None
+        else None
+    )
 
     return {
         "schema_version": str(campaign_section.get("schema_version", CAMPAIGN_CONFIG_SCHEMA)),
@@ -803,6 +893,9 @@ def load_campaign_config(path: str | os.PathLike[str]) -> dict[str, Any]:
         "output_root": _resolve_optional_path(campaign_section.get("output_root"), base_dir),
         "report": bool(campaign_section.get("report", False)),
         "journal_style": campaign_section.get("journal_style"),
+        "max_workers": campaign_max_workers,
+        "deduplicate_identical_frames": campaign_dedup,
+        "beamstop_radius_px": default_beamstop,
         "metadata": copy.deepcopy(dict(raw.get("metadata") or {})),
         "samples": samples,
     }
@@ -842,8 +935,12 @@ def _run_sample_batch(
 
     poni = sample.get("poni")
     full2d = bool(sample.get("full2d", False))
+    sample_beamstop = sample.get("beamstop_radius_px")
+    sample_dedup = bool(sample.get("deduplicate_identical_frames", False))
     analysis = copy.deepcopy(dict(sample.get("analysis") or {}))
     analysis["stage"] = "full2d" if full2d else "geometry"
+    if sample_beamstop is not None:
+        analysis["beamstop_radius_px"] = sample_beamstop
     config = ProjectConfig(
         poni_path=poni,
         output_dir=os.fspath(sample_output_dir),
@@ -877,6 +974,7 @@ def _run_sample_batch(
             mask_dataset=sample.get("mask_dataset"),
             valid_mask=sample.get("valid_mask"),
             geometry_cache=geometry_cache,
+            beamstop_radius_px=sample_beamstop,
         )
 
     stream = bool(sample.get("stream", False))
@@ -919,6 +1017,8 @@ def _run_sample_batch(
             result_sink=None if stream_writer is None else stream_writer.write,
             retain_results=stream_writer is None,
             analyzer_identity="butterfly_saxs.pipeline.analyze_frame",
+            deduplicate_identical_frames=sample_dedup,
+            beamstop_radius_px=sample_beamstop,
         )
         exports = (
             stream_writer.finalize(run)
@@ -971,6 +1071,106 @@ def _run_sample_batch(
     }
 
 
+_DEFAULT_RUN_SAMPLE_BATCH = _run_sample_batch
+
+
+def _format_sample_record(
+    sample: Mapping[str, Any],
+    sample_dir: Path,
+    outcome: Mapping[str, Any],
+    elapsed_s: float,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "name": sample["name"],
+        "preset": sample["preset"],
+        "status": str(outcome.get("status", "ok")),
+        "output_dir": str(sample_dir),
+        "n_frames": int(outcome.get("n_frames", 0)),
+        "n_success": int(outcome.get("n_success", 0)),
+        "n_warning": int(outcome.get("n_warning", 0)),
+        "n_failed": int(outcome.get("n_failed", 0)),
+        "outputs": dict(outcome.get("outputs") or {}),
+        "error": None,
+        "elapsed_s": round(float(elapsed_s), 6),
+    }
+    if outcome.get("warning_reason") is not None:
+        record["warning_reason"] = str(outcome["warning_reason"])
+    return record
+
+
+def _format_sample_error_record(
+    sample: Mapping[str, Any],
+    sample_dir: Path,
+    error_type: str,
+    error_message: str,
+    elapsed_s: float,
+) -> dict[str, Any]:
+    return {
+        "name": sample["name"],
+        "preset": sample["preset"],
+        "status": "failed",
+        "output_dir": str(sample_dir),
+        "n_frames": 0,
+        "n_success": 0,
+        "n_warning": 0,
+        "n_failed": 0,
+        "outputs": {},
+        "error": {
+            "type": error_type,
+            "message": error_message,
+        },
+        "elapsed_s": round(float(elapsed_s), 6),
+    }
+
+
+def _format_sample_skipped_record(
+    sample: Mapping[str, Any],
+    sample_dir: Path,
+) -> dict[str, Any]:
+    return {
+        "name": sample["name"],
+        "preset": sample["preset"],
+        "status": "skipped",
+        "output_dir": str(sample_dir),
+        "n_frames": 0,
+        "n_success": 0,
+        "n_warning": 0,
+        "n_failed": 0,
+        "outputs": {},
+        "error": None,
+        "elapsed_s": 0.0,
+    }
+
+
+def _run_sample_worker(
+    sample: dict[str, Any],
+    sample_dir_str: str,
+    force: bool,
+) -> dict[str, Any]:
+    """Top-level Windows spawn-safe worker executing one independent sample."""
+
+    sample_dir = Path(sample_dir_str)
+    sample_start = time.monotonic()
+    try:
+        outcome = _run_sample_batch(
+            sample,
+            sample_dir,
+            force=force,
+            progress=None,
+        )
+        return _format_sample_record(
+            sample, sample_dir, outcome, time.monotonic() - sample_start
+        )
+    except Exception as exc:  # noqa: BLE001 - isolate sample failure inside worker
+        return _format_sample_error_record(
+            sample,
+            sample_dir,
+            type(exc).__name__,
+            str(exc),
+            time.monotonic() - sample_start,
+        )
+
+
 def run_campaign(
     campaign_toml_path: str | os.PathLike[str],
     output_root: str | os.PathLike[str],
@@ -980,25 +1180,48 @@ def run_campaign(
     report: bool | None = None,
     journal_style: str | None = None,
     progress: Callable[[str], None] | None = None,
+    max_workers: int | None = None,
+    beamstop_radius_px: float | str | None = None,
+    deduplicate_identical_frames: bool | None = None,
 ) -> dict[str, Any]:
     """Execute a multi-sample campaign TOML with per-sample failure isolation.
 
     Returns a strict-JSON-safe summary dict and writes ``campaign_summary.json``
-    under ``output_root``.
+    under ``output_root``.  Pass ``max_workers > 1`` to execute independent
+    samples concurrently via :class:`concurrent.futures.ProcessPoolExecutor`
+    while preserving deterministic sample summary ordering and per-sample
+    failure isolation.
     """
 
     started = time.monotonic()
     config = load_campaign_config(campaign_toml_path)
+    effective_workers = strict_int(
+        config.get("max_workers", 1) if max_workers is None else max_workers,
+        "max_workers",
+        minimum=1,
+    )
+    override_beamstop = (
+        _validate_beamstop_radius_px(beamstop_radius_px)
+        if beamstop_radius_px is not None
+        else None
+    )
     out_root = Path(output_root).expanduser()
     if out_root.exists() and any(out_root.iterdir()) and not force:
         raise FileExistsError(f"输出目录已有内容，未覆盖：{out_root}（需要 --force）")
     out_root.mkdir(parents=True, exist_ok=True)
 
-    sample_results: list[dict[str, Any]] = []
+    # Pre-assign deterministic collision-free output directories in manifest order.
+    sample_jobs: list[tuple[int, dict[str, Any], Path]] = []
     used_dirs: set[str] = set()
-    halted = False
-
-    for sample in config["samples"]:
+    for idx, raw_sample in enumerate(config["samples"]):
+        sample = copy.deepcopy(raw_sample)
+        if override_beamstop is not None:
+            sample["beamstop_radius_px"] = override_beamstop
+            sample_analysis = dict(sample.get("analysis") or {})
+            sample_analysis["beamstop_radius_px"] = override_beamstop
+            sample["analysis"] = sample_analysis
+        if deduplicate_identical_frames is not None:
+            sample["deduplicate_identical_frames"] = bool(deduplicate_identical_frames)
         base_dirname = _safe_sample_dirname(sample["name"])
         dirname = base_dirname
         suffix = 2
@@ -1006,77 +1229,116 @@ def run_campaign(
             dirname = f"{base_dirname}_{suffix}"
             suffix += 1
         used_dirs.add(dirname)
-        sample_dir = out_root / dirname
+        sample_jobs.append((idx, sample, out_root / dirname))
 
-        if halted:
-            sample_results.append(
-                {
-                    "name": sample["name"],
-                    "preset": sample["preset"],
-                    "status": "skipped",
-                    "output_dir": str(sample_dir),
-                    "n_frames": 0,
-                    "n_success": 0,
-                    "n_warning": 0,
-                    "n_failed": 0,
-                    "outputs": {},
-                    "error": None,
-                    "elapsed_s": 0.0,
-                }
-            )
-            continue
+    sample_results: list[dict[str, Any]] = []
+    use_parallel = effective_workers > 1 and len(sample_jobs) > 1 and continue_on_error
 
-        sample_start = time.monotonic()
-        try:
-            outcome = _run_sample_batch(
-                sample,
-                sample_dir,
-                force=force,
-                progress=progress,
-            )
-            sample_elapsed = round(time.monotonic() - sample_start, 6)
-            record = {
-                "name": sample["name"],
-                "preset": sample["preset"],
-                "status": str(outcome.get("status", "ok")),
-                "output_dir": str(sample_dir),
-                "n_frames": int(outcome.get("n_frames", 0)),
-                "n_success": int(outcome.get("n_success", 0)),
-                "n_warning": int(outcome.get("n_warning", 0)),
-                "n_failed": int(outcome.get("n_failed", 0)),
-                "outputs": dict(outcome.get("outputs") or {}),
-                "error": None,
-                "elapsed_s": sample_elapsed,
-            }
-            if outcome.get("warning_reason") is not None:
-                record["warning_reason"] = str(outcome["warning_reason"])
-            sample_results.append(record)
-            if record["status"] == "failed" and not continue_on_error:
-                halted = True
-        except AnalysisCancelled:
-            raise
-        except Exception as exc:  # noqa: BLE001 - isolate sample failure
-            sample_elapsed = round(time.monotonic() - sample_start, 6)
-            sample_results.append(
-                {
-                    "name": sample["name"],
-                    "preset": sample["preset"],
-                    "status": "failed",
-                    "output_dir": str(sample_dir),
-                    "n_frames": 0,
-                    "n_success": 0,
-                    "n_warning": 0,
-                    "n_failed": 0,
-                    "outputs": {},
-                    "error": {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                    "elapsed_s": sample_elapsed,
+    if use_parallel:
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+        results_by_index: dict[int, dict[str, Any]] = {}
+        # Use real ProcessPoolExecutor for production runs; gracefully fall back
+        # to ThreadPoolExecutor when _run_sample_batch is monkeypatched in tests
+        # (spawned child processes would not inherit in-process monkeypatches).
+        use_processes = _run_sample_batch is _DEFAULT_RUN_SAMPLE_BATCH
+        pool_workers = min(effective_workers, len(sample_jobs))
+
+        if use_processes:
+            with ProcessPoolExecutor(max_workers=pool_workers) as executor:
+                future_map = {
+                    executor.submit(_run_sample_worker, sample, os.fspath(sample_dir), force): (
+                        idx,
+                        sample,
+                        sample_dir,
+                    )
+                    for idx, sample, sample_dir in sample_jobs
                 }
-            )
-            if not continue_on_error:
-                halted = True
+                for fut in as_completed(future_map):
+                    idx, sample, sample_dir = future_map[fut]
+                    try:
+                        record = fut.result()
+                    except Exception as exc:  # noqa: BLE001 - isolate worker crash
+                        record = _format_sample_error_record(
+                            sample, sample_dir, type(exc).__name__, str(exc), 0.0
+                        )
+                    results_by_index[idx] = record
+                    if progress is not None:
+                        progress(f"[{sample['name']}] {record['status']}")
+        else:
+            def _run_threaded(sample: dict[str, Any], sample_dir: Path) -> dict[str, Any]:
+                sample_start = time.monotonic()
+                try:
+                    outcome = _run_sample_batch(
+                        sample, sample_dir, force=force, progress=progress
+                    )
+                    return _format_sample_record(
+                        sample, sample_dir, outcome, time.monotonic() - sample_start
+                    )
+                except AnalysisCancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolate sample failure
+                    return _format_sample_error_record(
+                        sample,
+                        sample_dir,
+                        type(exc).__name__,
+                        str(exc),
+                        time.monotonic() - sample_start,
+                    )
+
+            with ThreadPoolExecutor(max_workers=pool_workers) as executor:
+                future_map = {
+                    executor.submit(_run_threaded, sample, sample_dir): (idx, sample, sample_dir)
+                    for idx, sample, sample_dir in sample_jobs
+                }
+                for fut in as_completed(future_map):
+                    idx, sample, sample_dir = future_map[fut]
+                    try:
+                        record = fut.result()
+                    except AnalysisCancelled:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        record = _format_sample_error_record(
+                            sample, sample_dir, type(exc).__name__, str(exc), 0.0
+                        )
+                    results_by_index[idx] = record
+
+        sample_results = [results_by_index[idx] for idx in range(len(sample_jobs))]
+    else:
+        halted = False
+        for _, sample, sample_dir in sample_jobs:
+            if halted:
+                sample_results.append(_format_sample_skipped_record(sample, sample_dir))
+                continue
+
+            sample_start = time.monotonic()
+            try:
+                outcome = _run_sample_batch(
+                    sample,
+                    sample_dir,
+                    force=force,
+                    progress=progress,
+                )
+                record = _format_sample_record(
+                    sample, sample_dir, outcome, time.monotonic() - sample_start
+                )
+                sample_results.append(record)
+                if record["status"] == "failed" and not continue_on_error:
+                    halted = True
+            except AnalysisCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate sample failure
+                sample_results.append(
+                    _format_sample_error_record(
+                        sample,
+                        sample_dir,
+                        type(exc).__name__,
+                        str(exc),
+                        time.monotonic() - sample_start,
+                    )
+                )
+                if not continue_on_error:
+                    halted = True
 
     n_samples = len(sample_results)
     n_success = sum(item["status"] == "ok" for item in sample_results)
@@ -1134,6 +1396,7 @@ def run_campaign(
             "output_root": str(out_root.resolve(strict=False)),
             "preset": config["preset"],
             "continue_on_error": bool(continue_on_error),
+            "max_workers": effective_workers,
             "status": overall_status,
             "exit_code": exit_code,
             "n_samples": n_samples,
@@ -1147,6 +1410,10 @@ def run_campaign(
             "scientific_acceptance": False,
         }
     )
+    if override_beamstop is not None or config.get("beamstop_radius_px") is not None:
+        summary["beamstop_radius_px"] = (
+            override_beamstop if override_beamstop is not None else config.get("beamstop_radius_px")
+        )
     if report_summary is not None:
         summary["analysis_report"] = report_summary
 

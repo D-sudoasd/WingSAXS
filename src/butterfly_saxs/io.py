@@ -59,6 +59,8 @@ class LoadedImage:
     dataset: str | None = None
     valid_mask: np.ndarray | None = None
     qmap: dict[str, Any] | None = None
+    uncertainty: np.ndarray | None = None
+    uncertainty_source: str | None = None
 
     def __post_init__(self) -> None:
         self.data = np.asarray(self.data)
@@ -70,6 +72,16 @@ class LoadedImage:
             self.valid_mask = _coerce_mask_array(
                 self.valid_mask, self.data.shape, name="valid_mask"
             )
+        if self.uncertainty is not None:
+            unc = np.asarray(self.uncertainty)
+            if unc.dtype.kind == "O":
+                raise DataShapeError("uncertainty cannot be object-valued")
+            if unc.shape != self.data.shape:
+                raise DataShapeError(
+                    f"uncertainty shape {unc.shape!r} does not exactly match "
+                    f"image shape {self.data.shape!r}"
+                )
+            self.uncertainty = np.asarray(unc, dtype=np.float64)
         # Keep the source object useful even when callers construct it directly.
         self.metadata = dict(self.metadata)
         self.metadata.setdefault("shape", list(self.data.shape))
@@ -86,6 +98,8 @@ class LoadedImage:
                 "external_mask_true": "invalid pixel",
             },
         )
+        if self.uncertainty_source is not None:
+            self.metadata.setdefault("uncertainty_source", self.uncertainty_source)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -160,6 +174,30 @@ _IMAGE_SUFFIXES = {
 }
 
 
+DEFAULT_H5_UNCERTAINTY_PATHS: tuple[str, ...] = (
+    "entry/data/uncertainty/statistical",
+    "entry/data/uncertainty/sigma",
+    "entry/data/uncertainty",
+    "entry/data/errors",
+    "entry/data/sigma",
+    "entry/data/I_abs_2d_err",
+    "entry/data/I_abs_2d_sigma",
+    "uncertainty/statistical",
+    "uncertainty/sigma",
+    "uncertainty",
+    "errors",
+    "sigma",
+)
+
+_NPZ_AUTO_UNCERTAINTY_KEYS: tuple[str, ...] = (
+    "uncertainty",
+    "sigma",
+    "errors",
+    "statistical_uncertainty",
+    "statistical",
+)
+
+
 def load_image(
     path: str | Path,
     *,
@@ -171,6 +209,7 @@ def load_image(
     mask_frame: int | None = None,
     mask_dataset: str | None = None,
     include_qmap: bool = False,
+    uncertainty_dataset: str | None = None,
 ) -> LoadedImage:
     """Read one two-dimensional detector frame.
 
@@ -202,6 +241,11 @@ def load_image(
         Read reserved NPZ q-map fields beside the selected intensity in the
         same archive access. Only this mode excludes q-map keys when choosing
         a sole intensity dataset; multiple intensity datasets remain ambiguous.
+    uncertainty_dataset:
+        Optional companion statistical uncertainty dataset path/key, or
+        ``"auto"`` to probe standard HDF5/NPZ companion paths (including
+        ``/entry/data/uncertainty/statistical``).  ``None`` (default) skips
+        uncertainty loading.
     """
 
     source = Path(path).expanduser()
@@ -217,6 +261,8 @@ def load_image(
         raise DatasetSelectionError("dataset must be a string path/key")
     if mask_dataset is not None and not isinstance(mask_dataset, str):
         raise DatasetSelectionError("mask_dataset must be a string path/key")
+    if uncertainty_dataset is not None and not isinstance(uncertainty_dataset, str):
+        raise DatasetSelectionError("uncertainty_dataset must be a string path/key or 'auto'")
 
     suffix = source.suffix.lower()
     kind = _IMAGE_SUFFIXES.get(suffix)
@@ -227,6 +273,19 @@ def load_image(
         )
 
     qmap = None
+    uncertainty: np.ndarray | None = None
+    uncertainty_source: str | None = None
+    is_auto_uncertainty = (
+        uncertainty_dataset is not None
+        and uncertainty_dataset.strip().casefold() == "auto"
+    )
+    if uncertainty_dataset is not None and not uncertainty_dataset.strip():
+        raise DatasetSelectionError("uncertainty_dataset path/key cannot be empty")
+    if uncertainty_dataset is not None and not is_auto_uncertainty and kind not in {"hdf5", "npz"}:
+        raise DatasetSelectionError(
+            f"explicit uncertainty_dataset {uncertainty_dataset!r} is only supported for HDF5/NPZ sources"
+        )
+
     if kind == "fabio":
         array, metadata, selected_frame = _read_fabio(source, frame=frame)
         selected_dataset = None
@@ -260,8 +319,12 @@ def load_image(
         )
         selected_dataset = None
     elif kind == "npz":
-        array, metadata, selected_frame, selected_dataset, qmap = _read_npz(
-            source, frame=frame, dataset=dataset, include_qmap=include_qmap
+        array, metadata, selected_frame, selected_dataset, qmap, uncertainty, uncertainty_source = _read_npz(
+            source,
+            frame=frame,
+            dataset=dataset,
+            include_qmap=include_qmap,
+            uncertainty_dataset=uncertainty_dataset,
         )
     elif kind == "csv":
         if dataset is not None:
@@ -280,8 +343,11 @@ def load_image(
         )
         selected_dataset = None
     else:
-        array, metadata, selected_frame, selected_dataset = _read_hdf5(
-            source, frame=frame, dataset=dataset
+        array, metadata, selected_frame, selected_dataset, uncertainty, uncertainty_source = _read_hdf5(
+            source,
+            frame=frame,
+            dataset=dataset,
+            uncertainty_dataset=uncertainty_dataset,
         )
 
     data = np.asarray(array)
@@ -295,6 +361,8 @@ def load_image(
     # HDF5 views must be detached before the file closes; copying every selected
     # array also makes the result independent of FabIO/TIFF file handles.
     data = np.array(data, copy=True)
+    if uncertainty is not None:
+        uncertainty = np.array(uncertainty, dtype=np.float64, copy=True)
     metadata = dict(metadata)
     metadata.update(
         {
@@ -312,6 +380,8 @@ def load_image(
             },
         }
     )
+    if uncertainty_source is not None:
+        metadata["uncertainty_source"] = uncertainty_source
 
     combined_mask = combine_masks(
         data.shape,
@@ -334,6 +404,8 @@ def load_image(
         dataset=selected_dataset,
         valid_mask=combined_mask,
         qmap=qmap,
+        uncertainty=uncertainty,
+        uncertainty_source=uncertainty_source,
     )
 
 
@@ -496,7 +568,16 @@ def _read_npz(
     frame: int | None,
     dataset: str | None,
     include_qmap: bool,
-) -> tuple[np.ndarray, dict[str, Any], int | None, str, dict[str, Any] | None]:
+    uncertainty_dataset: str | None = None,
+) -> tuple[
+    np.ndarray,
+    dict[str, Any],
+    int | None,
+    str,
+    dict[str, Any] | None,
+    np.ndarray | None,
+    str | None,
+]:
     if dataset is not None and not dataset:
         raise DatasetSelectionError("NPZ dataset/key cannot be empty")
     try:
@@ -540,7 +621,54 @@ def _read_npz(
                 if raw_unit.ndim != 0:
                     raise DataShapeError("NPZ q_unit 必须是标量字符串")
                 qmap["q_unit"] = str(raw_unit.item())
-        return array, metadata, selected_frame, selected_dataset, qmap or None
+        uncertainty: np.ndarray | None = None
+        uncertainty_source: str | None = None
+        if uncertainty_dataset is not None:
+            token = uncertainty_dataset.strip()
+            if token.casefold() == "auto":
+                for cand_key in _NPZ_AUTO_UNCERTAINTY_KEYS:
+                    if cand_key not in keys or cand_key == selected_dataset:
+                        continue
+                    try:
+                        raw_unc = archive[cand_key]
+                        unc_arr, _ = _select_frame(
+                            raw_unc, frame=selected_frame, source=source, source_kind="NPZ"
+                        )
+                        unc_arr = np.asarray(unc_arr, dtype=np.float64)
+                    except (DataIOError, TypeError, ValueError):
+                        continue
+                    if unc_arr.shape == array.shape and np.any(np.isfinite(unc_arr)):
+                        uncertainty = unc_arr
+                        uncertainty_source = cand_key
+                        break
+            else:
+                if token not in keys:
+                    raise DatasetSelectionError(
+                        f"uncertainty dataset {uncertainty_dataset!r} not found in NPZ source "
+                        f"{source}; available: {keys!r}"
+                    )
+                unc_arr, _ = _select_frame(
+                    archive[token], frame=selected_frame, source=source, source_kind="NPZ"
+                )
+                unc_arr = np.asarray(unc_arr)
+                if unc_arr.dtype.kind == "O":
+                    raise DataShapeError("object-valued uncertainty arrays are not supported")
+                if unc_arr.shape != array.shape:
+                    raise DataShapeError(
+                        f"uncertainty dataset {token!r} shape {unc_arr.shape!r} does not match "
+                        f"image shape {array.shape!r}"
+                    )
+                uncertainty = np.asarray(unc_arr, dtype=np.float64)
+                uncertainty_source = token
+        return (
+            array,
+            metadata,
+            selected_frame,
+            selected_dataset,
+            qmap or None,
+            uncertainty,
+            uncertainty_source,
+        )
     finally:
         archive.close()
 
@@ -716,12 +844,189 @@ def _read_fabio(
         _close_fabio(first)
 
 
+def _looks_like_channel_last_shape(shape: Sequence[int]) -> bool:
+    if len(shape) != 3:
+        return False
+    height, width, channels = int(shape[0]), int(shape[1]), int(shape[2])
+    return channels in {1, 3, 4} and height >= 4 and width >= 4 and channels < min(height, width)
+
+
+def _read_hdf5_node_frame(
+    node: Any,
+    *,
+    frame: int | None,
+    source: Path,
+) -> tuple[np.ndarray, int | None]:
+    """Read only the requested frame from an HDF5 dataset when possible."""
+
+    shape = tuple(int(dim) for dim in getattr(node, "shape", ()))
+    if len(shape) == 3 and not _looks_like_channel_last_shape(shape):
+        if frame is None:
+            raise FrameSelectionError(
+                f"HDF5 source {source} contains multiple dimensions/frames; "
+                "select an explicit frame=..."
+            )
+        index = int(frame)
+        if index >= shape[0]:
+            raise FrameSelectionError(
+                f"frame {index} is outside HDF5 source {source} with {shape[0]} frames"
+            )
+        selected = np.asarray(node[index])
+        if selected.ndim != 2:
+            raise DataShapeError(
+                f"frame {index} from {source} is not a 2-D image: {selected.shape!r}"
+            )
+        return selected, index
+    array = np.asarray(node[...])
+    return _select_frame(array, frame=frame, source=source, source_kind="HDF5")
+
+
+def _candidate_h5_uncertainty_paths(image_dataset: str | None) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        cleaned = path.lstrip("/")
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            candidates.append(cleaned)
+
+    if image_dataset:
+        cleaned_img = image_dataset.lstrip("/")
+        parent, sep, leaf = cleaned_img.rpartition("/")
+        if sep and parent:
+            add(f"{parent}/uncertainty/statistical")
+            add(f"{parent}/uncertainty/sigma")
+            add(f"{parent}/uncertainty")
+            add(f"{parent}/errors")
+            add(f"{parent}/sigma")
+            if leaf:
+                add(f"{parent}/{leaf}_err")
+                add(f"{parent}/{leaf}_errors")
+                add(f"{parent}/{leaf}_sigma")
+        elif leaf:
+            add(f"{leaf}_err")
+            add(f"{leaf}_sigma")
+    for default_path in DEFAULT_H5_UNCERTAINTY_PATHS:
+        add(default_path)
+    return candidates
+
+
+def _read_hdf5_uncertainty_from_handle(
+    handle: Any,
+    *,
+    h5py_module: Any,
+    source: Path,
+    uncertainty_dataset: str,
+    frame: int | None,
+    image_dataset: str | None = None,
+    expected_shape: tuple[int, int] | None = None,
+) -> tuple[np.ndarray | None, str | None]:
+    token = uncertainty_dataset.strip()
+    if not token:
+        raise DatasetSelectionError("HDF5 uncertainty_dataset path cannot be empty")
+
+    if token.casefold() == "auto":
+        primary_clean = image_dataset.lstrip("/") if image_dataset else None
+        for cand_path in _candidate_h5_uncertainty_paths(image_dataset):
+            if cand_path == primary_clean:
+                continue
+            node = handle.get(cand_path)
+            if node is None or not isinstance(node, h5py_module.Dataset):
+                continue
+            if getattr(node.dtype, "kind", "O") not in {"f", "i", "u"}:
+                continue
+            try:
+                raw_arr, _ = _read_hdf5_node_frame(node, frame=frame, source=source)
+            except (FrameSelectionError, DataShapeError):
+                continue
+            if raw_arr.ndim != 2:
+                continue
+            if expected_shape is not None and tuple(raw_arr.shape) != expected_shape:
+                continue
+            unc = np.asarray(raw_arr, dtype=np.float64)
+            if not np.any(np.isfinite(unc)):
+                continue
+            return np.array(unc, dtype=np.float64, copy=True), cand_path
+        return None, None
+
+    selected = token.lstrip("/")
+    if not selected:
+        raise DatasetSelectionError("HDF5 uncertainty_dataset path cannot be empty")
+    node = handle.get(selected)
+    if node is None or not isinstance(node, h5py_module.Dataset):
+        raise DatasetSelectionError(
+            f"uncertainty dataset {uncertainty_dataset!r} not found in HDF5 source {source}"
+        )
+    if getattr(node.dtype, "kind", "O") == "O":
+        raise DataShapeError("object-valued uncertainty arrays are not supported")
+    raw_arr, _ = _read_hdf5_node_frame(node, frame=frame, source=source)
+    if raw_arr.ndim != 2:
+        raise DataShapeError(
+            f"uncertainty dataset {uncertainty_dataset!r} from {source} must be 2-D, "
+            f"got {raw_arr.shape!r}"
+        )
+    if expected_shape is not None and tuple(raw_arr.shape) != expected_shape:
+        raise DataShapeError(
+            f"uncertainty dataset {uncertainty_dataset!r} shape {raw_arr.shape!r} "
+            f"does not match image shape {expected_shape!r}"
+        )
+    unc = np.asarray(raw_arr, dtype=np.float64)
+    return np.array(unc, dtype=np.float64, copy=True), selected
+
+
+def load_h5_uncertainty(
+    path: str | Path,
+    *,
+    uncertainty_dataset: str = "auto",
+    frame: int | None = None,
+    image_dataset: str | None = None,
+    expected_shape: Sequence[int] | None = None,
+) -> tuple[np.ndarray | None, str | None]:
+    """Load a companion statistical uncertainty array from an HDF5 file.
+
+    When ``uncertainty_dataset="auto"`` (default), probes standard companion
+    paths (including ``/entry/data/uncertainty/statistical``) without scanning
+    the full HDF5 tree and returns ``(uncertainty_array, dataset_path)`` or
+    ``(None, None)`` if no matching companion dataset exists.  An explicit path
+    fails closed with :class:`DatasetSelectionError` if absent.
+    """
+
+    source = Path(path).expanduser()
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"HDF5 source does not exist: {source}")
+    _validate_frame_argument(frame)
+    if not isinstance(uncertainty_dataset, str):
+        raise DatasetSelectionError("uncertainty_dataset must be a string path or 'auto'")
+    shape_tuple = _validate_shape(expected_shape) if expected_shape is not None else None
+    try:
+        import h5py
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise DataIOError("HDF5 support requires h5py; install butterfly-saxs[hdf5]") from exc
+    try:
+        with h5py.File(source, "r") as handle:
+            return _read_hdf5_uncertainty_from_handle(
+                handle,
+                h5py_module=h5py,
+                source=source,
+                uncertainty_dataset=uncertainty_dataset,
+                frame=frame,
+                image_dataset=image_dataset,
+                expected_shape=shape_tuple,
+            )
+    except (DatasetSelectionError, FrameSelectionError, DataShapeError):
+        raise
+    except (OSError, ValueError, RuntimeError, TypeError) as exc:
+        raise DataIOError(f"could not read HDF5 uncertainty from {source}: {exc}") from exc
+
+
 def _read_hdf5(
     source: Path,
     *,
     frame: int | None,
     dataset: str | None,
-) -> tuple[np.ndarray, dict[str, Any], int | None, str]:
+    uncertainty_dataset: str | None = None,
+) -> tuple[np.ndarray, dict[str, Any], int | None, str, np.ndarray | None, str | None]:
     if dataset is not None and not dataset:
         raise DatasetSelectionError("HDF5 dataset path cannot be empty")
     try:
@@ -730,39 +1035,74 @@ def _read_hdf5(
         raise DataIOError("HDF5 support requires h5py; install butterfly-saxs[hdf5]") from exc
     try:
         with h5py.File(source, "r") as handle:
-            datasets: list[str] = []
+            datasets: list[str]
+            discovery_mode: str
+            node: Any = None
+            selected_dataset: str
 
-            def visit(name: str, obj: Any) -> None:
-                if isinstance(obj, h5py.Dataset):
-                    datasets.append(name)
+            if dataset is not None:
+                selected_dataset = dataset.lstrip("/")
+                if not selected_dataset:
+                    raise DatasetSelectionError("HDF5 dataset path cannot be empty")
+                # Fast path: open the explicit dataset directly without a full
+                # HDF5 tree traversal via handle.visititems().
+                candidate = handle.get(selected_dataset)
+                if candidate is not None and isinstance(candidate, h5py.Dataset):
+                    node = candidate
+                    datasets = [selected_dataset]
+                    discovery_mode = "direct"
+                else:
+                    datasets = []
 
-            handle.visititems(visit)
-            if dataset is None:
+                    def visit_missing(name: str, obj: Any) -> None:
+                        if isinstance(obj, h5py.Dataset):
+                            datasets.append(name)
+
+                    handle.visititems(visit_missing)
+                    raise DatasetSelectionError(
+                        f"dataset {dataset!r} not found in HDF5 source {source}; "
+                        f"available: {datasets!r}"
+                    )
+            else:
+                datasets = []
+
+                def visit(name: str, obj: Any) -> None:
+                    if isinstance(obj, h5py.Dataset):
+                        datasets.append(name)
+
+                handle.visititems(visit)
                 if len(datasets) != 1:
                     raise DatasetSelectionError(
                         f"HDF5 source {source} has datasets {datasets!r}; "
                         "select dataset='...' explicitly"
                     )
                 selected_dataset = datasets[0]
-            else:
-                selected_dataset = dataset.lstrip("/")
-                if selected_dataset not in datasets:
-                    raise DatasetSelectionError(
-                        f"dataset {dataset!r} not found in HDF5 source {source}; "
-                        f"available: {datasets!r}"
-                    )
-            node = handle[selected_dataset]
-            array = np.asarray(node[...])
-            array, selected_frame = _select_frame(
-                array, frame=frame, source=source, source_kind="HDF5"
+                node = handle[selected_dataset]
+                discovery_mode = "tree_scan"
+
+            array, selected_frame = _read_hdf5_node_frame(
+                node, frame=frame, source=source
             )
+            uncertainty: np.ndarray | None = None
+            uncertainty_source: str | None = None
+            if uncertainty_dataset is not None:
+                uncertainty, uncertainty_source = _read_hdf5_uncertainty_from_handle(
+                    handle,
+                    h5py_module=h5py,
+                    source=source,
+                    uncertainty_dataset=uncertainty_dataset,
+                    frame=selected_frame,
+                    image_dataset=selected_dataset,
+                    expected_shape=(int(array.shape[0]), int(array.shape[1])),
+                )
             metadata: dict[str, Any] = {
                 "format": "hdf5",
                 "datasets": datasets,
+                "dataset_discovery": discovery_mode,
                 "file_attrs": _attribute_dict(handle.attrs),
                 "dataset_attrs": _attribute_dict(node.attrs),
             }
-            return array, metadata, selected_frame, selected_dataset
+            return array, metadata, selected_frame, selected_dataset, uncertainty, uncertainty_source
     except (DatasetSelectionError, FrameSelectionError, DataShapeError):
         raise
     except (OSError, ValueError, RuntimeError, TypeError) as exc:
@@ -821,6 +1161,7 @@ def _coerce_mask_array(value: Any, shape: Sequence[int], *, name: str) -> np.nda
 
 
 __all__ = [
+    "DEFAULT_H5_UNCERTAINTY_PATHS",
     "DataFrame",
     "DataIOError",
     "DataShapeError",
@@ -831,6 +1172,7 @@ __all__ = [
     "UnsupportedFormatError",
     "combine_masks",
     "load_frame",
+    "load_h5_uncertainty",
     "load_image",
     "read_data",
     "read_image",

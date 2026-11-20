@@ -9,14 +9,17 @@ orchestration with a small fake analyser.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import inspect
 import json
 import math
 import os
+import pickle
 import re
 import tempfile
 import traceback as traceback_module
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
@@ -1745,6 +1748,9 @@ class FrameFitResult:
     warm_start_from: str | None = None
     elapsed_s: float | None = None
     resumed: bool = False
+    is_duplicate_frame: bool = False
+    duplicate_of_frame_id: str | None = None
+    pixel_sha256: str | None = None
 
     def __init__(
         self,
@@ -1758,6 +1764,9 @@ class FrameFitResult:
         elapsed_s: float | None = None,
         resumed: bool = False,
         *,
+        is_duplicate_frame: bool = False,
+        duplicate_of_frame_id: str | None = None,
+        pixel_sha256: str | None = None,
         frame_ref: FrameRef | str | os.PathLike[str] | None = None,
         ref: FrameRef | str | os.PathLike[str] | None = None,
         fit_result: Any = _MISSING,
@@ -1788,6 +1797,11 @@ class FrameFitResult:
         self.warm_start_from = warm_start_from
         self.elapsed_s = elapsed_s
         self.resumed = bool(resumed)
+        self.is_duplicate_frame = bool(is_duplicate_frame)
+        self.duplicate_of_frame_id = (
+            None if duplicate_of_frame_id is None else str(duplicate_of_frame_id)
+        )
+        self.pixel_sha256 = None if pixel_sha256 is None else str(pixel_sha256)
 
     @property
     def frame_ref(self) -> FrameRef:
@@ -1833,7 +1847,7 @@ class FrameFitResult:
         return getattr(value, "parameters", getattr(value, "params", None))
 
     def to_record(self, *, include_result: bool = True) -> dict[str, Any]:
-        return {
+        record: dict[str, Any] = {
             "frame": self.frame.to_dict(),
             "status": self.status,
             "error": self.error,
@@ -1844,6 +1858,15 @@ class FrameFitResult:
             "resumed": self.resumed,
             "result": _json_safe(self.result) if include_result else None,
         }
+        if (
+            self.is_duplicate_frame
+            or self.duplicate_of_frame_id is not None
+            or self.pixel_sha256 is not None
+        ):
+            record["is_duplicate_frame"] = bool(self.is_duplicate_frame)
+            record["duplicate_of_frame_id"] = self.duplicate_of_frame_id
+            record["pixel_sha256"] = self.pixel_sha256
+        return record
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "FrameFitResult":
@@ -1858,6 +1881,9 @@ class FrameFitResult:
             warm_start_from=record.get("warm_start_from", record.get("lineage")),
             elapsed_s=record.get("elapsed_s"),
             resumed=bool(record.get("resumed", False)),
+            is_duplicate_frame=bool(record.get("is_duplicate_frame", False)),
+            duplicate_of_frame_id=record.get("duplicate_of_frame_id"),
+            pixel_sha256=record.get("pixel_sha256"),
         )
 
 
@@ -2102,6 +2128,162 @@ def _checkpoint_locked(function: Callable[_Call, _Return]) -> Callable[_Call, _R
     return locked
 
 
+def compute_frame_pixel_sha256(frame: FrameRef) -> str | None:
+    """Compute exact SHA-256 over a frame's 2D pixel array (or raw file bytes fallback).
+
+    Returns ``None`` when the source is missing or cannot be read cleanly so
+    missing/corrupt frames are never deduplicated and always run through the
+    analyzer to report their exact failure.
+    """
+
+    path = Path(frame.path)
+    if not path.is_file():
+        return None
+    selector = frame.frame_selector
+    dataset = frame.dataset_id or None
+    frame_idx = selector if isinstance(selector, int) else None
+
+    if path.suffix.casefold() in IMAGE_SUFFIXES:
+        try:
+            import numpy as np
+            from .io import load_image
+
+            loaded = load_image(path, frame=frame_idx, dataset=dataset)
+            arr = np.ascontiguousarray(loaded.data)
+            digest = hashlib.sha256()
+            digest.update(f"pixels:{arr.shape}:{arr.dtype.str}:".encode("ascii"))
+            digest.update(memoryview(arr))
+            return digest.hexdigest()
+        except Exception:
+            # Fall back to raw file bytes only for single-frame mock files without
+            # explicit container selectors (common in lightweight unit tests).
+            if selector is not None or dataset is not None:
+                return None
+
+    try:
+        digest = hashlib.sha256()
+        digest.update(b"rawfile:")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _attach_dedup_metadata(
+    result: Any,
+    frame: FrameRef,
+    *,
+    is_duplicate_frame: bool,
+    duplicate_of_frame_id: str | None,
+    pixel_sha256: str,
+) -> Any:
+    """Record deduplication provenance on a result object without mutating shared originals."""
+
+    if is_dataclass(result) and hasattr(result, "metadata") and hasattr(result, "ellipse_fit"):
+        # Shallow-copy heavy read-only detector arrays while deep-copying mutable
+        # result payloads so per-frame identity/provenance stays isolated.
+        kwargs: dict[str, Any] = {}
+        heavy_fields = {"image", "qmap", "valid_mask", "analysis_domain", "analysis_arrays"}
+        for item_field in fields(result):
+            name = item_field.name
+            value = getattr(result, name)
+            if name in heavy_fields:
+                kwargs[name] = value
+            elif name == "output_paths" and is_duplicate_frame:
+                kwargs[name] = []
+            elif name == "metadata":
+                meta = copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {}
+                meta["frame_id"] = frame.id
+                meta["path"] = os.fspath(frame.path)
+                if frame.frame_selector is not None:
+                    meta["frame_selector"] = frame.frame_selector
+                if frame.dataset_id:
+                    meta["dataset_selector"] = frame.dataset_id
+                if frame.source is not None:
+                    meta["series"] = frame.source
+                meta["is_duplicate_frame"] = bool(is_duplicate_frame)
+                meta["duplicate_of_frame_id"] = duplicate_of_frame_id
+                meta["pixel_sha256"] = pixel_sha256
+                kwargs[name] = meta
+            else:
+                kwargs[name] = copy.deepcopy(value)
+        return type(result)(**kwargs)
+
+    if isinstance(result, Mapping):
+        cloned = copy.deepcopy(dict(result))
+        meta = cloned.get("metadata")
+        if isinstance(meta, Mapping):
+            meta_copy = dict(meta)
+            meta_copy["frame_id"] = frame.id
+            meta_copy["path"] = os.fspath(frame.path)
+            meta_copy["is_duplicate_frame"] = bool(is_duplicate_frame)
+            meta_copy["duplicate_of_frame_id"] = duplicate_of_frame_id
+            meta_copy["pixel_sha256"] = pixel_sha256
+            cloned["metadata"] = meta_copy
+        return cloned
+
+    return copy.deepcopy(result) if is_duplicate_frame else result
+
+
+def _with_beamstop_radius_px(config: Any, beamstop_radius_px: float | str | None) -> Any:
+    """Attach beamstop_radius_px to config without mutating the caller's object."""
+
+    if beamstop_radius_px is None:
+        return config
+    if config is None:
+        return {"beamstop_radius_px": beamstop_radius_px}
+    if isinstance(config, Mapping):
+        copied = dict(config)
+        nested = copied.get("analysis")
+        if isinstance(nested, Mapping):
+            copied["analysis"] = {**nested, "beamstop_radius_px": beamstop_radius_px}
+        else:
+            copied["beamstop_radius_px"] = beamstop_radius_px
+        return copied
+    if is_dataclass(config) and hasattr(config, "analysis") and isinstance(getattr(config, "analysis"), Mapping):
+        copied = copy.copy(config)
+        copied.analysis = {**copied.analysis, "beamstop_radius_px": beamstop_radius_px}
+        return copied
+    return config
+
+
+def _can_pickle_for_process_pool(analyze_frame: Any, config: Any) -> bool:
+    try:
+        pickle.dumps((analyze_frame, config))
+        return True
+    except Exception:
+        return False
+
+
+def _parallel_analyze_worker(
+    analyze_frame: Callable[..., Any],
+    frame: FrameRef,
+    config: Any,
+) -> tuple[bool, Any, str | None, str | None, float]:
+    """Top-level Windows spawn-safe worker for mode='independent' parallel batches."""
+
+    started = __import__("time").perf_counter()
+    try:
+        result = _call_analyzer(
+            analyze_frame,
+            frame,
+            None,
+            warm_start=False,
+            config=config,
+        )
+        return True, result, None, None, __import__("time").perf_counter() - started
+    except Exception as exc:  # noqa: BLE001 - isolate worker failure per frame
+        return (
+            False,
+            None,
+            f"{type(exc).__name__}: {exc}",
+            traceback_module.format_exc(),
+            __import__("time").perf_counter() - started,
+        )
+
+
 @_checkpoint_locked
 def run_batch(
     frames: Iterable[Any] | Any = (),
@@ -2127,6 +2309,9 @@ def run_batch(
     retain_results: bool = True,
     analyzer_identity: Any = None,
     restore_frame: Callable[[FrameRef, int], bool] | None = None,
+    deduplicate_identical_frames: bool = False,
+    max_workers: int = 1,
+    beamstop_radius_px: float | str | None = None,
 ) -> BatchRunResult:
     """Analyze a sequence of frames with failure isolation and optional resume.
 
@@ -2138,6 +2323,14 @@ def run_batch(
     cannot establish whether its calculation is equivalent. ``restore_frame``
     lets a streaming consumer retry a checkpointed frame whose native array
     evidence was never published, without recomputing delivered frames.
+
+    Optional ``deduplicate_identical_frames=True`` hashes each frame's exact
+    pixel content (SHA-256) and reuses earlier completed results for exact
+    pixel duplicates while preserving every ``FrameRef`` row, sequence order,
+    and explicit provenance (``is_duplicate_frame``, ``duplicate_of_frame_id``,
+    ``pixel_sha256``).  Optional ``max_workers > 1`` executes independent
+    frames concurrently when ``mode="independent"`` (cleanly falling back to
+    sequential execution for ``mode="warm_start"`` or ``max_workers <= 1``).
     """
 
     # A few callers naturally write run_batch(analyze_frame, frames).  Keep
@@ -2150,9 +2343,12 @@ def run_batch(
         mode = strategy
     if mode not in {"independent", "warm_start"}:
         raise ValueError("mode must be 'independent' or 'warm_start'")
+    effective_workers = strict_int(max_workers, "max_workers", minimum=1)
+    dedup_enabled = bool(deduplicate_identical_frames)
     if checkpoint is not None and checkpoint_path is not None and Path(checkpoint) != Path(checkpoint_path):
         raise ValueError("checkpoint and checkpoint_path refer to different files")
     checkpoint_file = Path(checkpoint_path or checkpoint) if (checkpoint_path or checkpoint) else None
+    config = _with_beamstop_radius_px(config, beamstop_radius_px)
     config = _resolve_config_paths(config)
     missing_config_files = _missing_config_files(config)
     if missing_config_files:
@@ -2442,81 +2638,386 @@ def run_batch(
             payload["processed_count"] = sum(record["status"] != "skipped" for record in records)
         write_checkpoint(checkpoint_file, payload)
 
-    previous_result: Any = None
-    previous_frame_key: str | None = None
-    for frame_index, frame in enumerate(refs):
-        if cancelled():
-            run.cancelled = True
-            emit_progress(len(run.frame_results), None)
-            mark_cancelled_tail(len(run.frame_results))
-            break
-        emit_progress(len(run.frame_results), None)
-        if cancelled():
-            run.cancelled = True
-            emit_progress(len(run.frame_results), None)
-            mark_cancelled_tail(len(run.frame_results))
-            break
-        item = restore_checkpoint_item(frame, frame_index)
-        if item is not None:
-            run.frame_results.append(item)
-            if mode == "warm_start":
-                seed = _warm_start_seed(item.result)
-                if seed is not None:
-                    previous_result = seed
-                    previous_frame_key = frame.key
-            publish(item)
-            emit_progress(len(run.frame_results) - 1, item)
-            continue
+    # Bounded LRU dedup cache when retain_results=False (streaming); unbounded
+    # when retain_results=True (run.frame_results already holds the objects).
+    dedup_cache: OrderedDict[str, tuple[str, Literal["ok", "warning"], str | None, Any]] = OrderedDict()
+    dedup_cache_limit = None if retain_results else 32
 
-        initial = previous_result if mode == "warm_start" else None
-        lineage = previous_frame_key if mode == "warm_start" and previous_frame_key else None
-        started = __import__("time").perf_counter()
-        try:
-            result = _call_analyzer(
-                analyze_frame,
-                frame,
-                initial,
-                warm_start=mode == "warm_start",
-                config=config,
-            )
-        except AnalysisCancelled:
-            run.cancelled = True
+    def remember_dedup_result(
+        pixel_hash: str | None,
+        item: FrameFitResult,
+        raw_result: Any,
+    ) -> None:
+        if not dedup_enabled or not pixel_hash:
+            return
+        if item.status not in {"ok", "warning"} or raw_result is None:
+            return
+        if pixel_hash in dedup_cache:
+            return
+        dedup_cache[pixel_hash] = (item.frame.id, item.status, item.diagnostic, raw_result)
+        if dedup_cache_limit is not None and len(dedup_cache) > dedup_cache_limit:
+            dedup_cache.popitem(last=False)
+
+    def make_duplicate_item(
+        frame: FrameRef,
+        pixel_hash: str,
+        *,
+        lineage: str | None = None,
+        started_t: float,
+    ) -> FrameFitResult | None:
+        cached = dedup_cache.get(pixel_hash)
+        if cached is None:
+            return None
+        if dedup_cache_limit is not None:
+            dedup_cache.move_to_end(pixel_hash)
+        first_frame_id, cached_status, cached_diagnostic, cached_result = cached
+        cloned_result = _attach_dedup_metadata(
+            cached_result,
+            frame,
+            is_duplicate_frame=True,
+            duplicate_of_frame_id=first_frame_id,
+            pixel_sha256=pixel_hash,
+        )
+        return FrameFitResult(
+            frame=frame,
+            result=cloned_result,
+            status=cached_status,
+            diagnostic=cached_diagnostic,
+            warm_start_from=lineage,
+            elapsed_s=__import__("time").perf_counter() - started_t,
+            is_duplicate_frame=True,
+            duplicate_of_frame_id=first_frame_id,
+            pixel_sha256=pixel_hash,
+        )
+
+    use_parallel = effective_workers > 1 and mode == "independent" and len(refs) > 1
+
+    if use_parallel:
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+
+        resumed_items: dict[int, FrameFitResult] = {}
+        pending_indices: list[int] = []
+        for idx, frame in enumerate(refs):
+            restored_item = restore_checkpoint_item(frame, idx)
+            if restored_item is not None:
+                resumed_items[idx] = restored_item
+                if dedup_enabled and restored_item.pixel_sha256:
+                    remember_dedup_result(
+                        restored_item.pixel_sha256, restored_item, restored_item.result
+                    )
+            else:
+                pending_indices.append(idx)
+
+        pixel_hashes: dict[int, str | None] = {}
+        canonical_for_index: dict[int, int] = {}
+        first_index_for_hash: dict[str, int] = {}
+        if dedup_enabled:
+            # Record hashes of already-resumed frames so pending duplicates reuse them.
+            for idx, restored_item in resumed_items.items():
+                if restored_item.pixel_sha256 and restored_item.pixel_sha256 not in first_index_for_hash:
+                    first_index_for_hash[restored_item.pixel_sha256] = idx
+            for idx in pending_indices:
+                if cancelled():
+                    break
+                ph = compute_frame_pixel_sha256(refs[idx])
+                pixel_hashes[idx] = ph
+                if ph is not None:
+                    if ph in first_index_for_hash:
+                        canonical_for_index[idx] = first_index_for_hash[ph]
+                    else:
+                        first_index_for_hash[ph] = idx
+
+        work_queue = [idx for idx in pending_indices if idx not in canonical_for_index]
+        executor_cls = (
+            ProcessPoolExecutor
+            if _can_pickle_for_process_pool(analyze_frame, config)
+            else ThreadPoolExecutor
+        )
+        max_in_flight = max(effective_workers * 4, 8)
+        completed_outcomes: dict[int, tuple[FrameFitResult, Any]] = {}
+        next_emit_idx = 0
+        queue_pos = 0
+
+        with executor_cls(max_workers=effective_workers) as executor:
+            in_flight: dict[Any, int] = {}
+
+            def fill_window() -> None:
+                nonlocal queue_pos
+                while (
+                    queue_pos < len(work_queue)
+                    and len(in_flight) < max_in_flight
+                    and not cancelled()
+                ):
+                    idx = work_queue[queue_pos]
+                    queue_pos += 1
+                    fut = executor.submit(_parallel_analyze_worker, analyze_frame, refs[idx], config)
+                    in_flight[fut] = idx
+
+            def drain_ready() -> bool:
+                """Emit all contiguous ready frames in exact deterministic order."""
+                nonlocal next_emit_idx
+                while next_emit_idx < len(refs):
+                    if cancelled():
+                        return False
+                    if next_emit_idx in resumed_items:
+                        emit_progress(len(run.frame_results), None)
+                        item = resumed_items[next_emit_idx]
+                        run.frame_results.append(item)
+                        publish(item)
+                        run.processed_count = len(run.frame_results)
+                        emit_progress(len(run.frame_results) - 1, item)
+                        next_emit_idx += 1
+                        continue
+                    if next_emit_idx in canonical_for_index:
+                        frame = refs[next_emit_idx]
+                        ph = pixel_hashes.get(next_emit_idx)
+                        emit_progress(len(run.frame_results), None)
+                        started_dup = __import__("time").perf_counter()
+                        dup_item = (
+                            make_duplicate_item(frame, ph, started_t=started_dup)
+                            if ph is not None
+                            else None
+                        )
+                        if dup_item is None:
+                            # Canonical frame failed or was evicted from streaming cache:
+                            # run this frame directly so no frame is ever skipped/fabricated.
+                            ok_flag, raw_res, err_msg, tb_text, elapsed_s = _parallel_analyze_worker(
+                                analyze_frame, frame, config
+                            )
+                            if not ok_flag:
+                                dup_item = FrameFitResult(
+                                    frame=frame,
+                                    status="failed",
+                                    error=err_msg,
+                                    traceback=tb_text,
+                                    elapsed_s=elapsed_s,
+                                    pixel_sha256=ph,
+                                )
+                            else:
+                                result_status, quality_reason = _batch_result_status(raw_res)
+                                if ph is not None:
+                                    raw_res = _attach_dedup_metadata(
+                                        raw_res,
+                                        frame,
+                                        is_duplicate_frame=False,
+                                        duplicate_of_frame_id=None,
+                                        pixel_sha256=ph,
+                                    )
+                                dup_item = FrameFitResult(
+                                    frame=frame,
+                                    result=raw_res,
+                                    status=result_status,
+                                    error=quality_reason if result_status == "failed" else None,
+                                    diagnostic=quality_reason if result_status == "warning" else None,
+                                    elapsed_s=elapsed_s,
+                                    is_duplicate_frame=False,
+                                    duplicate_of_frame_id=None,
+                                    pixel_sha256=ph,
+                                )
+                                remember_dedup_result(ph, dup_item, raw_res)
+                        run.frame_results.append(dup_item)
+                        publish(dup_item)
+                        run.processed_count = len(run.frame_results)
+                        emit_progress(len(run.frame_results) - 1, dup_item)
+                        if checkpoint_file is not None:
+                            save_checkpoint()
+                        next_emit_idx += 1
+                        continue
+                    if next_emit_idx in completed_outcomes:
+                        emit_progress(len(run.frame_results), None)
+                        item, raw_res = completed_outcomes.pop(next_emit_idx)
+                        if dedup_enabled:
+                            remember_dedup_result(pixel_hashes.get(next_emit_idx), item, raw_res)
+                        run.frame_results.append(item)
+                        publish(item)
+                        run.processed_count = len(run.frame_results)
+                        emit_progress(len(run.frame_results) - 1, item)
+                        if checkpoint_file is not None:
+                            save_checkpoint()
+                        next_emit_idx += 1
+                        continue
+                    break
+                return True
+
+            fill_window()
+            while next_emit_idx < len(refs):
+                if not drain_ready():
+                    run.cancelled = True
+                    for fut in list(in_flight):
+                        fut.cancel()
+                    emit_progress(len(run.frame_results), None)
+                    mark_cancelled_tail(len(run.frame_results))
+                    break
+                if next_emit_idx >= len(refs):
+                    break
+                if not in_flight:
+                    fill_window()
+                    if not in_flight:
+                        if cancelled():
+                            run.cancelled = True
+                            emit_progress(len(run.frame_results), None)
+                            mark_cancelled_tail(len(run.frame_results))
+                        break
+                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    idx = in_flight.pop(fut)
+                    frame = refs[idx]
+                    ph = pixel_hashes.get(idx) if dedup_enabled else None
+                    try:
+                        ok_flag, raw_res, err_msg, tb_text, elapsed_s = fut.result()
+                    except Exception as exc:  # noqa: BLE001 - isolate pool crash per frame
+                        ok_flag = False
+                        raw_res = None
+                        err_msg = f"{type(exc).__name__}: {exc}"
+                        tb_text = traceback_module.format_exc()
+                        elapsed_s = 0.0
+                    if not ok_flag:
+                        item = FrameFitResult(
+                            frame=frame,
+                            status="failed",
+                            error=err_msg,
+                            traceback=tb_text,
+                            elapsed_s=elapsed_s,
+                            pixel_sha256=ph,
+                        )
+                        completed_outcomes[idx] = (item, None)
+                    else:
+                        result_status, quality_reason = _batch_result_status(raw_res)
+                        if dedup_enabled and ph is not None:
+                            raw_res = _attach_dedup_metadata(
+                                raw_res,
+                                frame,
+                                is_duplicate_frame=False,
+                                duplicate_of_frame_id=None,
+                                pixel_sha256=ph,
+                            )
+                        item = FrameFitResult(
+                            frame=frame,
+                            result=raw_res,
+                            status=result_status,
+                            error=quality_reason if result_status == "failed" else None,
+                            diagnostic=quality_reason if result_status == "warning" else None,
+                            elapsed_s=elapsed_s,
+                            is_duplicate_frame=False,
+                            duplicate_of_frame_id=None,
+                            pixel_sha256=ph,
+                        )
+                        completed_outcomes[idx] = (item, raw_res)
+                fill_window()
+    else:
+        previous_result: Any = None
+        previous_frame_key: str | None = None
+        for frame_index, frame in enumerate(refs):
+            if cancelled():
+                run.cancelled = True
+                emit_progress(len(run.frame_results), None)
+                mark_cancelled_tail(len(run.frame_results))
+                break
             emit_progress(len(run.frame_results), None)
-            mark_cancelled_tail(len(run.frame_results))
-            break
-        except Exception as exc:
-            item = FrameFitResult(
-                frame=frame,
-                status="failed",
-                error=f"{type(exc).__name__}: {exc}",
-                traceback=traceback_module.format_exc(),
-                warm_start_from=lineage,
-                elapsed_s=__import__("time").perf_counter() - started,
-            )
-            # Crucially, previous_result is unchanged.  A failed frame must
-            # never seed the next warm-start fit.
-        else:
-            result_status, quality_reason = _batch_result_status(result)
-            item = FrameFitResult(
-                frame=frame,
-                result=result,
-                status=result_status,
-                error=quality_reason if result_status == "failed" else None,
-                diagnostic=quality_reason if result_status == "warning" else None,
-                warm_start_from=lineage,
-                elapsed_s=__import__("time").perf_counter() - started,
-            )
-            if mode == "warm_start":
-                seed = _warm_start_seed(result)
-                if seed is not None:
-                    previous_result = seed
-                    previous_frame_key = frame.key
-        run.frame_results.append(item)
-        publish(item)
-        run.processed_count = len(run.frame_results)
-        emit_progress(len(run.frame_results) - 1, item)
-        if checkpoint_file is not None:
-            save_checkpoint()
+            if cancelled():
+                run.cancelled = True
+                emit_progress(len(run.frame_results), None)
+                mark_cancelled_tail(len(run.frame_results))
+                break
+            item = restore_checkpoint_item(frame, frame_index)
+            if item is not None:
+                run.frame_results.append(item)
+                if dedup_enabled and item.pixel_sha256:
+                    remember_dedup_result(item.pixel_sha256, item, item.result)
+                if mode == "warm_start":
+                    seed = _warm_start_seed(item.result)
+                    if seed is not None:
+                        previous_result = seed
+                        previous_frame_key = frame.key
+                publish(item)
+                emit_progress(len(run.frame_results) - 1, item)
+                continue
+
+            initial = previous_result if mode == "warm_start" else None
+            lineage = previous_frame_key if mode == "warm_start" and previous_frame_key else None
+            started = __import__("time").perf_counter()
+
+            pixel_hash: str | None = None
+            if dedup_enabled:
+                pixel_hash = compute_frame_pixel_sha256(frame)
+                if pixel_hash is not None:
+                    dup_item = make_duplicate_item(
+                        frame, pixel_hash, lineage=lineage, started_t=started
+                    )
+                    if dup_item is not None:
+                        if mode == "warm_start":
+                            seed = _warm_start_seed(dup_item.result)
+                            if seed is not None:
+                                previous_result = seed
+                                previous_frame_key = frame.key
+                        run.frame_results.append(dup_item)
+                        publish(dup_item)
+                        run.processed_count = len(run.frame_results)
+                        emit_progress(len(run.frame_results) - 1, dup_item)
+                        if checkpoint_file is not None:
+                            save_checkpoint()
+                        continue
+
+            try:
+                result = _call_analyzer(
+                    analyze_frame,
+                    frame,
+                    initial,
+                    warm_start=mode == "warm_start",
+                    config=config,
+                )
+            except AnalysisCancelled:
+                run.cancelled = True
+                emit_progress(len(run.frame_results), None)
+                mark_cancelled_tail(len(run.frame_results))
+                break
+            except Exception as exc:
+                item = FrameFitResult(
+                    frame=frame,
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback_module.format_exc(),
+                    warm_start_from=lineage,
+                    elapsed_s=__import__("time").perf_counter() - started,
+                    pixel_sha256=pixel_hash,
+                )
+                # Crucially, previous_result is unchanged.  A failed frame must
+                # never seed the next warm-start fit.
+            else:
+                result_status, quality_reason = _batch_result_status(result)
+                if dedup_enabled and pixel_hash is not None:
+                    result = _attach_dedup_metadata(
+                        result,
+                        frame,
+                        is_duplicate_frame=False,
+                        duplicate_of_frame_id=None,
+                        pixel_sha256=pixel_hash,
+                    )
+                item = FrameFitResult(
+                    frame=frame,
+                    result=result,
+                    status=result_status,
+                    error=quality_reason if result_status == "failed" else None,
+                    diagnostic=quality_reason if result_status == "warning" else None,
+                    warm_start_from=lineage,
+                    elapsed_s=__import__("time").perf_counter() - started,
+                    is_duplicate_frame=False,
+                    duplicate_of_frame_id=None,
+                    pixel_sha256=pixel_hash,
+                )
+                if dedup_enabled:
+                    remember_dedup_result(pixel_hash, item, result)
+                if mode == "warm_start":
+                    seed = _warm_start_seed(result)
+                    if seed is not None:
+                        previous_result = seed
+                        previous_frame_key = frame.key
+            run.frame_results.append(item)
+            publish(item)
+            run.processed_count = len(run.frame_results)
+            emit_progress(len(run.frame_results) - 1, item)
+            if checkpoint_file is not None:
+                save_checkpoint()
 
     run.processed_count = sum(item.status != "skipped" for item in run.frame_results)
     run.elapsed_s = __import__("time").perf_counter() - started_batch
@@ -2561,6 +3062,7 @@ __all__ = [
     "analyze_batch",
     "batch_analyze",
     "build_frame_refs",
+    "compute_frame_pixel_sha256",
     "config_fingerprint",
     "discover_frames",
     "input_fingerprint",

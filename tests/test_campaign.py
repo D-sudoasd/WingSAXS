@@ -443,3 +443,94 @@ def test_figure_export_dialog_journal_style_selector_and_i18n(tmp_path: Path, qt
         != en_item_tip
     )
     dialog.close()
+
+
+def test_campaign_config_roundtrip_max_workers_and_beamstop_radius_px(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "parallel_campaign.toml"
+    init_campaign_config(
+        [
+            {"name": "s1", "input_dir": "in/s1"},
+            {"name": "s2", "input_dir": "in/s2", "beamstop_radius_px": "auto"},
+        ],
+        cfg_path,
+        preset="curvature",
+        max_workers=2,
+        beamstop_radius_px=42.0,
+        deduplicate_identical_frames=True,
+    )
+    loaded = load_campaign_config(cfg_path)
+    assert loaded["max_workers"] == 2
+    assert loaded["beamstop_radius_px"] == pytest.approx(42.0)
+    assert loaded["deduplicate_identical_frames"] is True
+    assert loaded["samples"][0]["beamstop_radius_px"] == pytest.approx(42.0)
+    assert loaded["samples"][0]["analysis"]["beamstop_radius_px"] == pytest.approx(42.0)
+    assert loaded["samples"][1]["beamstop_radius_px"] == "auto"
+    assert loaded["samples"][1]["deduplicate_identical_frames"] is True
+
+    with pytest.raises(ValueError, match="max_workers"):
+        init_campaign_config([{"name": "s", "input_dir": "in"}], tmp_path / "bad_w.toml", max_workers=0)
+    with pytest.raises(ValueError, match="beamstop_radius_px"):
+        init_campaign_config(
+            [{"name": "s", "input_dir": "in"}],
+            tmp_path / "bad_bs.toml",
+            beamstop_radius_px=-5.0,
+        )
+
+
+def test_run_campaign_parallel_process_pool_end_to_end_and_failure_isolation(
+    tmp_path: Path,
+) -> None:
+    from butterfly_saxs.pipeline import synthetic_butterfly
+
+    for sample_name in ("sample_1", "sample_2"):
+        sample_dir = tmp_path / "inputs" / sample_name
+        sample_dir.mkdir(parents=True)
+        arr, qmap = synthetic_butterfly((32, 32), return_qmap=True, seed=5)
+        for frame_idx in range(2):
+            np.savez_compressed(
+                sample_dir / f"{sample_name}_frame{frame_idx:02d}.npz",
+                data=arr,
+                qx=qmap["qx"],
+                qy=qmap["qy"],
+                q=qmap["q"],
+                q_unit=np.asarray("pixel-q"),
+            )
+
+    cfg_path = tmp_path / "campaign_parallel.toml"
+    init_campaign_config(
+        [
+            {"name": "sample_1", "input_dir": "inputs/sample_1"},
+            {"name": "missing_sample", "input_dir": "inputs/does_not_exist"},
+            {"name": "sample_2", "input_dir": "inputs/sample_2"},
+        ],
+        cfg_path,
+        preset="curvature",
+        max_workers=2,
+        beamstop_radius_px=4.0,
+        deduplicate_identical_frames=True,
+    )
+
+    out_root = tmp_path / "parallel_out"
+    summary = run_campaign(cfg_path, out_root, max_workers=2, continue_on_error=True)
+
+    # Deterministic order preserved even under concurrent ProcessPoolExecutor execution.
+    assert [s["name"] for s in summary["samples"]] == [
+        "sample_1",
+        "missing_sample",
+        "sample_2",
+    ]
+    assert summary["max_workers"] == 2
+    assert summary["beamstop_radius_px"] == pytest.approx(4.0)
+    assert summary["status"] == "partial_failure"
+    assert summary["exit_code"] == 1
+    assert summary["n_samples"] == 3
+    assert summary["n_failed"] == 1
+    assert summary["n_success"] + summary["n_warning"] == 2
+    assert summary["samples"][1]["status"] == "failed"
+    assert summary["samples"][1]["error"] is not None
+    assert summary["samples"][0]["n_frames"] == 2
+    assert summary["samples"][2]["n_frames"] == 2
+    assert (out_root / "campaign_summary.json").is_file()
+    json.dumps(summary, allow_nan=False, ensure_ascii=True)

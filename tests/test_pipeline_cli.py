@@ -864,3 +864,162 @@ def test_cli_project_reports_counts_and_returns_nonzero_for_partial_failure(
     assert report["n_frames"] == 2
     assert report["n_success"] == 1
     assert report["n_failed"] == 1
+
+
+def test_pipeline_skips_redundant_validate_q_coordinates_on_cached_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import butterfly_saxs.pipeline as pipeline_module
+
+    image, qmap = synthetic_butterfly((40, 40), return_qmap=True, seed=31)
+    original_validate = pipeline_module.validate_q_coordinates
+    validate_calls = 0
+
+    def counting_validate(*args, **kwargs):
+        nonlocal validate_calls
+        validate_calls += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "validate_q_coordinates", counting_validate)
+
+    # Plain dict qmap validates at most once inside analyze_frame (not 3-4x).
+    first = analyze_frame(image, qmap=qmap)
+    assert validate_calls == 1
+
+    # Reusing the validated qmap object triggers 0 additional validate_q_coordinates calls.
+    second = analyze_frame(image, qmap=first.qmap)
+    assert validate_calls == 1
+    assert second.ellipse_fit["n_points"] == first.ellipse_fit["n_points"]
+
+    # GeometryMaps object validates once and is cached weakly across subsequent frames.
+    class FakeGeometryMaps:
+        def __init__(self, src: dict[str, Any]) -> None:
+            self.qx_nm_inv = src["qx"]
+            self.qy_nm_inv = src["qy"]
+            self.q_nm_inv = src["q"]
+            self.q_unit = "nm^-1"
+            self.metadata = {"q_unit": "nm^-1"}
+
+    geom_obj = FakeGeometryMaps(qmap)
+    analyze_frame(image, qmap=geom_obj)
+    assert validate_calls == 2
+    analyze_frame(image, qmap=geom_obj)
+    assert validate_calls == 2
+
+
+def test_pipeline_beamstop_radius_px_explicit_and_auto_preserves_raw_mask(
+    tmp_path: Path,
+) -> None:
+    image, qmap = synthetic_butterfly((64, 64), q0=18.0, return_qmap=True, seed=42)
+    # Create realistic low-q diffuse intensity plus an unmasked circular beamstop shadow (r <= 6 px).
+    yy = np.arange(64, dtype=np.float64)[:, None]
+    xx = np.arange(64, dtype=np.float64)[None, :]
+    r_px = np.hypot(xx - 31.5, yy - 31.5)
+    shadowed = image + 25.0 / ((r_px / 8.0) ** 2 + 0.25)
+    shadowed[r_px <= 6.0] = 0.0
+
+    raw_mask = np.zeros((64, 64), dtype=bool)
+    raw_mask[0, 0] = True
+    raw_mask_path = tmp_path / "raw_mask.npy"
+    np.save(raw_mask_path, raw_mask)
+    raw_mask_bytes_before = raw_mask_path.read_bytes()
+
+    base_res = analyze_frame(shadowed, qmap=qmap, mask=raw_mask_path)
+    bs_res = analyze_frame(
+        shadowed,
+        qmap=qmap,
+        mask=raw_mask_path,
+        beamstop_radius_px=8.0,
+    )
+
+    # Raw mask file on disk is strictly untouched.
+    assert raw_mask_path.read_bytes() == raw_mask_bytes_before
+    assert base_res.metadata["beamstop_mask_applied"] is False
+    assert base_res.metadata["beamstop_radius_px"] is None
+    assert bs_res.metadata["beamstop_mask_applied"] is True
+    assert bs_res.metadata["beamstop_radius_px"] == pytest.approx(8.0)
+    assert bs_res.analysis["beamstop_mask_applied"] is True
+    assert bs_res.analysis["beamstop_radius_px"] == pytest.approx(8.0)
+    assert bs_res.valid_mask is not None
+    assert not bool(bs_res.valid_mask[32, 32])
+    assert int(np.count_nonzero(bs_res.valid_mask)) < int(np.count_nonzero(base_res.valid_mask))
+
+    # inspect_frame supports beamstop_radius_px and bright_axis_convention cleanly.
+    inspected = inspect_frame(
+        shadowed,
+        qmap=qmap,
+        mask=raw_mask_path,
+        beamstop_radius_px=8.0,
+        bright_axis_convention="reference",
+        recommend=True,
+    )
+    assert inspected["beamstop_mask_applied"] is True
+    assert inspected["beamstop_radius_px"] == pytest.approx(8.0)
+    assert inspected["bright_axis_convention"] == "reference"
+    assert inspected["advisor"]["symmetry"]["bright_axis_convention"] == "reference"
+    json.dumps(inspected, allow_nan=False)
+
+    # beamstop_radius_px="auto" detects and masks the unmasked central shadow.
+    auto_res = analyze_frame(shadowed, qmap=qmap, beamstop_radius_px="auto")
+    assert auto_res.metadata["beamstop"]["beamstop_radius_source"] == "auto"
+    assert auto_res.metadata["beamstop_mask_applied"] is True
+    assert float(auto_res.metadata["beamstop_radius_px"]) >= 6.0
+    assert not bool(auto_res.valid_mask[32, 32])
+
+    with pytest.raises(PipelineError, match="beamstop_radius_px"):
+        analyze_frame(shadowed, qmap=qmap, beamstop_radius_px=-3.0)
+
+
+def test_pipeline_include_physics_raw_mode_and_h5_uncertainty(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    image, qmap = synthetic_butterfly(
+        (48, 48), q0=0.45, width=0.06, q_scale=0.03, return_qmap=True, seed=7
+    )
+    qmap["q_unit"] = "nm^-1"
+    sigma = np.full(image.shape, 0.05, dtype=np.float64)
+    h5_path = tmp_path / "physics_frame.h5"
+    with h5py.File(h5_path, "w") as handle:
+        handle.create_dataset("entry/data/I_abs_2d", data=image.astype(np.float32))
+        handle.create_dataset("entry/data/uncertainty/statistical", data=sigma)
+
+    cal_res = analyze_frame(
+        h5_path,
+        dataset="/entry/data/I_abs_2d",
+        qmap=qmap,
+        uncertainty_dataset="auto",
+        include_physics=True,
+        intensity_mode="calibrated",
+        bright_axis_convention="reference",
+    )
+    assert cal_res.saxs_physics is not None
+    assert cal_res.saxs_physics["intensity_mode"] == "calibrated"
+    assert cal_res.saxs_physics["bright_axis_convention"] == "reference"
+    assert cal_res.saxs_physics["q_win_invariant"] is not None
+    assert cal_res.saxs_physics["q_win_stat_stderr"] is not None
+    assert cal_res.saxs_physics["uncertainty"]["propagated"] is True
+    assert cal_res.saxs_physics["uncertainty"]["source"] == "entry/data/uncertainty/statistical"
+    assert "saxs_physics" in cal_res.to_mapping()
+    json.dumps(cal_res.to_mapping(), allow_nan=False)
+
+    # Raw intensity mode MUST omit Q_win (None) with explicit caveat.
+    raw_res = analyze_frame(
+        h5_path,
+        dataset="/entry/data/I_abs_2d",
+        qmap=qmap,
+        uncertainty_dataset="auto",
+        include_physics=True,
+        intensity_mode="raw",
+    )
+    assert raw_res.saxs_physics is not None
+    assert raw_res.saxs_physics["intensity_mode"] == "raw"
+    assert raw_res.saxs_physics["q_win_invariant"] is None
+    assert raw_res.saxs_physics["q_win_bg_subtracted"] is None
+    assert raw_res.saxs_physics["q_win_stat_stderr"] is None
+    assert raw_res.saxs_physics["radial"]["full_azimuth"]["q_win_invariant"] is None
+    assert any("raw" in c.lower() for c in raw_res.saxs_physics["caveats"])
+    json.dumps(raw_res.to_mapping(), allow_nan=False)
+
+    # Default include_physics=False keeps to_mapping() clean.
+    default_res = analyze_frame(image, qmap=qmap)
+    assert default_res.saxs_physics is None
+    assert "saxs_physics" not in default_res.to_mapping()

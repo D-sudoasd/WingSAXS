@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import weakref
 
 import numpy as np
 
@@ -317,9 +318,63 @@ def _coerce_array(value: Any) -> np.ndarray:
     return np.asarray(array, dtype=float)
 
 
+_VALIDATED_GEOMETRY_OBJECTS: weakref.WeakKeyDictionary[Any, tuple[Any, ...]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _q_arrays_identity(
+    qx: np.ndarray, qy: np.ndarray, q: np.ndarray
+) -> tuple[Any, ...]:
+    return (
+        id(qx),
+        id(qy),
+        id(q),
+        qx.shape,
+        qy.shape,
+        q.shape,
+        qx.ctypes.data,
+        qy.ctypes.data,
+        q.ctypes.data,
+    )
+
+
+class _ValidatedQMap(dict[str, Any]):
+    """Dictionary carrying already-validated (qx, qy, q) identity without extra keys."""
+
+    def __init__(
+        self,
+        *args: Any,
+        validated_identity: tuple[Any, ...] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._validated_q_identity = validated_identity
+
+    def matches_validated_identity(self) -> bool:
+        token = self._validated_q_identity
+        if token is None:
+            return False
+        qx = self.get("qx")
+        qy = self.get("qy")
+        q = self.get("q")
+        if not (
+            isinstance(qx, np.ndarray)
+            and isinstance(qy, np.ndarray)
+            and isinstance(q, np.ndarray)
+        ):
+            return False
+        return _q_arrays_identity(qx, qy, q) == token
+
+
 def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
     if value is None:
         return None
+
+    if isinstance(value, _ValidatedQMap) and value.matches_validated_identity():
+        qx_cached = value["qx"]
+        if qx_cached.shape == shape:
+            return _ValidatedQMap(value, validated_identity=value._validated_q_identity)
 
     def coerce_field(key: str, field: Any) -> np.ndarray | None:
         # Optional q-map providers commonly expose a property as ``None``.
@@ -334,7 +389,12 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
             )
         return array
 
-    def normalise_mapping(result: dict[str, Any]) -> dict[str, Any]:
+    def normalise_mapping(
+        result: dict[str, Any],
+        *,
+        source_obj: Any = None,
+        prevalidated: bool = False,
+    ) -> dict[str, Any]:
         qx = result.get("qx", result.get("qx_nm_inv", result.get("q_x")))
         qy = result.get("qy", result.get("qy_nm_inv", result.get("q_y")))
         radial = result.get(
@@ -350,6 +410,7 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
             if radial is not None:
                 raise PipelineError("二维分析不能仅使用 q/radius；qmap 必须提供 qx 和 qy")
             return result
+        q_computed_from_hypot = radial is None
         q = radial
         if q is None:
             q = np.hypot(np.asarray(qx, dtype=float), np.asarray(qy, dtype=float))
@@ -368,10 +429,24 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
             q,
             source_unit,
         )
-        try:
-            validate_q_coordinates(qx_array, qy_array, q_array)
-        except AnalysisDomainError as exc:
-            raise PipelineError(f"qmap 坐标不一致：{exc}") from exc
+        identity = _q_arrays_identity(qx_array, qy_array, q_array)
+        already_valid = prevalidated or q_computed_from_hypot
+        if not already_valid and source_obj is not None:
+            try:
+                if _VALIDATED_GEOMETRY_OBJECTS.get(source_obj) == identity:
+                    already_valid = True
+            except TypeError:
+                pass
+        if not already_valid:
+            try:
+                validate_q_coordinates(qx_array, qy_array, q_array)
+            except AnalysisDomainError as exc:
+                raise PipelineError(f"qmap 坐标不一致：{exc}") from exc
+            if source_obj is not None:
+                try:
+                    _VALIDATED_GEOMETRY_OBJECTS[source_obj] = identity
+                except TypeError:
+                    pass
         if (
             result.get("q_unit") == "nm^-1"
             and "q_conversion_factor_to_nm_inv" in result
@@ -386,7 +461,7 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
         result.update(unit_info)
         metadata.update(unit_info)
         result["metadata"] = metadata
-        return result
+        return _ValidatedQMap(result, validated_identity=identity)
 
     if isinstance(value, Mapping):
         result = dict(value)
@@ -417,6 +492,10 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
             if q is not None:
                 result["q"] = q
         return normalise_mapping(result)
+    # Support SAXSGeometryCache (Slice A) or GeometryMaps objects cleanly.
+    geom_inner = getattr(value, "geometry", None)
+    prevalidated_obj = bool(getattr(value, "q_coordinates_validated", False))
+    inspect_source = geom_inner if (geom_inner is not None and hasattr(geom_inner, "qx_nm_inv")) else value
     attrs: dict[str, Any] = {}
     aliases = {
         "qx": ("qx", "qx_nm_inv", "q_x"),
@@ -428,31 +507,44 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
         "valid_mask": ("valid_mask", "valid"),
     }
     for target, names in aliases.items():
-        for name in names:
-            if not hasattr(value, name):
-                continue
-            field = getattr(value, name)
-            array = coerce_field(target, field)
-            if array is not None:
-                attrs[target] = array
+        for obj_candidate in (value, inspect_source):
+            if target in attrs:
                 break
-    metadata = getattr(value, "metadata", None)
+            for name in names:
+                if not hasattr(obj_candidate, name):
+                    continue
+                field = getattr(obj_candidate, name)
+                array = coerce_field(target, field)
+                if array is not None:
+                    attrs[target] = array
+                    break
+    metadata = getattr(inspect_source, "metadata", None)
     if isinstance(metadata, Mapping):
         attrs["metadata"] = dict(metadata)
         if "q_unit" in metadata:
             attrs["q_unit"] = metadata["q_unit"]
         elif "unit" in metadata:
             attrs["q_unit"] = metadata["unit"]
+    if hasattr(value, "beam_center_xy") and getattr(value, "beam_center_xy") is not None:
+        attrs.setdefault("metadata", {})
+        attrs["metadata"]["beam_center_xy"] = list(getattr(value, "beam_center_xy"))
     if "q_unit" not in attrs:
-        for name in ("q_unit", "unit"):
-            if not hasattr(value, name):
-                continue
-            unit = getattr(value, name)
-            if unit is not None:
-                attrs["q_unit"] = unit
+        for obj_candidate in (value, inspect_source):
+            for name in ("q_unit", "unit"):
+                if not hasattr(obj_candidate, name):
+                    continue
+                unit = getattr(obj_candidate, name)
+                if unit is not None:
+                    attrs["q_unit"] = unit
+                    break
+            if "q_unit" in attrs:
                 break
     if attrs:
-        return normalise_mapping({"object": value, **attrs})
+        return normalise_mapping(
+            {"object": value, **attrs},
+            source_obj=value,
+            prevalidated=prevalidated_obj,
+        )
     array = np.asarray(value)
     if array.shape == shape + (2,):
         return normalise_mapping({"qx": array[..., 0], "qy": array[..., 1]})
@@ -460,6 +552,12 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
 
 
 def _qmap_arrays(qmap: Any, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if isinstance(qmap, _ValidatedQMap) and qmap.matches_validated_identity():
+        qx = qmap["qx"]
+        qy = qmap["qy"]
+        q = qmap["q"]
+        if qx.shape == shape and qy.shape == shape and q.shape == shape:
+            return qx, qy, q
     qmap = _coerce_qmap(qmap, shape)
     if qmap is None:
         raise PipelineError("缺少 qmap")
@@ -490,6 +588,8 @@ class _FrameBundle:
     qmap: Any | None
     valid_mask: np.ndarray | None = None
     external_mask: np.ndarray | None = None
+    uncertainty: np.ndarray | None = None
+    uncertainty_source: str | None = None
 
 
 def _combine_valid_masks(
@@ -571,7 +671,14 @@ def _merge_qmap_masks(
 ) -> tuple[dict[str, Any], np.ndarray | None]:
     """Attach source validity to a q-map while retaining q-map mask polarity."""
 
-    result = dict(qmap)
+    validated_id = (
+        qmap._validated_q_identity if isinstance(qmap, _ValidatedQMap) else None
+    )
+    result: dict[str, Any] = (
+        _ValidatedQMap(qmap, validated_identity=validated_id)
+        if validated_id is not None
+        else dict(qmap)
+    )
     qmap_valid = [result.get(key) for key in ("valid_mask", "valid") if result.get(key) is not None]
     qmap_masks = [
         result.get(key)
@@ -630,6 +737,7 @@ def _read_frame_bundle(
     external_mask: Any = None,
     mask_frame: int | None = None,
     mask_dataset: str | None = None,
+    uncertainty_dataset: str | None = None,
 ) -> _FrameBundle:
     """Read one frame while retaining ``LoadedImage.valid_mask`` and qmap mask."""
 
@@ -644,6 +752,11 @@ def _read_frame_bundle(
         mask_dataset
         if mask_dataset is not None
         else _config_value(config, "mask_dataset", None)
+    )
+    configured_uncertainty_dataset = (
+        uncertainty_dataset
+        if uncertainty_dataset is not None
+        else _config_value(config, "uncertainty_dataset", None)
     )
     if isinstance(source, Mapping):
         data = source.get("data", source.get("image", source.get("intensity")))
@@ -669,6 +782,17 @@ def _read_frame_bundle(
             frame=configured_mask_frame,
             dataset=configured_mask_dataset,
         )
+        src_uncertainty = source.get("uncertainty")
+        unc_array = (
+            np.asarray(src_uncertainty, dtype=np.float64)
+            if src_uncertainty is not None
+            else None
+        )
+        if unc_array is not None and unc_array.shape != image.shape:
+            raise PipelineError(
+                f"uncertainty 形状 {unc_array.shape} 与图像 {image.shape} 不一致"
+            )
+        unc_source = source.get("uncertainty_source")
         frame = _loaded_frame(data, metadata=metadata, valid_mask=valid)
         return _FrameBundle(
             frame=frame,
@@ -677,6 +801,8 @@ def _read_frame_bundle(
             qmap=source.get("qmap"),
             valid_mask=getattr(frame, "valid_mask", None),
             external_mask=exclusion,
+            uncertainty=unc_array,
+            uncertainty_source=None if unc_source is None else str(unc_source),
         )
 
     if isinstance(source, np.ndarray) or (
@@ -714,6 +840,17 @@ def _read_frame_bundle(
             frame=configured_mask_frame,
             dataset=configured_mask_dataset,
         )
+        src_uncertainty = getattr(source, "uncertainty", None)
+        unc_array = (
+            np.asarray(src_uncertainty, dtype=np.float64)
+            if src_uncertainty is not None
+            else None
+        )
+        if unc_array is not None and unc_array.shape != image.shape:
+            raise PipelineError(
+                f"uncertainty 形状 {unc_array.shape} 与图像 {image.shape} 不一致"
+            )
+        unc_source = getattr(source, "uncertainty_source", None)
         frame = _loaded_frame(data, metadata=metadata, valid_mask=valid)
         return _FrameBundle(
             frame=frame,
@@ -722,6 +859,8 @@ def _read_frame_bundle(
             qmap=getattr(source, "qmap", None),
             valid_mask=getattr(frame, "valid_mask", valid),
             external_mask=exclusion,
+            uncertainty=unc_array,
+            uncertainty_source=None if unc_source is None else str(unc_source),
         )
 
     path = Path(source)
@@ -732,12 +871,13 @@ def _read_frame_bundle(
     try:
         from .io import load_image
 
-        reader_kwargs = {
+        reader_kwargs: dict[str, Any] = {
             "frame": configured_frame,
             "dataset": configured_dataset,
             "valid_mask": configured_valid_mask,
             "mask_frame": configured_mask_frame,
             "mask_dataset": configured_mask_dataset,
+            "uncertainty_dataset": configured_uncertainty_dataset,
         }
         reader_kwargs = {key: value for key, value in reader_kwargs.items() if value is not None}
         if suffix == ".npz":
@@ -766,6 +906,8 @@ def _read_frame_bundle(
         qmap=embedded_qmap,
         valid_mask=valid,
         external_mask=exclusion,
+        uncertainty=getattr(loaded, "uncertainty", None),
+        uncertainty_source=getattr(loaded, "uncertainty_source", None),
     )
 
 
@@ -1778,6 +1920,493 @@ def fit_full2d(
     return raw
 
 
+def _normalise_intensity_mode(value: Any) -> str:
+    text = str("calibrated" if value is None else value).strip().lower()
+    if text not in {"calibrated", "raw"}:
+        raise PipelineError(
+            f"intensity_mode 必须是 'calibrated' 或 'raw'，实际为 {value!r}"
+        )
+    return text
+
+
+def _normalise_bright_axis_convention(value: Any) -> str:
+    text = str("draw" if value is None else value).strip().lower()
+    if text not in {"draw", "reference"}:
+        raise PipelineError(
+            f"bright_axis_convention 必须是 'draw' 或 'reference'，实际为 {value!r}"
+        )
+    return text
+
+
+def _parse_beamstop_radius_px(value: Any) -> float | str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise PipelineError("beamstop_radius_px 必须是非负有限数值或 'auto'")
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            return None
+        if token.casefold() == "auto":
+            return "auto"
+        try:
+            numeric = float(token)
+        except ValueError as exc:
+            raise PipelineError(
+                f"beamstop_radius_px 必须是非负有限数值或 'auto'，实际为 {value!r}"
+            ) from exc
+    else:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise PipelineError(
+                f"beamstop_radius_px 必须是非负有限数值或 'auto'，实际为 {value!r}"
+            ) from exc
+    if not math.isfinite(numeric) or numeric < 0.0:
+        raise PipelineError(
+            f"beamstop_radius_px 必须是非负有限数值或 'auto'，实际为 {value!r}"
+        )
+    return float(numeric)
+
+
+def _infer_beam_center_xy(
+    qx: np.ndarray,
+    qy: np.ndarray,
+    *,
+    qmap_obj: Any = None,
+    config: Any = None,
+) -> tuple[float, float]:
+    """Infer beam center (cx, cy) in pixel coordinates without mutating inputs."""
+
+    if isinstance(qmap_obj, Mapping):
+        meta = qmap_obj.get("metadata")
+        if isinstance(meta, Mapping):
+            bc = meta.get("beam_center_xy")
+            if isinstance(bc, Sequence) and not isinstance(bc, (str, bytes)) and len(bc) == 2:
+                try:
+                    cx, cy = float(bc[0]), float(bc[1])
+                    if math.isfinite(cx) and math.isfinite(cy):
+                        return cx, cy
+                except (TypeError, ValueError):
+                    pass
+            # Recover subpixel center directly from pyFAI PONI metadata when available.
+            poni1 = meta.get("poni1")
+            poni2 = meta.get("poni2")
+            detector = meta.get("detector")
+            if (
+                poni1 is not None
+                and poni2 is not None
+                and isinstance(detector, Mapping)
+                and detector.get("pixel1")
+                and detector.get("pixel2")
+            ):
+                try:
+                    p1 = float(detector["pixel1"])
+                    p2 = float(detector["pixel2"])
+                    if p1 > 0 and p2 > 0:
+                        cy = float(poni1) / p1
+                        cx = float(poni2) / p2
+                        if math.isfinite(cx) and math.isfinite(cy):
+                            return cx, cy
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+        obj = qmap_obj.get("object")
+        bc_attr = getattr(obj, "beam_center_xy", None)
+        if isinstance(bc_attr, Sequence) and not isinstance(bc_attr, (str, bytes)) and len(bc_attr) == 2:
+            try:
+                cx, cy = float(bc_attr[0]), float(bc_attr[1])
+                if math.isfinite(cx) and math.isfinite(cy):
+                    return cx, cy
+            except (TypeError, ValueError):
+                pass
+
+    center_cfg = _config_value(config, "center", None)
+    if (
+        isinstance(center_cfg, Sequence)
+        and not isinstance(center_cfg, (str, bytes))
+        and len(center_cfg) >= 2
+    ):
+        try:
+            cx, cy = float(center_cfg[0]), float(center_cfg[1])
+            if math.isfinite(cx) and math.isfinite(cy):
+                return cx, cy
+        except (TypeError, ValueError):
+            pass
+    cx_cfg = _config_value(config, "center_x", None)
+    cy_cfg = _config_value(config, "center_y", None)
+    if cx_cfg is not None and cy_cfg is not None:
+        try:
+            cx, cy = float(cx_cfg), float(cy_cfg)
+            if math.isfinite(cx) and math.isfinite(cy):
+                return cx, cy
+        except (TypeError, ValueError):
+            pass
+
+    height, width = qx.shape
+    stride_y = max(1, height // 48)
+    stride_x = max(1, width // 48)
+    qx_sub = qx[::stride_y, ::stride_x]
+    qy_sub = qy[::stride_y, ::stride_x]
+    finite_sub = np.isfinite(qx_sub) & np.isfinite(qy_sub)
+    if np.count_nonzero(finite_sub) >= 12:
+        ys = np.arange(0, height, stride_y, dtype=np.float64)
+        xs = np.arange(0, width, stride_x, dtype=np.float64)
+        gx, gy = np.meshgrid(xs, ys)
+        xv = gx[finite_sub]
+        yv = gy[finite_sub]
+        qxv = qx_sub[finite_sub]
+        qyv = qy_sub[finite_sub]
+        design = np.column_stack((np.ones_like(xv), xv, yv))
+        try:
+            coef_x, *_ = np.linalg.lstsq(design, qxv, rcond=None)
+            coef_y, *_ = np.linalg.lstsq(design, qyv, rcond=None)
+            a0, a1, a2 = float(coef_x[0]), float(coef_x[1]), float(coef_x[2])
+            b0, b1, b2 = float(coef_y[0]), float(coef_y[1]), float(coef_y[2])
+            det = a1 * b2 - a2 * b1
+            if abs(det) > 1e-18:
+                cx_fit = (-b2 * a0 + a2 * b0) / det
+                cy_fit = (b1 * a0 - a1 * b0) / det
+                if math.isfinite(cx_fit) and math.isfinite(cy_fit):
+                    return float(cx_fit), float(cy_fit)
+        except np.linalg.LinAlgError:
+            pass
+
+    q_mag = np.hypot(qx, qy)
+    finite_q = np.isfinite(q_mag)
+    if np.any(finite_q):
+        min_idx = np.unravel_index(int(np.argmin(np.where(finite_q, q_mag, np.inf))), q_mag.shape)
+        return float(min_idx[1]), float(min_idx[0])
+    return 0.5 * (width - 1), 0.5 * (height - 1)
+
+
+def _beamstop_exclusion_mask(
+    shape: tuple[int, int],
+    beam_center_xy: tuple[float, float],
+    radius_px: float,
+    *,
+    valid_mask: np.ndarray | None = None,
+    geometry_cache: Any = None,
+) -> np.ndarray:
+    """Return boolean exclusion mask (True = excluded inside beamstop circle)."""
+
+    if radius_px <= 0.0:
+        return np.zeros(shape, dtype=bool)
+    cache_key = (
+        "__beamstop_mask__",
+        shape,
+        round(float(beam_center_xy[0]), 6),
+        round(float(beam_center_xy[1]), 6),
+        round(float(radius_px), 6),
+    )
+    if isinstance(geometry_cache, Mapping) and cache_key in geometry_cache:
+        cached = geometry_cache[cache_key]
+        if isinstance(cached, np.ndarray) and cached.shape == shape:
+            return cached
+
+    exclusion: np.ndarray | None = None
+    try:
+        from . import geometry as geometry_module
+
+        apply_fn = getattr(geometry_module, "apply_beamstop_mask", None)
+        if callable(apply_fn):
+            _, exclusion_candidate = apply_fn(
+                valid_mask, shape, beam_center_xy, float(radius_px)
+            )
+            exclusion = np.asarray(exclusion_candidate, dtype=bool)
+    except Exception:
+        exclusion = None
+
+    if exclusion is None:
+        height, width = int(shape[0]), int(shape[1])
+        cx, cy = float(beam_center_xy[0]), float(beam_center_xy[1])
+        yy = np.arange(height, dtype=np.float64)[:, None]
+        xx = np.arange(width, dtype=np.float64)[None, :]
+        exclusion = ((xx - cx) ** 2 + (yy - cy) ** 2) <= (float(radius_px) ** 2)
+
+    if isinstance(geometry_cache, dict):
+        geometry_cache[cache_key] = exclusion
+    return exclusion
+
+
+def _resolve_beamstop_exclusion(
+    image: np.ndarray,
+    qmap_obj: Any,
+    *,
+    beamstop_radius_px: Any,
+    detector_valid: np.ndarray | None,
+    external_mask: np.ndarray | None,
+    config: Any = None,
+    nominal_draw_axis_deg: float = 90.0,
+    bright_axis_convention: str = "draw",
+    geometry_cache: Any = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Resolve optional explicit or 'auto' beamstop mask in memory without mutating raw masks."""
+
+    parsed = _parse_beamstop_radius_px(beamstop_radius_px)
+    if parsed is None:
+        return external_mask, {
+            "beamstop_mask_applied": False,
+            "beamstop_radius_px": None,
+            "beamstop_radius_source": None,
+            "beamstop_center_xy": None,
+            "beamstop_excluded_pixel_count": 0,
+        }
+
+    qx, qy, q = _qmap_arrays(qmap_obj, image.shape)
+    center_xy = _infer_beam_center_xy(qx, qy, qmap_obj=qmap_obj, config=config)
+
+    if parsed == "auto":
+        from .auto_advisor import advise_from_arrays
+
+        pre_valid = np.ones(image.shape, dtype=bool)
+        if detector_valid is not None:
+            pre_valid &= np.asarray(detector_valid, dtype=bool)
+        if isinstance(qmap_obj, Mapping):
+            qm_valid = qmap_obj.get("valid_mask", qmap_obj.get("valid"))
+            if qm_valid is not None:
+                pre_valid &= np.asarray(qm_valid, dtype=bool)
+        if external_mask is not None:
+            pre_valid &= ~np.asarray(external_mask, dtype=bool)
+        chi_deg = np.degrees(np.arctan2(qy, qx)) % 360.0
+        advisor = advise_from_arrays(
+            image,
+            q,
+            chi_deg,
+            pre_valid,
+            q_unit=_qmap_unit(qmap_obj, config),
+            beam_center_xy=center_xy,
+            nominal_draw_axis_deg=float(nominal_draw_axis_deg),
+            bright_axis_convention=bright_axis_convention,
+        )
+        bs_info = advisor.get("beamstop") or {}
+        radius = float(bs_info.get("recommended_mask_radius_px") or 0.0)
+        adv_center = bs_info.get("beam_center_xy")
+        if isinstance(adv_center, Sequence) and len(adv_center) == 2:
+            center_xy = (float(adv_center[0]), float(adv_center[1]))
+        source_label = "auto"
+    else:
+        radius = float(parsed)
+        source_label = "explicit"
+
+    if radius <= 0.0:
+        return external_mask, {
+            "beamstop_mask_applied": False,
+            "beamstop_radius_px": 0.0,
+            "beamstop_radius_source": source_label,
+            "beamstop_center_xy": [float(center_xy[0]), float(center_xy[1])],
+            "beamstop_excluded_pixel_count": 0,
+        }
+
+    bs_excl = _beamstop_exclusion_mask(
+        image.shape,
+        center_xy,
+        radius,
+        valid_mask=detector_valid,
+        geometry_cache=geometry_cache,
+    )
+    # Combine in memory; never mutate external_mask or any file-backed mask array.
+    combined_external = (
+        bs_excl.copy()
+        if external_mask is None
+        else (np.asarray(external_mask, dtype=bool) | bs_excl)
+    )
+    return combined_external, {
+        "beamstop_mask_applied": True,
+        "beamstop_radius_px": float(radius),
+        "beamstop_radius_source": source_label,
+        "beamstop_center_xy": [float(center_xy[0]), float(center_xy[1])],
+        "beamstop_excluded_pixel_count": int(np.count_nonzero(bs_excl)),
+    }
+
+
+def _compute_saxs_physics_block(
+    image: np.ndarray,
+    qmap_obj: Any,
+    domain: AnalysisDomain,
+    *,
+    config: Any = None,
+    intensity_mode: str = "calibrated",
+    bright_axis_convention: str = "draw",
+    uncertainty: np.ndarray | None = None,
+    uncertainty_source: str | None = None,
+    geometry_cache: Any = None,
+) -> dict[str, Any]:
+    """Compute additive strict-JSON-safe saxs_physics block on observed valid pixels."""
+
+    from . import saxs_physics as physics_module
+
+    qx, qy, _ = _qmap_arrays(qmap_obj, image.shape)
+    q_unit = _qmap_unit(qmap_obj, config)
+    draw_axis_deg = float(_config_value(config, "draw_axis_deg", 90.0))
+    valid_mask = np.asarray(domain.non_window_valid_mask, dtype=bool)
+    if not np.any(valid_mask):
+        valid_mask = np.asarray(domain.fit_valid_mask, dtype=bool)
+    q_window = tuple(float(v) for v in domain.q_window)
+
+    # Optionally build/reuse Slice A SAXSGeometryCache when available.
+    saxs_geom_cache: Any = None
+    try:
+        from . import geometry as geometry_module
+
+        build_cache_fn = getattr(geometry_module, "build_geometry_cache", None)
+        raw_geom = qmap_obj.get("object") if isinstance(qmap_obj, Mapping) else None
+        if callable(build_cache_fn) and raw_geom is not None and hasattr(raw_geom, "q_nm_inv"):
+            saxs_geom_cache = build_cache_fn(
+                raw_geom,
+                valid_mask=valid_mask,
+                q_roi_max=q_window[1],
+            )
+    except Exception:
+        saxs_geom_cache = None
+
+    harmonics = _call_supported(
+        physics_module.compute_azimuthal_harmonics_and_order,
+        image,
+        qx,
+        qy,
+        valid_mask=valid_mask,
+        q_window=q_window,
+        q_unit=q_unit,
+        nominal_draw_axis_deg=draw_axis_deg,
+        bright_axis_convention=bright_axis_convention,
+        geometry_cache=saxs_geom_cache,
+    )
+    radial = _call_supported(
+        physics_module.measure_radial_coarsening_observables,
+        image,
+        qx,
+        qy,
+        valid_mask=valid_mask,
+        q_window=q_window,
+        q_unit=q_unit,
+        nominal_draw_axis_deg=draw_axis_deg,
+        intensity_mode=intensity_mode,
+        sigma=uncertainty,
+        geometry_cache=saxs_geom_cache,
+    )
+
+    c2_fit: dict[str, Any] | None = None
+    profile = harmonics.get("profile") if isinstance(harmonics, Mapping) else None
+    if isinstance(profile, Mapping):
+        angles = profile.get("angle_deg")
+        intensities = profile.get("intensity")
+        counts = profile.get("counts")
+        n_obs_bins = int(harmonics.get("n_observed_bins") or 0)
+        if angles is not None and intensities is not None and n_obs_bins >= 12:
+            try:
+                c2_fit = _call_supported(
+                    physics_module.fit_c2_bridge_four_lobe,
+                    angles,
+                    intensities,
+                    counts=counts,
+                    nominal_draw_axis_deg=draw_axis_deg,
+                    initial_chi_sym_deg=harmonics.get("friedel_bisector_deg"),
+                    initial_alpha_deg=harmonics.get("wing_half_opening_estimate_deg"),
+                    max_nfev=1500,
+                )
+            except Exception:
+                c2_fit = None
+
+    # Strictly enforce raw-intensity isolation for Q_win both standalone and after Slice A merges.
+    radial_clean = _jsonable(radial, array_summary=False)
+    caveats: list[str] = []
+    if isinstance(radial_clean, Mapping):
+        radial_clean = dict(radial_clean)
+        if isinstance(radial_clean.get("caveats"), list):
+            caveats.extend(str(item) for item in radial_clean["caveats"])
+    if intensity_mode == "raw":
+        raw_note = (
+            "Q_win is omitted (None) because intensity_mode='raw' represents "
+            "uncalibrated detector counts rather than absolute intensity."
+        )
+        if raw_note not in caveats:
+            caveats.append(raw_note)
+        if isinstance(radial_clean, dict):
+            for channel_key in ("full_azimuth", "lobe_sectored"):
+                channel = radial_clean.get(channel_key)
+                if isinstance(channel, Mapping):
+                    channel_copy = dict(channel)
+                    channel_copy["q_win_invariant"] = None
+                    channel_copy["q_win_bg_subtracted"] = None
+                    if "q_win_stat_stderr" in channel_copy:
+                        channel_copy["q_win_stat_stderr"] = None
+                    radial_clean[channel_key] = channel_copy
+            if "q_win_invariant" in radial_clean:
+                radial_clean["q_win_invariant"] = None
+            if "q_win_bg_subtracted" in radial_clean:
+                radial_clean["q_win_bg_subtracted"] = None
+            radial_clean["intensity_mode"] = "raw"
+
+    full_channel = (
+        radial_clean.get("full_azimuth")
+        if isinstance(radial_clean, Mapping) and isinstance(radial_clean.get("full_azimuth"), Mapping)
+        else {}
+    )
+    q_win_val = None if intensity_mode == "raw" else full_channel.get("q_win_invariant")
+    q_win_bg_sub = None if intensity_mode == "raw" else full_channel.get("q_win_bg_subtracted")
+
+    uncertainty_summary: dict[str, Any] | None = None
+    q_win_stat_stderr = full_channel.get("q_win_stat_stderr")
+    if uncertainty is not None:
+        obs_unc_mask = valid_mask & np.isfinite(uncertainty) & (uncertainty >= 0.0)
+        obs_unc = uncertainty[obs_unc_mask]
+        uncertainty_summary = {
+            "source": uncertainty_source,
+            "propagated": True,
+            "finite_valid_pixels": int(obs_unc.size),
+            "median_sigma": float(np.median(obs_unc)) if obs_unc.size else None,
+            "systematic_k_uncertainty": "unavailable",
+        }
+        # Standalone fallback statistical SE for Q_win when saxs_physics does not yet compute it.
+        if (
+            intensity_mode == "calibrated"
+            and q_win_stat_stderr is None
+            and obs_unc.size > 0
+            and isinstance(full_channel, Mapping)
+        ):
+            _, _, q_mag = _qmap_arrays(qmap_obj, image.shape)
+            in_win = obs_unc_mask & (q_mag >= q_window[0]) & (q_mag <= q_window[1])
+            if np.any(in_win):
+                q_sel = q_mag[in_win]
+                s_sel = uncertainty[in_win]
+                n_bins = 128
+                edges = np.linspace(q_window[0], q_window[1], n_bins + 1, dtype=np.float64)
+                centers = 0.5 * (edges[:-1] + edges[1:])
+                dq_step = float(edges[1] - edges[0])
+                bidx = np.clip(
+                    np.floor((q_sel - q_window[0]) / max(dq_step, 1e-15)).astype(np.int64),
+                    0,
+                    n_bins - 1,
+                )
+                cnt = np.bincount(bidx, minlength=n_bins)
+                sum_var = np.bincount(bidx, weights=s_sel * s_sel, minlength=n_bins)
+                has = cnt > 0
+                bin_se = np.zeros(n_bins, dtype=np.float64)
+                bin_se[has] = np.sqrt(sum_var[has]) / cnt[has]
+                q_win_stat_stderr = float(
+                    np.sqrt(np.sum(((centers[has] ** 2) * bin_se[has] * dq_step) ** 2))
+                )
+        uncertainty_summary["q_win_stat_stderr"] = (
+            None if intensity_mode == "raw" else q_win_stat_stderr
+        )
+
+    payload: dict[str, Any] = {
+        "intensity_mode": intensity_mode,
+        "bright_axis_convention": bright_axis_convention,
+        "q_unit": q_unit,
+        "q_window": [q_window[0], q_window[1]],
+        "harmonics": _jsonable(harmonics, array_summary=False),
+        "radial": radial_clean,
+        "c2_bridge_fit": _jsonable(c2_fit, array_summary=False) if c2_fit is not None else None,
+        "q_win_invariant": q_win_val,
+        "q_win_bg_subtracted": q_win_bg_sub,
+        "q_win_stat_stderr": None if intensity_mode == "raw" else q_win_stat_stderr,
+        "uncertainty": uncertainty_summary,
+        "caveats": caveats,
+    }
+    return _jsonable(payload, array_summary=False)
+
+
 @dataclass
 class PipelineResult:
     """Result object shared by CLI, GUI, and batch consumers."""
@@ -1795,6 +2424,7 @@ class PipelineResult:
     analysis_domain: AnalysisDomain | None = None
     analysis: dict[str, Any] = field(default_factory=dict)
     analysis_arrays: dict[str, np.ndarray] = field(default_factory=dict, repr=False)
+    saxs_physics: dict[str, Any] | None = None
 
     @property
     def data(self) -> np.ndarray:
@@ -1859,6 +2489,8 @@ class PipelineResult:
             ),
             "analysis": self.analysis,
         }
+        if self.saxs_physics is not None:
+            result["saxs_physics"] = self.saxs_physics
         if include_arrays and self.analysis_domain is not None:
             for name in (
                 "finite_mask",
@@ -1891,6 +2523,8 @@ def inspect_frame(
     fit_ellipse: bool = False,
     recommend: bool = False,
     nominal_draw_axis_deg: float = 90.0,
+    beamstop_radius_px: float | str | None = None,
+    bright_axis_convention: str = "draw",
 ) -> dict[str, Any]:
     """Return frame/q-space diagnostics, with ellipse fitting and advisor opt-in.
 
@@ -1900,6 +2534,16 @@ def inspect_frame(
     ``recommend=True`` to attach smart beamstop/q-window/symmetry guidance.
     """
 
+    convention = _normalise_bright_axis_convention(
+        bright_axis_convention
+        if bright_axis_convention != "draw"
+        else _config_value(config, "bright_axis_convention", "draw")
+    )
+    selected_beamstop = (
+        beamstop_radius_px
+        if beamstop_radius_px is not None
+        else _config_value(config, "beamstop_radius_px", None)
+    )
     bundle = _read_frame_bundle(
         source,
         config=config,
@@ -1920,12 +2564,22 @@ def inspect_frame(
         valid_mask=bundle.valid_mask,
     )
     qx, qy, q = _qmap_arrays(qmap_obj, image.shape)
+    effective_external_mask, beamstop_info = _resolve_beamstop_exclusion(
+        image,
+        qmap_obj,
+        beamstop_radius_px=selected_beamstop,
+        detector_valid=bundle.valid_mask,
+        external_mask=bundle.external_mask,
+        config=config,
+        nominal_draw_axis_deg=float(nominal_draw_axis_deg),
+        bright_axis_convention=convention,
+    )
     domain = _analysis_domain(
         image,
         qmap_obj,
         config=config,
         detector_valid=bundle.valid_mask,
-        external_mask=bundle.external_mask,
+        external_mask=effective_external_mask,
         include_config_mask=False,
     )
     finite = np.isfinite(image)
@@ -1939,6 +2593,11 @@ def inspect_frame(
         fit_ellipse=requested_fit_ellipse,
         analysis_domain=domain,
     )
+    if beamstop_info["beamstop_radius_source"] is not None:
+        metadata = dict(metadata)
+        metadata["beamstop_mask_applied"] = beamstop_info["beamstop_mask_applied"]
+        metadata["beamstop_radius_px"] = beamstop_info["beamstop_radius_px"]
+        metadata["beamstop"] = dict(beamstop_info)
     report: dict[str, Any] = {
         "metadata": metadata,
         "shape": list(image.shape),
@@ -1958,6 +2617,9 @@ def inspect_frame(
         "ellipse_fit": _jsonable(measured.get("ellipse")),
         "valid_mask": _jsonable(domain.fit_valid_mask),
         "analysis_domain": domain.to_summary(),
+        "beamstop_mask_applied": beamstop_info["beamstop_mask_applied"],
+        "beamstop_radius_px": beamstop_info["beamstop_radius_px"],
+        "bright_axis_convention": convention,
         "flags": {
             "empirical_model_only": True,
             "mechanism_under_determined": True,
@@ -1968,6 +2630,8 @@ def inspect_frame(
             ),
         },
     }
+    if beamstop_info["beamstop_center_xy"] is not None:
+        report["beamstop_center_xy"] = beamstop_info["beamstop_center_xy"]
     requested_recommend = bool(recommend or _config_value(config, "recommend", False))
     if requested_recommend:
         from .auto_advisor import advise_from_arrays
@@ -1985,6 +2649,7 @@ def inspect_frame(
             advisor_valid,
             q_unit=_qmap_unit(qmap_obj, config),
             nominal_draw_axis_deg=float(nominal_draw_axis_deg),
+            bright_axis_convention=convention,
         )
         report["advisor"] = _jsonable(advisor, array_summary=False)
     return report
@@ -2008,10 +2673,38 @@ def analyze_frame(
     force: bool = False,
     geometry_cache: Any = None,
     cancel_event: Any = None,
+    beamstop_radius_px: float | str | None = None,
+    uncertainty_dataset: str | None = None,
+    include_physics: bool = False,
+    intensity_mode: str = "calibrated",
+    bright_axis_convention: str = "draw",
 ) -> PipelineResult:
     """Run read → qmap → observables → ridge → symmetric ellipse → full2d."""
 
     raise_if_cancelled(cancel_event, "frame-load")
+    resolved_intensity_mode = _normalise_intensity_mode(
+        intensity_mode
+        if intensity_mode != "calibrated"
+        else _config_value(config, "intensity_mode", "calibrated")
+    )
+    resolved_convention = _normalise_bright_axis_convention(
+        bright_axis_convention
+        if bright_axis_convention != "draw"
+        else _config_value(config, "bright_axis_convention", "draw")
+    )
+    resolved_beamstop = (
+        beamstop_radius_px
+        if beamstop_radius_px is not None
+        else _config_value(config, "beamstop_radius_px", None)
+    )
+    resolved_uncertainty_dataset = (
+        uncertainty_dataset
+        if uncertainty_dataset is not None
+        else _config_value(config, "uncertainty_dataset", None)
+    )
+    resolved_include_physics = bool(
+        include_physics or _config_value(config, "include_physics", False)
+    )
     bundle = _read_frame_bundle(
         source,
         config=config,
@@ -2021,6 +2714,7 @@ def analyze_frame(
         external_mask=mask,
         mask_frame=mask_frame,
         mask_dataset=mask_dataset,
+        uncertainty_dataset=resolved_uncertainty_dataset,
     )
     image, metadata, embedded_qmap = bundle.image, bundle.metadata, bundle.qmap
     if isinstance(source, (str, os.PathLike)):
@@ -2035,6 +2729,8 @@ def analyze_frame(
         metadata["dataset_selector"] = str(dataset)
     elif _config_value(config, "dataset", None) is not None:
         metadata["dataset_selector"] = str(_config_value(config, "dataset", None))
+    if bundle.uncertainty_source is not None:
+        metadata["uncertainty_source"] = bundle.uncertainty_source
     selected_poni = poni or _config_value(config, "poni_path", _config_value(config, "poni", None))
     selected_embedded_qmap = qmap if qmap is not None else embedded_qmap
     if geometry_cache is not None and selected_poni is not None and selected_embedded_qmap is None:
@@ -2071,12 +2767,27 @@ def analyze_frame(
             valid_mask=bundle.valid_mask,
         )
     options = _analysis_options(image, qmap_obj, config)
+    effective_external_mask, beamstop_info = _resolve_beamstop_exclusion(
+        image,
+        qmap_obj,
+        beamstop_radius_px=resolved_beamstop,
+        detector_valid=bundle.valid_mask,
+        external_mask=bundle.external_mask,
+        config=config,
+        nominal_draw_axis_deg=float(options.get("draw_axis_deg", 90.0)),
+        bright_axis_convention=resolved_convention,
+        geometry_cache=geometry_cache,
+    )
+    metadata["beamstop_mask_applied"] = beamstop_info["beamstop_mask_applied"]
+    metadata["beamstop_radius_px"] = beamstop_info["beamstop_radius_px"]
+    if beamstop_info["beamstop_radius_source"] is not None:
+        metadata["beamstop"] = dict(beamstop_info)
     domain = _analysis_domain(
         image,
         qmap_obj,
         config=config,
         detector_valid=bundle.valid_mask,
-        external_mask=bundle.external_mask,
+        external_mask=effective_external_mask,
         include_config_mask=False,
     )
     # ``measure_observables`` owns the ridge and ellipse calculation.  Keep
@@ -2163,10 +2874,26 @@ def analyze_frame(
     )
     if isinstance(full2d_result, Mapping) and full2d_result.get("sampled_indices") is not None:
         domain = domain.with_sampled_indices(full2d_result["sampled_indices"])
+    saxs_physics_block: dict[str, Any] | None = None
+    if resolved_include_physics:
+        saxs_physics_block = _compute_saxs_physics_block(
+            image,
+            qmap_obj,
+            domain,
+            config=config,
+            intensity_mode=resolved_intensity_mode,
+            bright_axis_convention=resolved_convention,
+            uncertainty=bundle.uncertainty,
+            uncertainty_source=bundle.uncertainty_source,
+            geometry_cache=geometry_cache,
+        )
     public_analysis = {
         key: value for key, value in options.items()
         if key not in {"butterfly_options", "_ellipse_parameter_settings"}
     }
+    if beamstop_info["beamstop_radius_source"] is not None:
+        public_analysis["beamstop_mask_applied"] = beamstop_info["beamstop_mask_applied"]
+        public_analysis["beamstop_radius_px"] = beamstop_info["beamstop_radius_px"]
     result = PipelineResult(
         image=image,
         qmap=qmap_obj,
@@ -2188,6 +2915,7 @@ def analyze_frame(
             **public_analysis,
             "q_window": list(domain.q_window),
         },
+        saxs_physics=saxs_physics_block,
     )
     if output is not None:
         result.output_paths = [os.fspath(path) for path in export_result(result, output, force=force)]
@@ -2442,6 +3170,62 @@ def _expand_inputs(inputs: Iterable[Any]) -> list[Any]:
     return expanded
 
 
+_WORKER_GEOMETRY_CACHE: dict[Any, Any] = {}
+
+
+@dataclass
+class _BatchFrameAnalyzer:
+    """Picklable top-level frame analyzer for Windows spawn-safe parallel batches."""
+
+    poni: str | None = None
+    full2d: bool | None = None
+    destination: str | None = None
+    force: bool = False
+    resume: bool = False
+    stem_counts: dict[str, int] = field(default_factory=dict)
+    beamstop_radius_px: float | str | None = None
+    uncertainty_dataset: str | None = None
+    include_physics: bool = False
+    intensity_mode: str = "calibrated"
+    bright_axis_convention: str = "draw"
+    use_process_local_cache: bool = True
+
+    def __call__(
+        self,
+        ref: FrameRef,
+        initial_parameters: Any = None,
+        config: Any = None,
+    ) -> PipelineResult:
+        cache = _WORKER_GEOMETRY_CACHE if self.use_process_local_cache else None
+        result = analyze_frame(
+            ref.path,
+            poni=self.poni,
+            config=config,
+            full2d=self.full2d,
+            initial_parameters=initial_parameters,
+            frame=ref.frame_selector,
+            dataset=ref.dataset_id or None,
+            geometry_cache=cache,
+            beamstop_radius_px=self.beamstop_radius_px,
+            uncertainty_dataset=self.uncertainty_dataset,
+            include_physics=self.include_physics,
+            intensity_mode=self.intensity_mode,
+            bright_axis_convention=self.bright_axis_convention,
+        )
+        result.metadata["frame_id"] = ref.id
+        if self.stem_counts.get(ref.path.stem.casefold(), 0) > 1:
+            result.metadata["source_parent_token"] = ref.path.parent.name
+        if ref.source is not None:
+            result.metadata["series"] = ref.source
+        if self.destination is not None:
+            target = Path(self.destination)
+            result.output_paths = [
+                os.fspath(path)
+                for path in export_result(result, target, force=self.force or self.resume)
+            ]
+        return result
+
+
 def batch_analyze(
     inputs: Iterable[Any],
     *,
@@ -2462,6 +3246,13 @@ def batch_analyze(
     cancel_event: Any = None,
     progress: Any = None,
     result_sink: Any = None,
+    beamstop_radius_px: float | str | None = None,
+    deduplicate_identical_frames: bool = False,
+    max_workers: int = 1,
+    uncertainty_dataset: str | None = None,
+    include_physics: bool = False,
+    intensity_mode: str = "calibrated",
+    bright_axis_convention: str = "draw",
 ) -> list[PipelineResult] | BatchRunResult:
     """Analyze a sequence of frames and optionally export one bundle per frame."""
 
@@ -2489,39 +3280,63 @@ def batch_analyze(
     for ref in refs:
         stem_counts[ref.path.stem.casefold()] = stem_counts.get(ref.path.stem.casefold(), 0) + 1
 
-    def analyze_for_batch(
-        ref: FrameRef,
-        initial_parameters: Any = None,
-        config: Any = None,
-    ) -> PipelineResult:
-        result = analyze_frame(
-            ref.path,
-            poni=poni,
-            config=config,
+    resolved_mode = str(_config_value(config, "batch_mode", "independent"))
+    resolved_workers = int(max_workers)
+    use_picklable_analyzer = resolved_workers > 1 and resolved_mode == "independent" and cancel_event is None
+
+    if use_picklable_analyzer:
+        analyze_for_batch: Any = _BatchFrameAnalyzer(
+            poni=None if poni is None else os.fspath(poni),
             full2d=full2d,
-            initial_parameters=initial_parameters,
-            frame=ref.frame_selector,
-            dataset=ref.dataset_id or None,
-            geometry_cache=geometry_cache,
-            cancel_event=cancel_event,
+            destination=None if destination is None else os.fspath(destination),
+            force=force,
+            resume=resume,
+            stem_counts=stem_counts,
+            beamstop_radius_px=beamstop_radius_px,
+            uncertainty_dataset=uncertainty_dataset,
+            include_physics=include_physics,
+            intensity_mode=intensity_mode,
+            bright_axis_convention=bright_axis_convention,
         )
-        result.metadata["frame_id"] = ref.id
-        if stem_counts.get(ref.path.stem.casefold(), 0) > 1:
-            result.metadata["source_parent_token"] = ref.path.parent.name
-        if ref.source is not None:
-            result.metadata["series"] = ref.source
-        if destination is not None:
-            target = Path(destination)
-            result.output_paths = [
-                os.fspath(path)
-                for path in export_result(result, target, force=force or resume)
-            ]
-        return result
+    else:
+        def analyze_for_batch(
+            ref: FrameRef,
+            initial_parameters: Any = None,
+            config: Any = None,
+        ) -> PipelineResult:
+            result = analyze_frame(
+                ref.path,
+                poni=poni,
+                config=config,
+                full2d=full2d,
+                initial_parameters=initial_parameters,
+                frame=ref.frame_selector,
+                dataset=ref.dataset_id or None,
+                geometry_cache=geometry_cache,
+                cancel_event=cancel_event,
+                beamstop_radius_px=beamstop_radius_px,
+                uncertainty_dataset=uncertainty_dataset,
+                include_physics=include_physics,
+                intensity_mode=intensity_mode,
+                bright_axis_convention=bright_axis_convention,
+            )
+            result.metadata["frame_id"] = ref.id
+            if stem_counts.get(ref.path.stem.casefold(), 0) > 1:
+                result.metadata["source_parent_token"] = ref.path.parent.name
+            if ref.source is not None:
+                result.metadata["series"] = ref.source
+            if destination is not None:
+                target = Path(destination)
+                result.output_paths = [
+                    os.fspath(path)
+                    for path in export_result(result, target, force=force or resume)
+                ]
+            return result
 
     run = run_batch_frames(
         refs,
         analyze_for_batch,
-        mode=str(_config_value(config, "batch_mode", "independent")),
+        mode=resolved_mode,
         config=config,
         checkpoint=checkpoint,
         resume=resume,
@@ -2534,7 +3349,28 @@ def batch_analyze(
         result_sink=result_sink,
         retain_results=result_sink is None,
         allow_mixed_series=series is not None,
+        deduplicate_identical_frames=deduplicate_identical_frames,
+        max_workers=resolved_workers,
+        beamstop_radius_px=beamstop_radius_px,
     )
+    # Export deduplicated frames when per-frame directory output is requested.
+    if destination is not None:
+        target = Path(destination)
+        for item in run.frame_results:
+            if (
+                item.is_duplicate_frame
+                and isinstance(item.result, PipelineResult)
+                and not item.result.output_paths
+            ):
+                item.result.metadata["frame_id"] = item.frame.id
+                if stem_counts.get(item.frame.path.stem.casefold(), 0) > 1:
+                    item.result.metadata["source_parent_token"] = item.frame.path.parent.name
+                if item.frame.source is not None:
+                    item.result.metadata["series"] = item.frame.source
+                item.result.output_paths = [
+                    os.fspath(path)
+                    for path in export_result(item.result, target, force=force or resume)
+                ]
     if bounded:
         return run
     results: list[PipelineResult] = []
@@ -2579,6 +3415,13 @@ def _run_project_bounded(
     manifest = analysis.get("manifest")
     checkpoint = analysis.get("checkpoint")
     resume = bool(analysis.get("resume", False))
+    deduplicate_identical_frames = bool(
+        analysis.get(
+            "deduplicate_identical_frames",
+            analysis.get("deduplicate_frames", False),
+        )
+    )
+    max_workers = int(analysis.get("max_workers", 1) or 1)
     series = analysis.get("series")
     start = analysis.get("start")
     stop = analysis.get("stop")
@@ -2601,7 +3444,19 @@ def _run_project_bounded(
         analysis={
             key: value
             for key, value in project_config.analysis.items()
-            if key not in {"batch_mode", "mode", "manifest", "checkpoint", "resume", "stream", "stream_results"}
+            if key
+            not in {
+                "batch_mode",
+                "mode",
+                "manifest",
+                "checkpoint",
+                "resume",
+                "stream",
+                "stream_results",
+                "max_workers",
+                "deduplicate_identical_frames",
+                "deduplicate_frames",
+            }
         },
         export=project_config.export,
         metadata=project_config.metadata,
@@ -2661,7 +3516,25 @@ def _run_project_bounded(
             frame_range=frame_range,
             result_sink=None if stream_writer is None else stream_writer.write,
             retain_results=stream_writer is None,
+            deduplicate_identical_frames=deduplicate_identical_frames,
+            max_workers=max_workers,
         )
+        if stream_writer is None:
+            for item in run.frame_results:
+                if (
+                    item.is_duplicate_frame
+                    and isinstance(item.result, PipelineResult)
+                    and not item.result.output_paths
+                ):
+                    item.result.metadata["frame_id"] = item.frame.id
+                    if project_stem_counts.get(item.frame.path.stem.casefold(), 0) > 1:
+                        item.result.metadata["source_parent_token"] = item.frame.path.parent.name
+                    if item.frame.source is not None:
+                        item.result.metadata["series"] = item.frame.source
+                    item.result.output_paths = [
+                        os.fspath(path)
+                        for path in export_result(item.result, destination, force=bool(force or resume))
+                    ]
         if stream_writer is not None:
             stream_writer.finalize(run)
         return run
