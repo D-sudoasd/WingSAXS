@@ -458,3 +458,17 @@ def test_build_quality_remediation_bilingual_and_strict_json() -> None:
     assert by_flag["axis_ratio_at_bound"]["suggested_parameters"]["treat_ellipse_axes_as_candidate_only"] is True
     assert build_quality_remediation([]) == []
 
+    # Suggested q_max must be clamped to <= q_active_max / q_valid_max (never off-detector)
+    clamped = build_quality_remediation(
+        ["annular_outer_window_truncated", "high_q_edge_hit", "major_axis_exceeds_observed_extent"],
+        metrics={
+            "q_max": 10.27,
+            "observed_q_extent": 10.27,
+            "q_active_max": 5.85,
+            "q_valid_max": 10.27,
+        },
+    )
+    for item in clamped:
+        assert item["suggested_parameters"]["q_max"] <= 5.85
+
+

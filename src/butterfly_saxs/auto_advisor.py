@@ -228,12 +228,84 @@ def _infer_beam_geometry(
     return (float(inferred_cx), float(inferred_cy)), float(inferred_dq), source
 
 
+def _detect_active_outer_q_cutoff(
+    intensity: np.ndarray,
+    q_map: np.ndarray,
+    obs_valid: np.ndarray,
+    pixel_dq: float,
+) -> tuple[float, bool]:
+    """Detect and exclude unmasked outer zero-padded dead high-q shells.
+
+    Some calibrated 2D containers (such as circularly integrated H5 images)
+    pad detector corners beyond an outer cutoff with exact ``0.0`` without
+    setting the detector mask. Excluding contiguous outer shells with
+    ``frac(|I| <= 1e-12) > 0.90`` prevents zero-fill cliffs from collapsing
+    the diffuse background floor to zero.
+    """
+    q_vals = q_map[obs_valid]
+    i_vals = intensity[obs_valid]
+    q_min_obs = float(np.min(q_vals))
+    q_max_obs = float(np.max(q_vals))
+    if q_max_obs <= q_min_obs or q_vals.size < 64:
+        return q_max_obs, False
+
+    span_px = (q_max_obs - q_min_obs) / max(pixel_dq, 1e-12)
+    n_shells = int(np.clip(round(span_px / 3.0), 24, 120))
+    edges = np.linspace(q_min_obs, q_max_obs, n_shells + 1, dtype=np.float64)
+    idx = np.clip(np.searchsorted(edges, q_vals, side="right") - 1, 0, n_shells - 1)
+    counts = np.bincount(idx, minlength=n_shells)
+    zero_counts = np.bincount(idx, weights=(np.abs(i_vals) <= 1e-12).astype(np.float64), minlength=n_shells)
+
+    populated = np.flatnonzero(counts >= 5)
+    if populated.size < 6:
+        return q_max_obs, False
+
+    zero_frac = np.zeros(n_shells, dtype=np.float64)
+    zero_frac[populated] = zero_counts[populated] / counts[populated]
+
+    # Walk inward from outermost populated shell while >90% pixels are exact zero
+    last_active_pos = populated.size - 1
+    dead_shells = 0
+    dead_pixels = 0
+    while last_active_pos >= 0:
+        b = int(populated[last_active_pos])
+        if zero_frac[b] > 0.90:
+            dead_shells += 1
+            dead_pixels += int(counts[b])
+            last_active_pos -= 1
+        else:
+            break
+
+    if dead_shells < 2 and dead_pixels < int(0.05 * q_vals.size):
+        return q_max_obs, False
+    if last_active_pos < 3:
+        return q_max_obs, False
+
+    # Verify genuine positive active scattering exists inside the dead outer zone
+    inner_bins = populated[: last_active_pos + 1]
+    if not np.any(zero_frac[inner_bins] < 0.50):
+        return q_max_obs, False
+
+    # Step past any partial-zero transition shell immediately adjacent to the cliff
+    while last_active_pos > 3 and zero_frac[int(populated[last_active_pos])] > 0.20:
+        last_active_pos -= 1
+
+    active_bin = int(populated[last_active_pos])
+    q_active_max = float(edges[active_bin + 1])
+    active_vals = i_vals[q_vals <= q_active_max]
+    if active_vals.size < 16 or float(np.percentile(np.abs(active_vals), 90.0)) <= 1e-12:
+        return q_max_obs, False
+    return q_active_max, True
+
+
 def _detect_beamstop(
     intensity: np.ndarray,
     q_map: np.ndarray,
     obs_valid: np.ndarray,
     beam_center_xy: tuple[float, float],
     pixel_dq: float,
+    *,
+    q_active_max: float | None = None,
 ) -> dict[str, Any]:
     """Detect masked or unmasked central beamstop shadow around beam center."""
     height, width = intensity.shape
@@ -269,9 +341,12 @@ def _detect_beamstop(
     has_total = total_cnt > 0
     valid_frac[has_total] = valid_cnt[has_total] / total_cnt[has_total]
 
-    # Outer detector floor (outermost 20% of valid q pixels)
-    valid_q = q_map[obs_valid]
-    valid_i = intensity[obs_valid]
+    # Outer detector floor computed strictly on active (non-zero-padded) high-q pixels
+    active_valid = obs_valid if q_active_max is None else (obs_valid & (q_map <= q_active_max))
+    if not np.any(active_valid):
+        active_valid = obs_valid
+    valid_q = q_map[active_valid]
+    valid_i = intensity[active_valid]
     q_p80 = float(np.percentile(valid_q, 80.0))
     outer_vals = valid_i[valid_q >= q_p80]
     if outer_vals.size == 0:
@@ -335,11 +410,10 @@ def _detect_beamstop(
                     r_shadow_end = run_end
                     detection_mode = "unmasked_zero_core"
 
-        # Signature B: suppressed low-count core with sharp positive edge
+        # Signature B: suppressed low-count core with sharp 1-px or 2-px rising rim
         if not unmasked_shadow and dynamic_range > max(5.0 * outer_mad, 1e-9):
             k0 = int(valid_shells[0])
             i_core0 = float(shell_med[k0])
-            # Look for the earliest sharp step from a dark/flat core
             for k in range(k0, min(r_cap, n_shells - 3)):
                 if not (np.isfinite(shell_med[k]) and np.isfinite(shell_med[k + 1])):
                     continue
@@ -362,22 +436,26 @@ def _detect_beamstop(
                     continue
                 if core_med > 0.25 * i_post_peak:
                     continue
-                # Must jump sharply within <= 2 pixels from k -> k+1 or k+2
-                step_2px = float(np.max(shell_med[post_idx[: min(2, post_idx.size)]])) - core_med
+                # Check sharp rise across 1-px or 2-px beamstop rim
+                step_1px = float(shell_med[post_idx[0]]) - float(shell_med[k])
+                post_2px_max = float(np.max(shell_med[post_idx[: min(2, post_idx.size)]]))
+                step_2px = post_2px_max - core_med
                 if step_2px < 0.50 * jump:
                     continue
-                # Distinguish true beamstop shadow from a smooth ring on zero background:
-                # either core is darker than outer detector floor, OR post-edge decays / stays
-                # elevated right after a 1-2 px razor-sharp step.
+                step_2px_edge = post_2px_max - float(shell_med[k])
+                ratio_2px = post_2px_max / max(core_med, outer_mad, 1e-6)
                 darker_than_outer = (outer_bg > 0.0) and (core_med < 0.50 * outer_bg)
-                step_1px = float(shell_med[post_idx[0]]) - float(shell_med[k])
-                very_sharp_step = step_1px >= 0.45 * jump
+                very_sharp_step = (step_1px >= 0.40 * jump) or (
+                    step_2px_edge >= 0.65 * jump and step_1px >= 0.20 * jump
+                )
+                huge_ratio_rim = (ratio_2px >= 10.0) and (step_2px_edge >= 0.65 * jump)
+                # Post-edge scattering stays elevated after the 1-2 px rim
                 post_stays_elevated = (
                     post_idx.size >= 3
-                    and float(shell_med[post_idx[0]]) >= i_core0 + 0.35 * jump
                     and float(shell_med[post_idx[1]]) >= i_core0 + 0.35 * jump
+                    and float(shell_med[post_idx[2]]) >= i_core0 + 0.35 * jump
                 )
-                if darker_than_outer or (very_sharp_step and post_stays_elevated):
+                if darker_than_outer or ((very_sharp_step or huge_ratio_rim) and post_stays_elevated):
                     unmasked_shadow = True
                     r_shadow_end = k
                     detection_mode = "unmasked_low_count_core"
@@ -430,6 +508,9 @@ def _radial_profile_and_window(
     obs_valid: np.ndarray,
     beamstop: Mapping[str, Any],
     q_unit: str,
+    *,
+    q_active_max: float | None = None,
+    outer_zero_padded: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Compute observed radial stats outside beamstop and choose a clean q_window."""
     pixel_dq = float(beamstop["pixel_dq"])
@@ -444,28 +525,38 @@ def _radial_profile_and_window(
     else:
         clean_valid = obs_valid
 
-    q_vals = q_map[clean_valid]
-    i_vals = intensity[clean_valid]
-    q_valid_min = float(np.min(q_vals))
-    q_valid_max = float(np.max(q_vals))
+    q_vals_all = q_map[clean_valid]
+    q_valid_min = float(np.min(q_vals_all))
+    q_valid_max = float(np.max(q_vals_all))
+
+    # Exclude outer zero-padded dead shells from radial profile & diffuse floor estimation
+    active_max = q_valid_max if q_active_max is None else min(q_valid_max, float(q_active_max))
+    active_clean = clean_valid & (q_map <= active_max)
+    if np.count_nonzero(active_clean) < 16:
+        active_clean = clean_valid
+        active_max = q_valid_max
+        outer_zero_padded = False
+
+    q_vals = q_map[active_clean]
+    i_vals = intensity[active_clean]
 
     # Avoid exact q == 0 bin when no beamstop is present
     q_floor = max(q_valid_min, float(beamstop["safe_q_min"]))
     if rec_radius_px <= 0.0:
         q_floor = max(q_floor, 2.0 * pixel_dq)
-        if q_floor >= q_valid_max:
+        if q_floor >= active_max:
             q_floor = q_valid_min
 
-    span_px = (q_valid_max - q_floor) / max(pixel_dq, 1e-12)
-    n_rbins = int(np.clip(round(span_px / 2.0), 16, 120))
-    if q_valid_max <= q_floor:
+    span_px = (active_max - q_floor) / max(pixel_dq, 1e-12)
+    n_rbins = int(np.clip(round(span_px / 2.0), 16, 160))
+    if active_max <= q_floor:
         n_rbins = 1
-        edges = np.array([q_valid_min, q_valid_max + max(pixel_dq, 1e-9)], dtype=np.float64)
+        edges = np.array([q_valid_min, active_max + max(pixel_dq, 1e-9)], dtype=np.float64)
     else:
-        edges = np.linspace(q_floor, q_valid_max, n_rbins + 1, dtype=np.float64)
+        edges = np.linspace(q_floor, active_max, n_rbins + 1, dtype=np.float64)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
-    # Also evaluate full candidate counts (including masked pixels) for radial coverage
+    # Evaluate full candidate counts (including masked pixels) for radial coverage
     q_all_finite = np.isfinite(q_map)
     cand_q = q_map[q_all_finite]
     in_cand = (cand_q >= edges[0]) & (cand_q <= edges[-1])
@@ -494,7 +585,7 @@ def _radial_profile_and_window(
             radial_p90[b] = float(np.percentile(vals, 90.0))
             radial_p25[b] = float(np.percentile(vals, 25.0))
 
-    # Estimate outer background floor & noise from outermost 20% of observed bins
+    # Estimate active outer diffuse background floor & noise from outermost 20% of active bins
     valid_bins = np.flatnonzero(np.isfinite(radial_med) & (obs_counts >= 3))
     if valid_bins.size == 0:
         valid_bins = np.flatnonzero(np.isfinite(radial_med))
@@ -514,7 +605,6 @@ def _radial_profile_and_window(
         bg_p90 = float(np.percentile(i_vals, 90.0))
         bg_aniso = float(np.percentile(i_vals, 90.0) - np.percentile(i_vals, 25.0))
 
-    # Also compute pixel-level robust noise from azimuthal dispersion in the outer tail
     noise_scale = max(bg_mad, 1e-12 * max(abs(float(np.max(obs_i))) if obs_i.size else 1.0, 1.0))
 
     # Signal profile combines radial excess and baseline-adjusted anisotropic p90 wing excess
@@ -525,8 +615,7 @@ def _radial_profile_and_window(
 
     finite_sig = np.isfinite(signal_curve)
     peak_signal = float(np.nanmax(signal_curve)) if np.any(finite_sig) else 0.0
-    # Compute bin-averaged SNR using estimator-appropriate standard errors so pure
-    # i.i.d. noise stays well below threshold while real weak scattering passes.
+    peak_aniso = float(np.nanmax(aniso_excess)) if np.any(np.isfinite(aniso_excess)) else 0.0
     sqrt_n = np.sqrt(np.maximum(obs_counts, 1))
     se_mean = np.where(obs_counts > 0, noise_scale / sqrt_n, np.inf)
     se_p90 = np.where(obs_counts > 0, 1.71 * noise_scale / sqrt_n, np.inf)
@@ -539,106 +628,152 @@ def _radial_profile_and_window(
     peak_snr = float(np.max(pixel_snr_curve)) if pixel_snr_curve.size else 0.0
     peak_bin_snr = float(np.max(snr_curve)) if snr_curve.size else 0.0
 
-    # Detect direct I(q) peak and Kratky q^2 * I_excess(q) peak
+    # Determine q_max where SAXS excess/anisotropy merges into the active high-q diffuse floor
+    cov_bins = np.flatnonzero((radial_cov >= 0.25) & np.isfinite(radial_med))
+    q_cov_max = float(edges[int(cov_bins[-1]) + 1]) if cov_bins.size else active_max
+
+    mean_active = np.isfinite(excess_mean) & (excess_mean >= max(2.0 * noise_scale, 0.002 * peak_signal))
+    p90_active = np.isfinite(excess_p90) & (excess_p90 >= max(2.5 * noise_scale, 0.003 * peak_signal))
+    aniso_active = np.isfinite(aniso_excess) & (
+        aniso_excess >= max(2.0 * noise_scale, 0.005 * max(peak_aniso, 0.0))
+    )
+    pixel_sig_mask = (mean_active | p90_active | aniso_active) & (radial_cov >= 0.15)
+    if np.any(pixel_sig_mask):
+        active_sig_bins = np.flatnonzero(pixel_sig_mask)
+        # Walk outward from strongest signal bin; stop after >=3 consecutive diffuse-floor bins
+        # unless a genuine strong outer ring re-emerges.
+        peak_bin_idx = int(active_sig_bins[int(np.argmax(signal_curve[active_sig_bins]))])
+        strong_reemerge = (
+            (np.isfinite(excess_mean) & (excess_mean >= max(3.5 * noise_scale, 0.04 * peak_signal)))
+            | (np.isfinite(aniso_excess) & (aniso_excess >= max(3.5 * noise_scale, 0.06 * max(peak_aniso, 0.0))))
+        ) & (radial_cov >= 0.15)
+        last_sig_idx = peak_bin_idx
+        quiet_run = 0
+        for b in range(peak_bin_idx + 1, n_rbins):
+            if pixel_sig_mask[b]:
+                if quiet_run >= 3 and not strong_reemerge[b]:
+                    break
+                last_sig_idx = b
+                quiet_run = 0
+            elif np.isfinite(radial_med[b]):
+                quiet_run += 1
+        outer_sig_bins = active_sig_bins[active_sig_bins <= last_sig_idx]
+    else:
+        # Very low-amplitude regime: fall back to bin-averaged SNR
+        outer_sig_bins = np.flatnonzero(finite_sig & (snr_curve >= 5.0) & (radial_cov >= 0.15))
+
+    outer_signal_q: float | None = None
+    if outer_sig_bins.size:
+        last_sig_idx = int(outer_sig_bins[-1])
+        outer_signal_q = float(edges[last_sig_idx + 1])
+        q_max = min(q_cov_max, max(outer_signal_q * 1.15, float(edges[min(n_rbins, last_sig_idx + 3)])))
+    else:
+        q_max = q_cov_max
+
+    # Detect direct I(q) peak and baseline-subtracted Kratky q^2*(I - I_bg) peak
+    # on a fine grid strictly within [q_floor, q_max] (never on the flat diffuse floor!).
     q_star_direct: float | None = None
     q_star_kratky: float | None = None
     low_q_peak_near_beamstop = False
 
-    if valid_bins.size >= 3 and peak_signal > 0.0:
-        # Use radial_p90 excess for direct peak so narrow anisotropic wings still register
-        direct_curve = np.where(np.isfinite(radial_p90), radial_p90 - bg_level, np.nan)
-        k_curve = np.where(
-            np.isfinite(radial_mean),
-            (centers ** 2) * np.maximum(radial_mean - bg_level, 0.0),
-            np.nan,
-        )
-        # Find interior local maxima first; avoid picking monotonic boundary decay as direct peak
-        def _find_best_peak(curve: np.ndarray) -> tuple[float | None, bool]:
-            idx_ok = np.flatnonzero(np.isfinite(curve))
-            if idx_ok.size < 3:
-                return None, False
-            vals = curve[idx_ok]
-            smooth = gaussian_filter1d(vals, sigma=1.0, mode="nearest")
-            vmax = float(np.max(smooth))
-            vmin = float(np.min(smooth))
-            if vmax <= max(vmin + 1e-12, 0.0):
-                return None, False
-            local_peaks: list[tuple[float, int]] = []
-            for j in range(1, smooth.size - 1):
-                if smooth[j] >= smooth[j - 1] and smooth[j] >= smooth[j + 1]:
-                    if smooth[j] > smooth[j - 1] or smooth[j] > smooth[j + 1]:
-                        # Require nontrivial prominence relative to dynamic range
-                        left_min = float(np.min(smooth[: j + 1]))
-                        right_min = float(np.min(smooth[j:]))
-                        prom = smooth[j] - max(left_min, right_min)
-                        if prom >= 0.05 * (vmax - vmin):
-                            local_peaks.append((float(smooth[j]), int(idx_ok[j])))
-            if local_peaks:
-                # Choose strongest peak (or first prominent low-q peak if comparable)
-                local_peaks.sort(key=lambda item: item[0], reverse=True)
-                best_idx = local_peaks[0][1]
-                near_inner = best_idx <= idx_ok[0] + 2
-                return float(centers[best_idx]), near_inner
-            # Monotonic decay peaking at inner boundary
-            if int(np.argmax(smooth)) == 0:
-                return None, True
+    def _find_best_peak(
+        curve: np.ndarray,
+        bin_centers: np.ndarray,
+        bin_mask: np.ndarray,
+        *,
+        min_abs_prom: float = 0.0,
+    ) -> tuple[float | None, bool]:
+        idx_ok = np.flatnonzero(bin_mask & np.isfinite(curve))
+        if idx_ok.size < 3:
             return None, False
+        vals = curve[idx_ok]
+        smooth = gaussian_filter1d(vals, sigma=1.0, mode="nearest")
+        vmax = float(np.max(smooth))
+        vmin = float(np.min(smooth))
+        if vmax <= max(vmin + 1e-12, 0.0):
+            return None, False
+        prom_floor = max(0.05 * (vmax - vmin), min_abs_prom)
+        local_peaks: list[tuple[float, int]] = []
+        for j in range(1, smooth.size - 1):
+            if smooth[j] >= smooth[j - 1] and smooth[j] >= smooth[j + 1]:
+                if smooth[j] > smooth[j - 1] or smooth[j] > smooth[j + 1]:
+                    left_min = float(np.min(smooth[: j + 1]))
+                    right_min = float(np.min(smooth[j:]))
+                    prom = smooth[j] - max(left_min, right_min)
+                    if prom >= prom_floor:
+                        local_peaks.append((float(smooth[j]), int(idx_ok[j])))
+        if local_peaks:
+            local_peaks.sort(key=lambda item: item[0], reverse=True)
+            best_idx = local_peaks[0][1]
+            near_inner = best_idx <= idx_ok[0] + 2
+            return float(bin_centers[best_idx]), near_inner
+        if int(np.argmax(smooth)) == 0:
+            return None, True
+        return None, False
 
-        q_star_direct, near_inner_direct = _find_best_peak(direct_curve)
-        q_star_kratky, near_inner_kratky = _find_best_peak(k_curve)
+    if valid_bins.size >= 3 and peak_signal > 0.0 and q_max > q_floor:
+        in_fine = (q_vals >= q_floor) & (q_vals <= q_max)
+        fine_q = q_vals[in_fine]
+        fine_i = i_vals[in_fine]
+        n_fine = int(np.clip(round((q_max - q_floor) / max(1.5 * pixel_dq, 1e-12)), 24, 96))
+        fine_edges = np.linspace(q_floor, q_max, n_fine + 1, dtype=np.float64)
+        fine_centers = 0.5 * (fine_edges[:-1] + fine_edges[1:])
+        fine_idx = np.clip(np.searchsorted(fine_edges, fine_q, side="right") - 1, 0, n_fine - 1)
+        fine_cnt = np.bincount(fine_idx, minlength=n_fine)
+        fine_mean = np.full(n_fine, np.nan, dtype=np.float64)
+        fine_p90 = np.full(n_fine, np.nan, dtype=np.float64)
+        for fb in range(n_fine):
+            if fine_cnt[fb] > 0:
+                fvals = fine_i[fine_idx == fb]
+                fine_mean[fb] = float(np.mean(fvals))
+                fine_p90[fb] = float(np.percentile(fvals, 90.0))
+        in_peak_win = fine_cnt >= 3
+        if np.count_nonzero(in_peak_win) < 3:
+            in_peak_win = fine_cnt > 0
+        direct_curve = np.where(np.isfinite(fine_p90), fine_p90 - bg_level, np.nan)
+        kratky_excess = np.where(
+            np.isfinite(fine_mean) & ((fine_mean - bg_level) > 0.5 * noise_scale),
+            fine_mean - bg_level,
+            0.0,
+        )
+        k_curve = np.where(np.isfinite(fine_mean), (fine_centers ** 2) * kratky_excess, np.nan)
+        q_star_direct, near_inner_direct = _find_best_peak(
+            direct_curve, fine_centers, in_peak_win, min_abs_prom=2.0 * noise_scale
+        )
+        q_star_kratky, near_inner_kratky = _find_best_peak(k_curve, fine_centers, in_peak_win)
         low_q_peak_near_beamstop = bool(near_inner_direct or near_inner_kratky)
 
-    # Choose clean q_min and q_max
-    # q_min: right above safe beamstop radius, avoiding premature low-q peak clipping!
+    # Choose clean q_min: right above safe beamstop radius, avoiding low-q peak clipping
     q_min = float(q_floor)
     if beamstop["detected"]:
-        # If there is still a slight upward beamstop-rim slope in bin 0 -> 1, stay at safe_q_min
-        # (which already includes the safety margin). Never push past a detected low-q peak!
         q_min = max(q_min, float(beamstop["safe_q_min"]))
         if q_star_direct is not None and q_min > 0.85 * q_star_direct:
             q_min = max(float(beamstop["shadow_edge_q"]) + pixel_dq, min(q_min, 0.80 * q_star_direct))
     else:
-        # Without a beamstop, skip noisy/sparse very-inner pixels unless signal starts right there
         sig_thresh_inner = max(3.0 * noise_scale, 0.05 * peak_signal)
         strong_bins = np.flatnonzero(finite_sig & (signal_curve >= sig_thresh_inner) & (obs_counts >= 3))
         if strong_bins.size:
             first_sig_idx = int(strong_bins[0])
-            # Give generous inner margin so peak foot is never clipped
             inner_idx = max(0, first_sig_idx - max(2, int(round(0.15 * first_sig_idx))))
             q_min = float(edges[inner_idx])
         if q_star_direct is not None:
             q_min = min(q_min, 0.65 * q_star_direct)
         q_min = max(q_min, q_valid_min)
 
-    # q_max: extend cleanly past outer signal while respecting detector coverage (>= 0.25)
-    cov_bins = np.flatnonzero((radial_cov >= 0.25) & np.isfinite(radial_med))
-    q_cov_max = float(edges[int(cov_bins[-1]) + 1]) if cov_bins.size else q_valid_max
-
-    sig_thresh_outer = max(2.5 * noise_scale, 0.04 * peak_signal)
-    outer_sig_bins = np.flatnonzero(
-        finite_sig
-        & ((signal_curve >= sig_thresh_outer) | (snr_curve >= 5.0))
-        & (radial_cov >= 0.15)
-    )
-    outer_signal_q: float | None = None
-    if outer_sig_bins.size:
-        last_sig_idx = int(outer_sig_bins[-1])
-        outer_signal_q = float(edges[last_sig_idx + 1])
-        # Add 15% outer buffer so butterfly wing tips aren't truncated
-        q_max = min(q_cov_max, max(outer_signal_q * 1.15, float(edges[min(n_rbins, last_sig_idx + 3)])))
-    else:
-        q_max = q_cov_max
-
     if q_star_direct is not None:
-        q_max = max(q_max, min(q_valid_max, q_star_direct * 1.8))
+        q_max = max(q_max, min(active_max, q_star_direct * 1.8))
+    q_max = min(q_max, active_max)
     if q_max <= q_min:
         q_min = q_valid_min
-        q_max = q_valid_max
+        q_max = active_max
 
     # Focus q-band for azimuthal symmetry: avoid outer noise diluting harmonics
     if outer_sig_bins.size:
         strong_azim_bins = np.flatnonzero(
-            finite_sig & (signal_curve >= max(2.0 * noise_scale, 0.10 * peak_signal)) & (centers >= q_min)
+            finite_sig
+            & (signal_curve >= max(2.0 * noise_scale, 0.10 * peak_signal))
+            & (centers >= q_min)
+            & (centers <= q_max)
         )
         if strong_azim_bins.size:
             azim_q_min = max(q_min, float(edges[int(strong_azim_bins[0])]))
@@ -657,12 +792,14 @@ def _radial_profile_and_window(
         )
     else:
         rationale_parts.append(f"q_min={q_min:.4g} preserves low-q signal without beamstop obstruction")
+    if outer_zero_padded:
+        rationale_parts.append(f"excluded outer zero-padded dead shells above q_active_max={active_max:.4g}")
     if outer_signal_q is not None:
         rationale_parts.append(
-            f"q_max={q_max:.4g} covers observed signal up to {outer_signal_q:.4g} with outer margin"
+            f"q_max={q_max:.4g} covers observed signal above diffuse floor ({bg_level:.4g}) up to {outer_signal_q:.4g}"
         )
     else:
-        rationale_parts.append(f"q_max={q_max:.4g} spans available detector coverage")
+        rationale_parts.append(f"q_max={q_max:.4g} spans available active detector coverage")
 
     q_window_info = {
         "q_min": float(q_min),
@@ -672,6 +809,10 @@ def _radial_profile_and_window(
         "q_beamstop_safe": float(beamstop["safe_q_min"]),
         "q_valid_min": float(q_valid_min),
         "q_valid_max": float(q_valid_max),
+        "q_active_max": float(active_max),
+        "outer_zero_padded": bool(outer_zero_padded),
+        "diffuse_floor_estimate": float(bg_level),
+        "diffuse_noise_mad": float(bg_mad),
         "q_star_direct_estimate": q_star_direct,
         "q_star_kratky_estimate": q_star_kratky,
         "outer_signal_q": outer_signal_q,
@@ -679,7 +820,7 @@ def _radial_profile_and_window(
         "rationale": "; ".join(rationale_parts),
     }
     stats = {
-        "clean_valid": clean_valid,
+        "clean_valid": active_clean,
         "bg_level": bg_level,
         "bg_mad": bg_mad,
         "noise_scale": noise_scale,
@@ -1021,8 +1162,18 @@ def _analyze_symmetry_and_morphology(
     radial_stats: Mapping[str, Any],
     q_window_info: Mapping[str, Any],
     nominal_draw_axis_deg: float,
+    *,
+    bright_axis_convention: str = "draw",
+    expected_bright_axis_deg: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Analyze azimuthal harmonics, Friedel bisector, mounting tilt, and morphology."""
+    reference_axis_deg = float((nominal_draw_axis_deg - 90.0) % 180.0)
+    if expected_bright_axis_deg is not None:
+        expected_bright_axis = float(expected_bright_axis_deg % 180.0)
+    elif bright_axis_convention == "reference":
+        expected_bright_axis = reference_axis_deg
+    else:
+        expected_bright_axis = float(nominal_draw_axis_deg % 180.0)
     clean_valid = radial_stats["clean_valid"]
     bg_level = float(radial_stats["bg_level"])
     noise_scale = float(radial_stats["noise_scale"])
@@ -1154,6 +1305,8 @@ def _analyze_symmetry_and_morphology(
     # Classify morphology and compute principal Friedel symmetry bisector
     friedel_bisector_deg: float | None = None
     mounting_tilt_deg: float | None = None
+    angle_to_draw_axis_deg: float | None = None
+    angle_to_reference_axis_deg: float | None = None
     orthogonal_residual_tilt_deg: float | None = None
     orthogonal_flip_detected = False
     wing_half_opening_deg: float | None = None
@@ -1178,7 +1331,6 @@ def _analyze_symmetry_and_morphology(
     ):
         # Four-lobe butterfly: determine acute bisector from the top two Friedel pairs
         if len(friedel_pairs) >= 2:
-            # Take the two strongest Friedel pairs
             ranked_pairs = sorted(
                 friedel_pairs,
                 key=lambda pr: pr[0]["intensity"] + pr[1]["intensity"],
@@ -1203,8 +1355,9 @@ def _analyze_symmetry_and_morphology(
                 half_open = 0.5 * gap_outer
             b_obtuse = (b_acute + 90.0) % 180.0
 
-            # If nearly square (half_opening within 42..48 deg), break tie using m=2 axis
-            if abs(half_open - 45.0) <= 3.0 and phi2_deg is not None and a2 >= 0.05:
+            # When lobes sit near +/-45 deg (37..53 deg), align to the brighter m=2 C2 bridge
+            # so small angular drifts across 45 deg never induce spurious 90-deg axis jumps.
+            if abs(half_open - 45.0) <= 8.0 and phi2_deg is not None and a2 >= 0.05:
                 d_ac = abs(_signed_angle_diff_mod180(b_acute, phi2_deg))
                 d_ob = abs(_signed_angle_diff_mod180(b_obtuse, phi2_deg))
                 seed_bisector = b_acute if d_ac <= d_ob else b_obtuse
@@ -1220,20 +1373,21 @@ def _analyze_symmetry_and_morphology(
             if phi2_deg is not None and a2 >= 0.05:
                 seed_bisector = phi2_deg
             elif phi4_deg is not None:
-                # Choose the phi4+45*k candidate closest to nominal or strongest peak
                 cands = [(phi4_deg + 45.0 * k) % 180.0 for k in range(4)]
-                seed_bisector = min(cands, key=lambda c: abs(_signed_angle_diff_mod180(c, nominal_draw_axis_deg)))
+                seed_bisector = min(cands, key=lambda c: abs(_signed_angle_diff_mod180(c, expected_bright_axis)))
             else:
-                seed_bisector = nominal_draw_axis_deg % 180.0
+                seed_bisector = expected_bright_axis
             friedel_bisector_deg = _refine_reflection_bisector(
                 chi_centers, smooth_profile, seed_bisector, search_half_width_deg=12.0
             )
 
-        mounting_tilt_deg = _signed_angle_diff_mod180(friedel_bisector_deg, nominal_draw_axis_deg)
+        angle_to_draw_axis_deg = _signed_angle_diff_mod180(friedel_bisector_deg, nominal_draw_axis_deg)
+        angle_to_reference_axis_deg = _signed_angle_diff_mod180(friedel_bisector_deg, reference_axis_deg)
+        mounting_tilt_deg = _signed_angle_diff_mod180(friedel_bisector_deg, expected_bright_axis)
         orthogonal_residual_tilt_deg = _signed_angle_diff_mod180(
-            friedel_bisector_deg, nominal_draw_axis_deg + 90.0
+            friedel_bisector_deg, expected_bright_axis + 90.0
         )
-        # Orthogonal flip: principal symmetry axis rotated ~90 deg from nominal (within 90 +/- 25 deg)
+        # Orthogonal flip: principal symmetry axis rotated ~90 deg from expected bright axis
         orthogonal_flip_detected = abs(abs(mounting_tilt_deg) - 90.0) <= 25.0
         morphology_class = (
             "orthogonal_flipped_butterfly" if orthogonal_flip_detected else "four_lobe_butterfly"
@@ -1241,23 +1395,27 @@ def _analyze_symmetry_and_morphology(
     elif a2 >= 0.08 or len(friedel_pairs) == 1 or azim_contrast >= 0.14:
         morphology_class = "two_lobe"
         seed = phi2_deg if phi2_deg is not None else (
-            friedel_pairs[0][0]["angle_deg"] % 180.0 if friedel_pairs else nominal_draw_axis_deg % 180.0
+            friedel_pairs[0][0]["angle_deg"] % 180.0 if friedel_pairs else expected_bright_axis
         )
         friedel_bisector_deg = _refine_reflection_bisector(
             chi_centers, smooth_profile, seed, search_half_width_deg=12.0
         )
-        mounting_tilt_deg = _signed_angle_diff_mod180(friedel_bisector_deg, nominal_draw_axis_deg)
+        angle_to_draw_axis_deg = _signed_angle_diff_mod180(friedel_bisector_deg, nominal_draw_axis_deg)
+        angle_to_reference_axis_deg = _signed_angle_diff_mod180(friedel_bisector_deg, reference_axis_deg)
+        mounting_tilt_deg = _signed_angle_diff_mod180(friedel_bisector_deg, expected_bright_axis)
         orthogonal_residual_tilt_deg = _signed_angle_diff_mod180(
-            friedel_bisector_deg, nominal_draw_axis_deg + 90.0
+            friedel_bisector_deg, expected_bright_axis + 90.0
         )
         orthogonal_flip_detected = abs(abs(mounting_tilt_deg) - 90.0) <= 25.0
     else:
         morphology_class = "isotropic_ring"
 
     if morphology_class == "streak_contaminated" and friedel_bisector_deg is not None:
-        mounting_tilt_deg = _signed_angle_diff_mod180(friedel_bisector_deg, nominal_draw_axis_deg)
+        angle_to_draw_axis_deg = _signed_angle_diff_mod180(friedel_bisector_deg, nominal_draw_axis_deg)
+        angle_to_reference_axis_deg = _signed_angle_diff_mod180(friedel_bisector_deg, reference_axis_deg)
+        mounting_tilt_deg = _signed_angle_diff_mod180(friedel_bisector_deg, expected_bright_axis)
         orthogonal_residual_tilt_deg = _signed_angle_diff_mod180(
-            friedel_bisector_deg, nominal_draw_axis_deg + 90.0
+            friedel_bisector_deg, expected_bright_axis + 90.0
         )
         orthogonal_flip_detected = abs(abs(mounting_tilt_deg) - 90.0) <= 25.0
 
@@ -1299,8 +1457,13 @@ def _analyze_symmetry_and_morphology(
 
     symmetry = {
         "morphology_class": morphology_class,
+        "bright_axis_convention": bright_axis_convention,
         "nominal_draw_axis_deg": float(nominal_draw_axis_deg),
+        "nominal_reference_axis_deg": reference_axis_deg,
+        "expected_bright_axis_deg": expected_bright_axis,
         "friedel_bisector_deg": friedel_bisector_deg,
+        "angle_to_draw_axis_deg": angle_to_draw_axis_deg,
+        "angle_to_reference_axis_deg": angle_to_reference_axis_deg,
         "mounting_tilt_deg": mounting_tilt_deg,
         "orthogonal_residual_tilt_deg": orthogonal_residual_tilt_deg,
         "orthogonal_flip_detected": bool(orthogonal_flip_detected),
@@ -1418,10 +1581,23 @@ def _recommend_parameters(
     else:
         recommended_ellipse_preset = "standard"
 
-    recommended_draw_axis_deg = (
-        float(symmetry["friedel_bisector_deg"])
-        if symmetry["friedel_bisector_deg"] is not None
-        else float(symmetry["nominal_draw_axis_deg"])
+    if symmetry["friedel_bisector_deg"] is not None:
+        if symmetry.get("bright_axis_convention") == "reference":
+            recommended_draw_axis_deg = float((float(symmetry["friedel_bisector_deg"]) + 90.0) % 180.0)
+        else:
+            recommended_draw_axis_deg = float(symmetry["friedel_bisector_deg"])
+    else:
+        recommended_draw_axis_deg = float(symmetry["nominal_draw_axis_deg"])
+
+    # Only flag outer window truncation when wing signal genuinely reaches the active detector limit
+    q_active_max = _finite_float(q_window_info.get("q_active_max", q_window_info.get("q_valid_max")))
+    outer_sig_q = _finite_float(q_window_info.get("outer_signal_q"))
+    detector_outer_truncated = bool(
+        wing_outer
+        and q_active_max is not None
+        and q_active_max > 0.0
+        and outer_sig_q is not None
+        and outer_sig_q >= 0.90 * q_active_max
     )
 
     # Assemble active warnings
@@ -1443,7 +1619,7 @@ def _recommend_parameters(
         and risk == "high"
     ):
         warnings.append("axis_ratio_at_bound")
-    if wing_outer and morphology in {"four_lobe_butterfly", "orthogonal_flipped_butterfly"}:
+    if detector_outer_truncated and morphology in {"four_lobe_butterfly", "orthogonal_flipped_butterfly"}:
         warnings.append("annular_outer_window_truncated")
     if _normalise_q_unit(q_window_info["q_unit"]) not in {"nm^-1", "Å^-1"}:
         warnings.append("uncalibrated_pixel_q")
@@ -1466,9 +1642,19 @@ def _recommend_parameters(
             "radial_ray_angle_std_deg": ray_std,
             "radial_ray_angular_drift_deg": ray_drift,
             "wing_reaches_outer_edge": wing_outer,
+            "detector_outer_truncated": detector_outer_truncated,
         },
     }
     return parameters, list(dict.fromkeys(warnings))
+
+
+def _normalise_bright_axis_convention(value: str) -> str:
+    text = str(value or "draw").strip().lower()
+    if text not in {"draw", "reference"}:
+        raise ValueError(
+            f"bright_axis_convention must be 'draw' or 'reference', got {value!r}"
+        )
+    return text
 
 
 def advise_from_arrays(
@@ -1481,6 +1667,8 @@ def advise_from_arrays(
     beam_center_xy: Sequence[float] | None = None,
     pixel_dq: float | None = None,
     nominal_draw_axis_deg: float = 90.0,
+    bright_axis_convention: str = "draw",
+    expected_bright_axis_deg: float | None = None,
 ) -> dict[str, Any]:
     """Recommend beamstop mask, q_window, symmetry axis, and workflow from 2D arrays.
 
@@ -1492,6 +1680,16 @@ def advise_from_arrays(
     nominal_axis = _finite_float(nominal_draw_axis_deg)
     if nominal_axis is None:
         raise ValueError(f"nominal_draw_axis_deg must be finite, got {nominal_draw_axis_deg!r}")
+    convention = _normalise_bright_axis_convention(bright_axis_convention)
+    expected_axis_val: float | None = None
+    if expected_bright_axis_deg is not None:
+        if isinstance(expected_bright_axis_deg, bool):
+            raise ValueError("expected_bright_axis_deg must be a finite number or None")
+        expected_axis_val = _finite_float(expected_bright_axis_deg)
+        if expected_axis_val is None:
+            raise ValueError(
+                f"expected_bright_axis_deg must be finite, got {expected_bright_axis_deg!r}"
+            )
 
     i_arr = np.asarray(intensity, dtype=np.float64)
     q_arr = np.asarray(q_map, dtype=np.float64)
@@ -1523,14 +1721,32 @@ def advise_from_arrays(
         beam_center_xy=beam_center_xy,
         pixel_dq=pixel_dq,
     )
-    beamstop = _detect_beamstop(i_arr, q_arr, obs_valid, center_xy, dq)
+    q_active_max, outer_zero_padded = _detect_active_outer_q_cutoff(
+        i_arr, q_arr, obs_valid, dq
+    )
+    beamstop = _detect_beamstop(
+        i_arr, q_arr, obs_valid, center_xy, dq, q_active_max=q_active_max
+    )
     beamstop["beam_center_source"] = center_source
 
     q_window_info, radial_stats = _radial_profile_and_window(
-        i_arr, q_arr, obs_valid, beamstop, unit
+        i_arr,
+        q_arr,
+        obs_valid,
+        beamstop,
+        unit,
+        q_active_max=q_active_max,
+        outer_zero_padded=outer_zero_padded,
     )
     symmetry, ray_info = _analyze_symmetry_and_morphology(
-        i_arr, q_arr, c_arr, radial_stats, q_window_info, nominal_axis
+        i_arr,
+        q_arr,
+        c_arr,
+        radial_stats,
+        q_window_info,
+        nominal_axis,
+        bright_axis_convention=convention,
+        expected_bright_axis_deg=expected_axis_val,
     )
     parameters, warnings = _recommend_parameters(
         beamstop, q_window_info, symmetry, ray_info, radial_stats
@@ -1539,10 +1755,13 @@ def advise_from_arrays(
     remediation_metrics = {
         "q_min": q_window_info["q_min"],
         "q_max": q_window_info["q_max"],
+        "q_active_max": q_window_info["q_active_max"],
+        "q_valid_max": q_window_info["q_valid_max"],
         "recommended_q_min": q_window_info["q_min"],
         "recommended_mask_radius_px": beamstop["recommended_mask_radius_px"],
         "beam_center_xy": beamstop["beam_center_xy"],
         "friedel_bisector_deg": symmetry["friedel_bisector_deg"],
+        "recommended_draw_axis_deg": parameters["draw_axis_deg"],
         "observed_q_extent": q_window_info["outer_signal_q"],
     }
     remediation = build_quality_remediation(warnings, metrics=remediation_metrics)
@@ -1569,6 +1788,8 @@ def advise_frame(
     mask_dataset: str | None = None,
     mask_frame_index: int | None = None,
     nominal_draw_axis_deg: float = 90.0,
+    bright_axis_convention: str = "draw",
+    expected_bright_axis_deg: float | None = None,
 ) -> dict[str, Any]:
     """Load one detector frame from disk and compute smart analysis recommendations."""
     from .io import load_image
@@ -1642,6 +1863,8 @@ def advise_frame(
         beam_center_xy=beam_center_xy,
         pixel_dq=pixel_dq,
         nominal_draw_axis_deg=nominal_draw_axis_deg,
+        bright_axis_convention=bright_axis_convention,
+        expected_bright_axis_deg=expected_bright_axis_deg,
     )
     result["provenance"] = _sanitize_json(
         {

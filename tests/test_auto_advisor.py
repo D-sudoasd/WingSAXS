@@ -344,3 +344,163 @@ def test_advise_from_arrays_rejects_invalid_inputs() -> None:
         advise_from_arrays(img, q[:16, :16], chi_deg, np.ones_like(img, dtype=bool), q_unit="nm^-1")
     with pytest.raises(ValueError, match="nominal_draw_axis_deg"):
         advise_from_arrays(img, q, chi_deg, np.ones_like(img, dtype=bool), q_unit="nm^-1", nominal_draw_axis_deg=math.nan)
+    with pytest.raises(ValueError, match="bright_axis_convention"):
+        advise_from_arrays(img, q, chi_deg, np.ones_like(img, dtype=bool), q_unit="nm^-1", bright_axis_convention="invalid")
+
+
+def test_bl19b2_outer_zero_padding_2px_beamstop_rim_and_diffuse_floor() -> None:
+    """Replicate real SPring-8 BL19B2 run06 edge cases:
+    - circular outer zero-fill cliff at q >= 6.0 nm^-1 (detector corners out to ~10 nm^-1)
+    - flat active diffuse floor ~5.0 cm^-1 with ~1.5 cm^-1 statistical noise across q = 1.5..6.0
+    - unmasked beamstop core r=0..9 px (10..23 cm^-1) with 2-px rising rim r=10 (383), r=11 (696), r=12..13 (850+)
+    """
+    # Use a 260x260 grid scaled so r=10 px -> q~0.08 nm^-1, q_cutoff=6.0 nm^-1, corners ~8.5 nm^-1
+    # Wait: to match both r=10 px beamstop and q=6.0 cutoff cleanly, use dq=0.055? No, test exact
+    # BL19B2 dq=0.008 on a 200x200 box OR scaled dq=0.06 where r_bs=10 -> q=0.6? Better: test BOTH
+    # exact r=10 px rim on dq=0.04 (corners q=5.65, zero cliff at q=4.2) so every physical feature
+    # (10 px beamstop, 2-px rim, SAXS signal up to ~1.2, flat 5.0 floor to 4.2, zero fill 4.2..5.65)
+    # is faithfully resolved without huge memory!
+    rng = np.random.default_rng(2026)
+    dq = 0.04
+    q, chi_deg, r_px, _ = _make_grid((220, 220), dq=dq)
+    # Flat diffuse floor ~5.0 cm^-1 + realistic statistical noise (~1.5 cm^-1)
+    diffuse = 5.0 + rng.normal(0.0, 1.5, size=q.shape)
+    # Strong low-q coarsened butterfly signal decaying into diffuse floor by q ~ 1.4 nm^-1
+    lobes = _make_four_lobe_butterfly(
+        q,
+        chi_deg,
+        bisector_deg=1.3,
+        half_opening_deg=39.0,
+        q_star=0.55,
+        radial_sigma=0.22,
+        angular_sigma_deg=14.0,
+        amplitude=500.0,
+        bg=0.0,
+    )
+    low_q_halo = 550.0 * np.exp(-0.5 * ((q - 0.50) / 0.25) ** 2)
+    image = np.maximum(diffuse + lobes + low_q_halo, 0.1)
+
+    # Unmasked beamstop shadow with realistic 2-px partial-shadow rim (run06 profile):
+    # r<=9 px: 10..23 cm^-1; r=10 px: ~380 cm^-1; r=11 px: ~700 cm^-1; r>=12: ~880 cm^-1
+    image[r_px <= 9.4] = 10.0 + 1.4 * r_px[r_px <= 9.4]
+    rim10 = (r_px > 9.4) & (r_px <= 10.4)
+    image[rim10] = 380.0
+    rim11 = (r_px > 10.4) & (r_px <= 11.4)
+    image[rim11] = 700.0
+
+    # Unmasked circular outer zero-fill beyond q >= 3.8 nm^-1 (detector corners reach ~6.2 nm^-1)
+    image[q >= 3.8] = 0.0
+
+    valid = np.ones_like(image, dtype=bool)
+    advice = advise_from_arrays(
+        image,
+        q,
+        chi_deg,
+        valid,
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+        bright_axis_convention="reference",
+    )
+    json.dumps(advice, allow_nan=False)
+
+    # BUG 1: 2-px rim beamstop shadow MUST be detected even with outer zero-padding
+    bs = advice["beamstop"]
+    assert bs["detected"] is True
+    assert bs["unmasked_beamstop"] is True
+    assert 9.0 <= bs["shadow_radius_px"] <= 11.0
+    assert 11.0 <= bs["recommended_mask_radius_px"] <= 13.5
+    assert "beamstop_unmasked_low_q" in advice["warnings"]
+
+    # BUG 2: outer zero-padded zone excluded; diffuse floor ~5.0 recovered; q_max stops near SAXS end
+    qw = advice["q_window"]
+    assert qw["outer_zero_padded"] is True
+    assert qw["q_active_max"] < 3.9
+    assert qw["q_valid_max"] > 5.0
+    assert 3.0 <= qw["diffuse_floor_estimate"] <= 7.0
+    assert qw["q_max"] < 2.2  # Must NOT extend to the q=3.8 cliff or q=6.2 corner
+    if qw["q_star_kratky_estimate"] is not None:
+        assert qw["q_star_kratky_estimate"] < 2.0  # Must NOT peak at the zero-cliff
+    assert "annular_outer_window_truncated" not in advice["warnings"]
+    for rem in advice["remediation"]:
+        suggested_q_max = rem["suggested_parameters"].get("q_max")
+        if suggested_q_max is not None:
+            assert suggested_q_max <= qw["q_active_max"] + 1e-6
+
+
+def test_bright_axis_convention_reference_vs_draw_for_equatorial_bridge_butterflies() -> None:
+    """Verify BUG 3 fix: NO50S equatorial-bridged butterflies (draw_axis_deg=90,
+    reference_axis=0) vs orthogonal-flipped run22 (bright bridge at ~84-90 deg)."""
+    q, chi_deg, r_px, _ = _make_grid((160, 160), dq=0.01)
+    valid = r_px > 8.0
+
+    # Normal NO50S run06-like: 4 lobes around 0 deg (39 deg, 141 deg, 219 deg, 321 deg)
+    # + bright equatorial C2 bridge at 0/180 deg, dark vertical notch at 90/270 deg.
+    normal_no50s = (
+        2.0
+        + _make_four_lobe_butterfly(
+            q, chi_deg, bisector_deg=1.5, half_opening_deg=39.0, q_star=0.30, amplitude=140.0, bg=0.0
+        )
+        + 45.0 * np.exp(-0.5 * ((q - 0.30) / 0.08) ** 2) * (0.5 + 0.5 * np.cos(np.deg2rad(2.0 * (chi_deg - 1.5))))
+    )
+
+    # Flipped NO50S run22-like: 4 lobes around 84 deg (52 deg, 116 deg, 232 deg, 296 deg)
+    # + bright vertical C2 bridge at 84/264 deg, dark horizontal notch at 174/354 deg.
+    flipped_no50s = (
+        2.0
+        + _make_four_lobe_butterfly(
+            q, chi_deg, bisector_deg=84.0, half_opening_deg=32.0, q_star=0.30, amplitude=140.0, bg=0.0
+        )
+        + 45.0 * np.exp(-0.5 * ((q - 0.30) / 0.08) ** 2) * (0.5 + 0.5 * np.cos(np.deg2rad(2.0 * (chi_deg - 84.0))))
+    )
+
+    # Under bright_axis_convention="reference" with nominal_draw_axis_deg=90.0:
+    res_norm_ref = advise_from_arrays(
+        normal_no50s,
+        q,
+        chi_deg,
+        valid,
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+        bright_axis_convention="reference",
+    )
+    sym_nr = res_norm_ref["symmetry"]
+    assert sym_nr["bright_axis_convention"] == "reference"
+    assert sym_nr["expected_bright_axis_deg"] == pytest.approx(0.0)
+    assert sym_nr["orthogonal_flip_detected"] is False
+    assert sym_nr["morphology_class"] == "four_lobe_butterfly"
+    assert abs(sym_nr["angle_to_reference_axis_deg"]) < 5.0
+    assert abs(abs(sym_nr["angle_to_draw_axis_deg"]) - 90.0) < 5.0
+    assert abs(((sym_nr["bright_bridge_axis_deg"] - 1.5 + 90.0) % 180.0) - 90.0) < 5.0
+    assert abs(((sym_nr["dark_notch_axis_deg"] - 91.5 + 90.0) % 180.0) - 90.0) < 5.0
+    assert "orthogonal_axis_flip" not in res_norm_ref["warnings"]
+
+    res_flip_ref = advise_from_arrays(
+        flipped_no50s,
+        q,
+        chi_deg,
+        valid,
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+        bright_axis_convention="reference",
+    )
+    sym_fr = res_flip_ref["symmetry"]
+    assert sym_fr["orthogonal_flip_detected"] is True
+    assert sym_fr["morphology_class"] == "orthogonal_flipped_butterfly"
+    assert abs(sym_fr["angle_to_draw_axis_deg"]) < 10.0
+    assert abs(abs(sym_fr["angle_to_reference_axis_deg"]) - 90.0) < 10.0
+    assert "orthogonal_axis_flip" in res_flip_ref["warnings"]
+
+    # Explicit expected_bright_axis_deg overrides convention cleanly
+    res_explicit = advise_from_arrays(
+        normal_no50s,
+        q,
+        chi_deg,
+        valid,
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+        bright_axis_convention="draw",
+        expected_bright_axis_deg=0.0,
+    )
+    assert res_explicit["symmetry"]["orthogonal_flip_detected"] is False
+    assert res_explicit["symmetry"]["morphology_class"] == "four_lobe_butterfly"
+

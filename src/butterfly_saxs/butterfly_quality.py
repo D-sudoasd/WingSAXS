@@ -509,6 +509,7 @@ def build_quality_remediation(
         q_min = _finite(q_window[0]) if q_min is None else q_min
         q_max = _finite(q_window[1]) if q_max is None else q_max
     observed_q_extent = _metric_float(metric_map, "observed_q_extent", "candidate_centered_q_extent")
+    q_cap_max = _metric_float(metric_map, "q_active_max", "q_valid_max", "detector_q_max")
     rec_q_min = _metric_float(metric_map, "recommended_q_min", "q_beamstop_safe", "beamstop_safe_q_min")
     rec_mask_radius = _metric_float(metric_map, "recommended_mask_radius_px", "beamstop_mask_radius_px")
     bisector_deg = _metric_float(metric_map, "friedel_bisector_deg", "recommended_draw_axis_deg", "detected_axis_deg")
@@ -516,6 +517,14 @@ def build_quality_remediation(
     collapse_rate = _metric_float(metric_map, "bound_collapse_rate", "axis_ratio_bound_collapse_rate")
     dup_count = _metric_float(metric_map, "duplicate_frame_count")
     unique_ratio = _metric_float(metric_map, "unique_ratio")
+
+    def _clamped_widened_q_max(base_hi: float | None) -> float | None:
+        if base_hi is None or base_hi <= 0.0:
+            return None
+        candidate = base_hi * 1.25
+        if q_cap_max is not None and q_cap_max > 0.0:
+            candidate = min(candidate, q_cap_max)
+        return _round_param(candidate)
 
     for flag in tokens:
         severity = "info"
@@ -526,10 +535,8 @@ def build_quality_remediation(
 
         if flag == "annular_outer_window_truncated":
             severity = "high"
-            target_q_max = None
             base_hi = q_max if q_max is not None else observed_q_extent
-            if base_hi is not None and base_hi > 0:
-                target_q_max = _round_param(base_hi * 1.25)
+            target_q_max = _clamped_widened_q_max(base_hi)
             summary_en = (
                 "Butterfly wings reach the outer q-window boundary, leaving the major-axis tip unobserved."
             )
@@ -570,7 +577,7 @@ def build_quality_remediation(
 
         elif flag == "high_q_edge_hit":
             severity = "medium"
-            target_q_max = _round_param(q_max * 1.25) if (q_max is not None and q_max > 0) else None
+            target_q_max = _clamped_widened_q_max(q_max)
             summary_en = "Peak candidates pile up at the outer q_max boundary."
             summary_zh = "峰候选值堆积在 q_max 外边界。"
             recommended_action = (
@@ -729,8 +736,9 @@ def build_quality_remediation(
                 "treat_major_axis_as_candidate": True,
                 "widen_q_max": True,
             }
-            if observed_q_extent is not None and observed_q_extent > 0:
-                suggested_parameters["q_max"] = _round_param(observed_q_extent * 1.25)
+            target_ext_max = _clamped_widened_q_max(observed_q_extent)
+            if target_ext_max is not None:
+                suggested_parameters["q_max"] = target_ext_max
 
         elif flag == "parameter_at_explicit_bound":
             severity = "medium"
