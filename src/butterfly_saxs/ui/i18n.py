@@ -361,6 +361,30 @@ _EN = {
     "dialog.figure_export_dpi": "Raster output resolution (dpi)",
     "figure.single_column": "Single column · 89 mm",
     "figure.double_column": "Double column · 183 mm",
+    "label.journal_style": "Journal style",
+    "journal_style.default": "Default",
+    "journal_style.nature": "Nature (89/183 mm)",
+    "journal_style.nature_comm": "Nature Comm",
+    "journal_style.science": "Science",
+    "journal_style.macromolecules": "Macromolecules",
+    "tooltip.figure_export_journal_style": (
+        "Choose a publication typography and styling preset; Default preserves existing styling."
+    ),
+    "tooltip.journal_style.default": "Use the standard WingSAXS measurement figure styling.",
+    "tooltip.journal_style.nature": (
+        "Use Nature publication styling (89 mm single / 183 mm double column, sans-serif typography)."
+    ),
+    "tooltip.journal_style.nature_comm": (
+        "Use Nature Communications publication styling and figure typography."
+    ),
+    "tooltip.journal_style.science": (
+        "Use Science publication styling and figure typography."
+    ),
+    "tooltip.journal_style.macromolecules": (
+        "Use ACS Macromolecules publication styling and figure typography."
+    ),
+    "summary.remediation_prefix": "Suggestions: ",
+    "summary.remediation_none": "No parameter adjustments suggested",
     "workflow.next_load": "Next: load a calibrated 2D frame to begin.",
     "workflow.next_identify": "Next: identify arcs to trace the observed ridge support.",
     "workflow.next_evaluate": "Next: evaluate the trace with {resamples} uncertainty resamples.",
@@ -806,6 +830,20 @@ _ZH = {
     "dialog.figure_export_dpi": "栅格输出分辨率（dpi）",
     "figure.single_column": "单栏 · 89 mm",
     "figure.double_column": "双栏 · 183 mm",
+    "label.journal_style": "期刊风格",
+    "journal_style.default": "默认",
+    "journal_style.nature": "Nature（89/183 mm）",
+    "journal_style.nature_comm": "Nature Comm（自然通讯）",
+    "journal_style.science": "Science（科学）",
+    "journal_style.macromolecules": "Macromolecules（大分子）",
+    "tooltip.figure_export_journal_style": "选择期刊排版与图稿风格预设；“默认”保持原有测量图样式。",
+    "tooltip.journal_style.default": "使用 WingSAXS 默认测量图风格。",
+    "tooltip.journal_style.nature": "采用 Nature 期刊排版风格（89 mm 单栏 / 183 mm 双栏，无衬线字体）。",
+    "tooltip.journal_style.nature_comm": "采用 Nature Communications 期刊排版与图稿风格。",
+    "tooltip.journal_style.science": "采用 Science 期刊排版与图稿风格。",
+    "tooltip.journal_style.macromolecules": "采用 ACS Macromolecules 期刊排版与图稿风格。",
+    "summary.remediation_prefix": "建议调整：",
+    "summary.remediation_none": "暂无参数调整建议",
     "workflow.next_load": "下一步：载入经过标定的二维图像。",
     "workflow.next_identify": "下一步：识别弧线，追踪观测脊线支持。",
     "workflow.next_evaluate": "下一步：用 {resamples} 次不确定度重采样评估轨迹。",

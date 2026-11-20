@@ -47,6 +47,37 @@ inspect_frame = None
 run_project = None
 synthetic_butterfly = None
 launch_gui = None
+advise_frame = None
+run_campaign = None
+
+_WORKFLOW_PRESETS = ("annular", "curvature", "sector", "butterfly_pub")
+_JOURNAL_STYLES = ("default", "nature", "nature_comm", "science", "macromolecules")
+
+
+def _advisor_callable() -> Any:
+    """Return ``advise_frame`` lazily, honouring monkeypatches on this module."""
+
+    patched = globals().get("advise_frame")
+    if patched is not None:
+        return patched
+    try:
+        from .auto_advisor import advise_frame as live_advise
+    except ModuleNotFoundError as exc:
+        raise PipelineError(
+            "auto_advisor module is unavailable in this installation"
+        ) from exc
+    return live_advise
+
+
+def _campaign_runner() -> Any:
+    """Return ``run_campaign`` lazily, honouring monkeypatches on this module."""
+
+    patched = globals().get("run_campaign")
+    if patched is not None:
+        return patched
+    from .campaign import run_campaign as live_run_campaign
+
+    return live_run_campaign
 
 
 def _shape(value: str) -> tuple[int, int]:
@@ -247,6 +278,12 @@ def _analysis_overrides(args: argparse.Namespace) -> dict[str, Any]:
         if selected is not None and selected != "butterfly_curvature":
             raise ValueError("--butterfly-trace-method requires the butterfly workflow; omit --ridge-method or use butterfly_curvature")
         mapping["ridge_method"] = "butterfly_curvature"
+    preset = getattr(args, "preset", None)
+    if preset is not None:
+        from .campaign import workflow_preset_analysis
+
+        preset_defaults = workflow_preset_analysis(preset)
+        mapping = deep_merge_mapping(preset_defaults, mapping)
     return mapping
 
 
@@ -272,6 +309,12 @@ def _with_analysis(config: ProjectConfig | None, overrides: Mapping[str, Any]) -
 def _add_refinement_options(parser: argparse.ArgumentParser) -> None:
     """Add the common flat-ellipse/ridge controls to a CLI subcommand."""
 
+    parser.add_argument(
+        "--preset",
+        choices=_WORKFLOW_PRESETS,
+        default=None,
+        help="工作流参数预设（annular/curvature/sector/butterfly_pub；省略时保持原有默认行为）",
+    )
     parser.add_argument(
         "--q-window",
         type=float,
@@ -458,6 +501,17 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     inspect_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
     inspect_parser.add_argument("--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）")
+    inspect_parser.add_argument(
+        "--recommend",
+        action="store_true",
+        help="附带智能参数、光束阻挡器与对称性建议（若 auto_advisor 可用）",
+    )
+    inspect_parser.add_argument(
+        "--nominal-draw-axis-deg",
+        type=float,
+        default=None,
+        help="配合 --recommend 使用的名义拉伸轴角度（度，默认 90.0）",
+    )
     inspect_parser.add_argument("-o", "--output", help="可选 JSON 输出路径")
     inspect_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
 
@@ -506,6 +560,12 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument(
         "--lamellar-settings",
         help="JSON/TOML 片层示意参数；椭圆派生周期和绘制假设可在此设置",
+    )
+    report_parser.add_argument(
+        "--journal-style",
+        choices=_JOURNAL_STYLES,
+        default="default",
+        help="期刊出版风格预设（default/nature/nature_comm/science/macromolecules；默认保持原有风格）",
     )
 
     delivery_check = sub.add_parser("verify-delivery", help="只读核对所选结项回执的当前文件绑定，不改写历史或科学状态")
@@ -664,6 +724,121 @@ def build_parser() -> argparse.ArgumentParser:
     p4_parser.add_argument(
         "--skip-sensitivity", action="store_true", help="跳过单个 T1 方法敏感性对照"
     )
+
+    init_manifest_parser = sub.add_parser(
+        "init-manifest",
+        help="从文件夹或 HDF5 帧栈发现自然排序的帧并生成校验后的 manifest.csv",
+    )
+    init_manifest_parser.add_argument(
+        "input_path",
+        nargs="?",
+        help="输入图像目录或 HDF5/图像文件（也可用 --input）",
+    )
+    init_manifest_parser.add_argument(
+        "-i",
+        "--input",
+        dest="input_dir",
+        help="输入图像目录或 HDF5/图像文件",
+    )
+    init_manifest_parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="输出 manifest.csv 路径（与原始数据分开，未提供 --force 时不覆盖）",
+    )
+    init_manifest_parser.add_argument("--dataset", help="HDF5/NPZ 数据集路径")
+    init_manifest_parser.add_argument("--pattern", default="*", help="目录扫描通配符（默认 *）")
+    init_manifest_parser.add_argument("--recursive", action="store_true", help="递归扫描子目录")
+    init_manifest_parser.add_argument(
+        "--no-parse-metadata",
+        dest="parse_metadata",
+        action="store_false",
+        default=True,
+        help="关闭文件名元数据解析",
+    )
+    init_manifest_parser.add_argument("--sha256", action="store_true", help="计算每个源文件的 SHA-256 摘要")
+    init_manifest_parser.add_argument(
+        "--relative",
+        action="store_true",
+        help="在 manifest 中记录相对输出目录的路径",
+    )
+    init_manifest_parser.add_argument("--force", action="store_true", help="允许覆盖已有 manifest")
+    init_manifest_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="以严格 JSON 输出摘要（stdout 默认即为严格 JSON）",
+    )
+
+    advise_parser = sub.add_parser(
+        "advise",
+        help="运行单帧智能参数、光束阻挡器与 Friedel 对称性诊断建议（只读，不拟合）",
+    )
+    advise_parser.add_argument("image_pos", nargs="?", help="输入图像路径（也可用 --image）")
+    advise_parser.add_argument("-i", "--image", dest="image", help="输入二维图像路径")
+    advise_parser.add_argument("--poni", help="PONI 几何标定文件")
+    advise_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
+    advise_parser.add_argument(
+        "--image-dataset",
+        "--dataset",
+        dest="image_dataset",
+        help="HDF5/NPZ 图像数据集路径",
+    )
+    advise_parser.add_argument(
+        "--image-frame-index",
+        "--frame",
+        dest="image_frame_index",
+        type=int,
+        help="多帧图像中的零基帧索引",
+    )
+    advise_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集路径")
+    advise_parser.add_argument("--mask-frame-index", "--mask-frame", dest="mask_frame_index", type=int, help="多帧掩膜中的零基帧索引")
+    advise_parser.add_argument(
+        "--nominal-draw-axis-deg",
+        type=float,
+        default=90.0,
+        help="名义拉伸轴方向（度，默认 90.0）",
+    )
+    advise_parser.add_argument("-o", "--output", help="可选 JSON 输出路径")
+    advise_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    advise_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="以严格 JSON 输出诊断建议（stdout 默认即为严格 JSON）",
+    )
+
+    campaign_parser = sub.add_parser(
+        "campaign",
+        help="执行多样品活动 TOML 配置，隔离单样品失败并输出严格 JSON 汇总",
+    )
+    campaign_parser.add_argument("config_pos", nargs="?", help="活动 TOML 路径（也可用 --config）")
+    campaign_parser.add_argument("-c", "--config", dest="config", help="活动 TOML 配置文件路径")
+    campaign_parser.add_argument("-o", "--output", help="多样品输出根目录（未提供 --force 时不覆盖非空目录）")
+    campaign_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    campaign_parser.add_argument(
+        "--fail-fast",
+        "--no-continue-on-error",
+        dest="continue_on_error",
+        action="store_false",
+        default=True,
+        help="首个样品失败后停止后续样品（默认隔离失败并继续）",
+    )
+    campaign_parser.add_argument(
+        "--report",
+        action="store_true",
+        default=None,
+        help="完成后生成多样品汇总报告",
+    )
+    campaign_parser.add_argument(
+        "--journal-style",
+        choices=_JOURNAL_STYLES,
+        default="default",
+        help="汇总报告期刊风格预设",
+    )
+    campaign_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="以严格 JSON 输出汇总（stdout 默认即为严格 JSON）",
+    )
     return parser
 
 
@@ -679,17 +854,61 @@ def _pick_input(args: argparse.Namespace, config: ProjectConfig | None) -> Any:
 def _handle_inspect(args: argparse.Namespace) -> int:
     config = _config(args.config)
     source = _pick_input(args, config)
-    report = _pipeline_symbol("inspect_frame")(
-        source,
-        poni=args.poni or (config.poni_path if config else None),
-        config=config,
-        frame=args.frame,
-        dataset=args.dataset,
-        mask=args.mask,
-        mask_frame=args.mask_frame,
-        mask_dataset=args.mask_dataset,
-        valid_mask=args.valid_mask,
-    )
+    poni = args.poni or (config.poni_path if config else None)
+    inspect_fn = _pipeline_symbol("inspect_frame")
+    inspect_kwargs: dict[str, Any] = {
+        "poni": poni,
+        "config": config,
+        "frame": args.frame,
+        "dataset": args.dataset,
+        "mask": args.mask,
+        "mask_frame": args.mask_frame,
+        "mask_dataset": args.mask_dataset,
+        "valid_mask": args.valid_mask,
+    }
+    recommend = bool(getattr(args, "recommend", False))
+    nominal_axis = getattr(args, "nominal_draw_axis_deg", None)
+    used_native_recommend = False
+    if recommend:
+        import inspect as _inspect
+
+        try:
+            sig = _inspect.signature(inspect_fn)
+            params = sig.parameters
+            accepts_var_kw = any(
+                p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if accepts_var_kw or "recommend" in params:
+                inspect_kwargs["recommend"] = True
+                used_native_recommend = True
+                if nominal_axis is not None and (
+                    accepts_var_kw or "nominal_draw_axis_deg" in params
+                ):
+                    inspect_kwargs["nominal_draw_axis_deg"] = float(nominal_axis)
+        except (TypeError, ValueError):
+            pass
+
+    report = inspect_fn(source, **inspect_kwargs)
+    if recommend and not used_native_recommend and "advisor" not in report:
+        report = dict(report)
+        try:
+            advisor_fn = _advisor_callable()
+        except PipelineError as exc:
+            report["advisor"] = {
+                "available": False,
+                "reason": str(exc),
+            }
+        else:
+            report["advisor"] = advisor_fn(
+                source,
+                poni_path=poni,
+                mask_path=args.mask,
+                image_dataset=args.dataset,
+                image_frame_index=args.frame,
+                mask_dataset=args.mask_dataset,
+                mask_frame_index=args.mask_frame,
+                nominal_draw_axis_deg=90.0 if nominal_axis is None else float(nominal_axis),
+            )
     report = annotate_report(report, command="inspect", exit_code=0)
     if args.output:
         destination = Path(args.output)
@@ -811,6 +1030,7 @@ def _build_analysis_report(
     formats: Sequence[str] = ("png", "svg", "pdf"),
     dpi: int = 180,
     lamellar_settings: Mapping[str, Any] | None = None,
+    journal_style: str | None = None,
 ) -> Mapping[str, Any]:
     """Load the optional report pipeline only when a report is requested."""
 
@@ -827,6 +1047,24 @@ def _build_analysis_report(
     }
     if lamellar_settings is not None:
         options["lamellar_settings"] = dict(lamellar_settings)
+    if journal_style is not None and str(journal_style).strip() and str(journal_style) != "default":
+        import inspect as _inspect
+
+        try:
+            sig = _inspect.signature(build_analysis_report)
+            params = sig.parameters
+            accepts_style = "journal_style" in params or any(
+                p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            accepts_style = True
+        if accepts_style:
+            options["journal_style"] = str(journal_style)
+        else:
+            print(
+                f"警告：当前报告模块尚不支持 --journal-style={journal_style}，已回退默认样式。",
+                file=sys.stderr,
+            )
     return build_analysis_report(
         output_dir,
         **options,
@@ -836,16 +1074,19 @@ def _build_analysis_report(
 def _handle_report(args: argparse.Namespace) -> int:
     _validate_report_options(args.radial_bins, args.angular_bins)
     lamellar_settings = _load_lamellar_settings(args.lamellar_settings)
-    result = _build_analysis_report(
-        args.output_dir,
-        resume=args.resume,
-        force=args.force,
-        radial_bins=args.radial_bins,
-        angular_bins=args.angular_bins,
-        formats=args.formats,
-        dpi=args.dpi,
-        lamellar_settings=lamellar_settings,
-    )
+    report_kwargs: dict[str, Any] = {
+        "resume": args.resume,
+        "force": args.force,
+        "radial_bins": args.radial_bins,
+        "angular_bins": args.angular_bins,
+        "formats": args.formats,
+        "dpi": args.dpi,
+        "lamellar_settings": lamellar_settings,
+    }
+    journal_style = getattr(args, "journal_style", "default")
+    if journal_style is not None and str(journal_style) != "default":
+        report_kwargs["journal_style"] = str(journal_style)
+    result = _build_analysis_report(args.output_dir, **report_kwargs)
     _print_json(result)
     return int(result.get("exit_code", 0))
 
@@ -1571,6 +1812,121 @@ def _handle_p4_evaluate(args: argparse.Namespace) -> int:
     return 0 if report["p4_go_no_go"] == "GO" else 1
 
 
+def _handle_init_manifest(args: argparse.Namespace) -> int:
+    from .campaign import discover_manifest, write_manifest_csv
+
+    source = args.input_dir or args.input_path
+    if not source:
+        raise PipelineError("init-manifest 需要输入目录或 HDF5/图像文件（--input）")
+    output_path = Path(args.output).expanduser()
+    rows = discover_manifest(
+        source,
+        pattern=args.pattern,
+        recursive=bool(args.recursive),
+        dataset=args.dataset,
+        parse_metadata=bool(args.parse_metadata),
+        compute_sha256=bool(args.sha256),
+        relative_to=output_path.parent if args.relative else None,
+    )
+    if not rows:
+        raise PipelineError(f"未发现受支持的图像或数据集帧：{source}")
+    written = write_manifest_csv(rows, output_path, force=bool(args.force))
+    report = annotate_report(
+        {
+            "ok": True,
+            "input": str(Path(source).expanduser().resolve(strict=False)),
+            "output": str(written.resolve(strict=False)),
+            "n_frames": len(rows),
+            "dataset": rows[0].get("dataset") if rows else args.dataset,
+            "sha256_computed": bool(args.sha256),
+            "parse_metadata": bool(args.parse_metadata),
+            "rows_preview": rows[:5],
+        },
+        command="init-manifest",
+        exit_code=0,
+    )
+    _print_json(report)
+    return 0
+
+
+def _handle_advise(args: argparse.Namespace) -> int:
+    image = args.image or args.image_pos
+    if not image:
+        raise PipelineError("advise 需要输入图像路径（--image）")
+    advisor_fn = _advisor_callable()
+    advice = advisor_fn(
+        image,
+        poni_path=args.poni,
+        mask_path=args.mask,
+        image_dataset=args.image_dataset,
+        image_frame_index=args.image_frame_index,
+        mask_dataset=args.mask_dataset,
+        mask_frame_index=args.mask_frame_index,
+        nominal_draw_axis_deg=float(args.nominal_draw_axis_deg),
+    )
+    report = annotate_report(advice, command="advise", exit_code=0)
+    if args.output:
+        destination = Path(args.output).expanduser()
+        if destination.exists() and not args.force:
+            raise FileExistsError(f"输出已存在，未覆盖：{destination}（需要 --force）")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+    _print_json(report)
+    return 0
+
+
+def _handle_campaign(args: argparse.Namespace) -> int:
+    config_path = args.config or args.config_pos
+    if not config_path:
+        raise PipelineError("campaign 需要活动 TOML 配置文件（--config）")
+    output_root = args.output
+    if not output_root:
+        from .campaign import load_campaign_config
+
+        loaded = load_campaign_config(config_path)
+        output_root = loaded.get("output_root")
+    if not output_root:
+        raise PipelineError("campaign 需要输出根目录（--output）")
+
+    runner = _campaign_runner()
+    kwargs: dict[str, Any] = {
+        "force": bool(args.force),
+        "continue_on_error": bool(args.continue_on_error),
+    }
+    if args.report is not None:
+        kwargs["report"] = bool(args.report)
+    if args.journal_style and args.journal_style != "default":
+        kwargs["journal_style"] = str(args.journal_style)
+
+    import inspect as _inspect
+
+    try:
+        sig = _inspect.signature(runner)
+        params = sig.parameters
+        if not any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
+        if "progress" in params or any(
+            p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            kwargs["progress"] = lambda message: print(message, file=sys.stderr, flush=True)
+    except (TypeError, ValueError):
+        pass
+
+    result = runner(config_path, output_root, **kwargs)
+    exit_code = int(
+        result.get(
+            "exit_code",
+            1 if (result.get("n_failed", 0) or result.get("n_warning", 0)) else 0,
+        )
+    )
+    report = annotate_report(result, command="campaign", exit_code=exit_code)
+    _print_json(report)
+    return exit_code
+
+
 def _handle_describe(args: argparse.Namespace) -> int:
     report = agent_manifest(getattr(args, "topic", None))
     if getattr(args, "text", False):
@@ -1705,6 +2061,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_p3_status(args)
         if command == "p4-evaluate":
             return _handle_p4_evaluate(args)
+        if command == "init-manifest":
+            return _handle_init_manifest(args)
+        if command == "advise":
+            return _handle_advise(args)
+        if command == "campaign":
+            return _handle_campaign(args)
         parser.error(f"未知命令：{command}")
     except AnalysisCancelled as exc:
         _emit_error(exc, exit_code=1, command=command, code="cancelled")

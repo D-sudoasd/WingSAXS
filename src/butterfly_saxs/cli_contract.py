@@ -17,6 +17,9 @@ INSPECT_SCHEMA = "lamellarsaxs2d.inspect.v1"
 ANALYSIS_SUMMARY_SCHEMA = "lamellarsaxs2d.analysis_summary.v1"
 BATCH_RUN_SCHEMA = "lamellarsaxs2d.batch_run.v1"
 REPORT_SCHEMA = "wingsaxs.analysis_report.v1"
+MANIFEST_INIT_SCHEMA = "wingsaxs.manifest_init.v1"
+ADVISE_SCHEMA = "wingsaxs.advise.v1"
+CAMPAIGN_RUN_SCHEMA = "wingsaxs.campaign_run.v1"
 SYNTHETIC_SCHEMA = "lamellarsaxs2d.synthetic.v1"
 PROJECT_RUN_SCHEMA = "lamellarsaxs2d.project_run.v2"
 AGENT_MANIFEST_SCHEMA = "lamellarsaxs2d.agent_manifest.v1"
@@ -45,6 +48,9 @@ _SCHEMA_BY_COMMAND = {
     "analyze": ANALYSIS_SUMMARY_SCHEMA,
     "batch": BATCH_RUN_SCHEMA,
     "report": REPORT_SCHEMA,
+    "init-manifest": MANIFEST_INIT_SCHEMA,
+    "advise": ADVISE_SCHEMA,
+    "campaign": CAMPAIGN_RUN_SCHEMA,
     "synthetic": SYNTHETIC_SCHEMA,
     "project": PROJECT_RUN_SCHEMA,
 }
@@ -214,6 +220,20 @@ def agent_guidance(
         next_steps.append("Prefer `bsaxs batch` when you need streaming CSV/JSON/NPZ longitudinal exports.")
     elif command == "report":
         next_steps.append("Review the generated index, summary and figures alongside the source NPZ exports.")
+    elif command == "init-manifest":
+        next_steps.append("Inspect the generated manifest CSV; missing timestamps stay empty and are never fabricated.")
+        next_steps.append("Pass the manifest to `bsaxs batch --manifest MANIFEST` or reference it in a campaign TOML.")
+    elif command == "advise":
+        if pixel_q:
+            next_steps.append("Provide --poni so recommended q windows and spacing bounds use calibrated physical q.")
+        next_steps.append("Advisor recommendations are pre-fit diagnostics, not scientific acceptance; apply validated q-window, beamstop mask, and workflow preset in `bsaxs analyze` or `bsaxs batch`.")
+    elif command == "campaign":
+        failed = report.get("n_failed")
+        if isinstance(failed, int) and failed > 0:
+            next_steps.append("Inspect failed sample records in campaign_summary.json; remaining samples were isolated.")
+        if report.get("n_warning"):
+            next_steps.append("Warning samples retain estimates and diagnostics; review each sample summary and QC remediation.")
+        next_steps.append("Run `bsaxs report OUTPUT_ROOT --journal-style nature` to build cross-sample comparison reports without refitting.")
     else:
         next_steps.append("If the required command is unknown, use `bsaxs describe`; otherwise reuse its known contract.")
 
@@ -277,6 +297,8 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
             "recommended_ridge_method": "butterfly_curvature",
             "recommended_ellipse_preset": "standard",
             "recommended_butterfly_stage": "evaluate",
+            "workflow_presets": ["annular", "curvature", "sector", "butterfly_pub"],
+            "journal_styles": ["default", "nature", "nature_comm", "science", "macromolecules"],
             "overwrite": False,
         },
         "recommended_agent_workflow": [
@@ -299,8 +321,11 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
             },
             {
                 "name": "report",
-                "purpose": "Read existing batch exports without refitting to create intensity statistics, fit diagnostics, ellipse candidates, parameterized lamellar geometry summaries and frame/sequence figures; accepts one batch directory or a parent containing sample directories. For each retained observed q-direction beta, ellipse mode reports conditional period 2*pi/R(beta) from the corresponding fitted branch; it keeps Ln_from_minor_axis=2*pi/b separate.",
+                "purpose": "Read existing batch exports without refitting to create intensity statistics, fit diagnostics, ellipse candidates, parameterized lamellar geometry summaries and frame/sequence figures; accepts one batch directory or a parent containing sample directories. Supports optional --journal-style {default,nature,nature_comm,science,macromolecules}. For each retained observed q-direction beta, ellipse mode reports conditional period 2*pi/R(beta) from the corresponding fitted branch; it keeps Ln_from_minor_axis=2*pi/b separate.",
                 "stdout": REPORT_SCHEMA,
+                "options": {
+                    "journal_style": ["default", "nature", "nature_comm", "science", "macromolecules"],
+                },
                 "artifacts": {
                     "inputs": "Existing results.npz, frame_summary.csv and fit-detail exports; no refitting.",
                     "outputs": {
@@ -357,20 +382,71 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
             },
             {
                 "name": "inspect",
-                "purpose": "Read-only frame/q-space diagnostics. No ellipse publication.",
+                "purpose": "Read-only frame/q-space diagnostics. Pass --recommend to attach smart parameter/beamstop/symmetry advisor guidance. No ellipse publication.",
                 "stdout": INSPECT_SCHEMA,
+                "options": {
+                    "recommend": "Attach advisor diagnostics when butterfly_saxs.auto_advisor is available.",
+                },
                 "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
             },
             {
+                "name": "advise",
+                "purpose": "Read-only smart parameter, beamstop shadow, q-window, and Friedel symmetry advisor for one frame; does not fit or grant scientific acceptance.",
+                "stdout": ADVISE_SCHEMA,
+                "options": {
+                    "image": "Input 2D frame path (--image or positional).",
+                    "poni": "Optional PONI calibration path.",
+                    "mask": "Optional external mask path.",
+                    "image_dataset": "Optional HDF5/NPZ image dataset selector.",
+                    "image_frame_index": "Optional zero-based frame index.",
+                    "nominal_draw_axis_deg": "Nominal specimen draw axis in degrees (default 90.0).",
+                },
+                "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
+            },
+            {
+                "name": "init-manifest",
+                "purpose": "Discover naturally sorted image frames or HDF5 stacks and write a validated manifest CSV without fabricating missing timestamps.",
+                "stdout": MANIFEST_INIT_SCHEMA,
+                "options": {
+                    "input": "Source directory or HDF5/image file (--input).",
+                    "output": "Destination manifest CSV path (--output; requires --force to overwrite).",
+                    "dataset": "Optional HDF5/NPZ dataset path.",
+                    "pattern": "Optional glob pattern for directory discovery (default '*').",
+                    "recursive": "Recurse into subdirectories when set.",
+                    "sha256": "Compute optional per-file SHA-256 content digests.",
+                },
+                "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
+            },
+            {
+                "name": "campaign",
+                "purpose": "Orchestrate multi-sample batch analysis from a campaign TOML with per-sample failure isolation and strict JSON summary.",
+                "stdout": CAMPAIGN_RUN_SCHEMA,
+                "options": {
+                    "config": "Campaign TOML path (--config or positional).",
+                    "output": "Campaign output root directory (--output; requires --force to overwrite non-empty directory).",
+                    "force": "Allow overwriting existing campaign outputs.",
+                    "continue_on_error": "Isolate per-sample failures by default; pass --fail-fast to stop after first failed sample.",
+                    "journal_style": ["default", "nature", "nature_comm", "science", "macromolecules"],
+                },
+                "presets": ["annular", "curvature", "sector", "butterfly_pub"],
+                "exit_codes": EXIT_CODES,
+            },
+            {
                 "name": "analyze",
-                "purpose": "Single-frame geometry measurement; --full2d is optional and separate.",
+                "purpose": "Single-frame geometry measurement; supports optional --preset {annular,curvature,sector,butterfly_pub}; --full2d is optional and separate.",
                 "stdout": ANALYSIS_SUMMARY_SCHEMA,
+                "options": {
+                    "preset": ["annular", "curvature", "sector", "butterfly_pub"],
+                },
                 "exit_codes": EXIT_CODES,
             },
             {
                 "name": "batch",
-                "purpose": "Independent or quality-gated warm-start series; --stream writes longitudinal exports, --report analyzes exports and generates parameterized lamellar geometry using observed direction evidence, and --package builds delivery navigation and ZIP.",
+                "purpose": "Independent or quality-gated warm-start series; supports optional --preset {annular,curvature,sector,butterfly_pub}; --stream writes longitudinal exports, --report analyzes exports and generates parameterized lamellar geometry using observed direction evidence, and --package builds delivery navigation and ZIP.",
                 "stdout": BATCH_RUN_SCHEMA,
+                "options": {
+                    "preset": ["annular", "curvature", "sector", "butterfly_pub"],
+                },
                 "exit_codes": EXIT_CODES,
             },
             {
@@ -441,13 +517,16 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
 
 
 __all__ = [
+    "ADVISE_SCHEMA",
     "AGENT_MANIFEST_SCHEMA",
     "ANALYSIS_SUMMARY_SCHEMA",
     "BATCH_RUN_SCHEMA",
+    "CAMPAIGN_RUN_SCHEMA",
     "CLI_ERROR_SCHEMA",
     "EXIT_CODES",
     "INSPECT_SCHEMA",
     "INVARIANTS",
+    "MANIFEST_INIT_SCHEMA",
     "PROJECT_RUN_SCHEMA",
     "REPORT_SCHEMA",
     "SYNTHETIC_SCHEMA",

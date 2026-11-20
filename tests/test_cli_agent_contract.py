@@ -186,3 +186,297 @@ def test_analyze_warn_exits_one_without_discarding_measurement(monkeypatch, caps
 def test_pipeline_error_is_stdlib_importable() -> None:
     assert issubclass(PipelineError, RuntimeError)
     assert PipelineError("x").args == ("x",)
+
+
+def test_lazy_import_invariant_for_help_describe_and_doctor() -> None:
+    import os
+    import subprocess
+    import sys
+
+    repo_src = str(Path(__file__).resolve().parents[1] / "src")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_src
+    heavy = ("numpy", "scipy", "matplotlib", "pyFAI", "PySide6", "h5py")
+
+    for cli_args in (
+        ["--help"],
+        ["describe"],
+        ["describe", "advise"],
+        ["describe", "campaign"],
+        ["describe", "init-manifest"],
+    ):
+        probe = (
+            "import json, sys\n"
+            "from butterfly_saxs.cli import main\n"
+            f"argv = {cli_args!r}\n"
+            "try:\n"
+            "    main(argv)\n"
+            "except SystemExit:\n"
+            "    pass\n"
+            f"loaded = [m for m in {heavy!r} if m in sys.modules]\n"
+            "sys.stderr.write('LOADED=' + json.dumps(loaded) + '\\n')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        marker = [line for line in proc.stderr.splitlines() if line.startswith("LOADED=")]
+        assert marker, (cli_args, proc.stderr, proc.stdout)
+        loaded = json.loads(marker[-1].split("=", 1)[1])
+        assert loaded == [], (cli_args, loaded)
+
+    # Importing CLI, contract, campaign, project, and doctor modules stays stdlib-only.
+    import_probe = (
+        "import json, sys\n"
+        "from butterfly_saxs import campaign, cli, cli_contract, doctor, project\n"
+        f"loaded = [m for m in {heavy!r} if m in sys.modules]\n"
+        "sys.stderr.write('LOADED=' + json.dumps(loaded) + '\\n')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", import_probe],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    marker = [line for line in proc.stderr.splitlines() if line.startswith("LOADED=")]
+    assert marker and json.loads(marker[-1].split("=", 1)[1]) == []
+
+
+def test_cli_init_manifest_command_writes_csv_and_enforces_overwrite(tmp_path, capsys) -> None:
+    import numpy as np
+
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    np.save(frames_dir / "NO50S_350C_0001.npy", np.ones((8, 8), dtype=float))
+    np.save(frames_dir / "NO50S_350C_0002.npy", np.ones((8, 8), dtype=float))
+    out_csv = tmp_path / "manifest.csv"
+
+    assert main(["init-manifest", "--input", str(frames_dir), "--output", str(out_csv), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == "wingsaxs.manifest_init.v1"
+    assert payload["n_frames"] == 2
+    assert out_csv.is_file()
+    json.dumps(payload, allow_nan=False, ensure_ascii=True)
+
+    # Refuses overwrite without --force (exit 2).
+    assert main(["init-manifest", "--input", str(frames_dir), "--output", str(out_csv)]) == 2
+    err_payload = json.loads(capsys.readouterr().out)
+    assert err_payload["error"]["code"] == "output_exists"
+
+    # Succeeds with --force.
+    assert main(["init-manifest", "--input", str(frames_dir), "--output", str(out_csv), "--force"]) == 0
+    capsys.readouterr()
+
+
+def test_cli_advise_command_forwards_contract_and_handles_missing_module(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    import butterfly_saxs.cli as cli_module
+
+    calls = []
+
+    def fake_advise(image_path, **kwargs):
+        calls.append((image_path, kwargs))
+        return {
+            "schema_version": "wingsaxs.advise.v1",
+            "beamstop": {"recommended_mask_radius_px": 14},
+            "q_window": [0.12, 1.35],
+            "symmetry": {"friedel_bisector_deg": 90.2, "orthogonal_flip_detected": False},
+            "parameters": {"recommended_workflow": "annular"},
+            "warnings": [],
+            "remediation": [],
+        }
+
+    monkeypatch.setattr(cli_module, "advise_frame", fake_advise)
+    out_json = tmp_path / "advice.json"
+    assert main([
+        "advise",
+        "--image", "sample.h5",
+        "--poni", "geom.poni",
+        "--mask", "mask.npy",
+        "--image-dataset", "entry/data/data",
+        "--image-frame-index", "3",
+        "--nominal-draw-axis-deg", "88.5",
+        "--output", str(out_json),
+        "--json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == [(
+        "sample.h5",
+        {
+            "poni_path": "geom.poni",
+            "mask_path": "mask.npy",
+            "image_dataset": "entry/data/data",
+            "image_frame_index": 3,
+            "mask_dataset": None,
+            "mask_frame_index": None,
+            "nominal_draw_axis_deg": 88.5,
+        },
+    )]
+    assert payload["schema_version"] == "wingsaxs.advise.v1"
+    assert payload["agent"]["scientific_acceptance"] is False
+    assert out_json.is_file()
+    json.dumps(payload, allow_nan=False, ensure_ascii=True)
+
+    # Existing output refuses overwrite without --force.
+    assert main(["advise", "--image", "sample.h5", "--output", str(out_json)]) == 2
+    err = json.loads(capsys.readouterr().out)
+    assert err["error"]["code"] == "output_exists"
+
+
+def test_cli_campaign_command_forwards_flags_and_preserves_exit_code(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    import butterfly_saxs.cli as cli_module
+
+    calls = []
+
+    def fake_run(config_path, output_root, **kwargs):
+        calls.append((config_path, output_root, kwargs))
+        return {
+            "schema_version": "wingsaxs.campaign_run.v1",
+            "status": "partial_failure",
+            "exit_code": 1,
+            "n_samples": 2,
+            "n_success": 1,
+            "n_warning": 0,
+            "n_failed": 1,
+            "n_skipped": 0,
+            "samples": [],
+        }
+
+    monkeypatch.setattr(cli_module, "run_campaign", fake_run)
+    assert main([
+        "campaign",
+        "--config", str(tmp_path / "camp.toml"),
+        "--output", str(tmp_path / "out"),
+        "--force",
+        "--json",
+    ]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == "wingsaxs.campaign_run.v1"
+    assert payload["n_failed"] == 1
+    assert calls[0][0] == str(tmp_path / "camp.toml")
+    assert calls[0][1] == str(tmp_path / "out")
+    assert calls[0][2]["force"] is True
+    assert calls[0][2]["continue_on_error"] is True
+    json.dumps(payload, allow_nan=False, ensure_ascii=True)
+
+
+def test_cli_preset_on_analyze_and_batch_preserves_legacy_when_omitted(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    import numpy as np
+    import butterfly_saxs.cli as cli_module
+
+    seen_configs = []
+
+    class DummyResult:
+        def to_mapping(self):
+            return {"ellipse_fit": {"status": "ok", "success": True}}
+
+    def fake_analyze(*args, **kwargs):
+        seen_configs.append(kwargs.get("config"))
+        return DummyResult()
+
+    monkeypatch.setattr(cli_module, "analyze_frame", fake_analyze)
+
+    # Omitting --preset preserves None config (100% legacy).
+    assert main(["analyze", "frame.npy"]) == 0
+    capsys.readouterr()
+    assert seen_configs[-1] is None
+
+    # --preset annular populates workflow preset; explicit CLI flags override it.
+    assert main(["analyze", "frame.npy", "--preset", "annular", "--butterfly-resamples", "8"]) == 0
+    capsys.readouterr()
+    cfg = seen_configs[-1]
+    assert cfg is not None
+    assert cfg.analysis["ridge_method"] == "butterfly_curvature"
+    assert cfg.analysis["butterfly"]["trace_method"] == "annular_peak"
+    assert cfg.analysis["butterfly"]["resamples"] == 8
+
+    # Batch also supports --preset.
+    src = tmp_path / "f1.npy"
+    np.save(src, np.ones((8, 8), dtype=float))
+    seen_configs.clear()
+    monkeypatch.setattr(
+        cli_module,
+        "analyze_frame",
+        lambda *a, **kw: seen_configs.append(kw.get("config"))
+        or {"parameters": {"axis_ratio": 0.4}, "image": np.ones((8, 8))},
+    )
+    assert main(["batch", str(src), "-o", str(tmp_path / "batch_out"), "--preset", "sector"]) == 0
+    capsys.readouterr()
+    batch_cfg = seen_configs[-1]
+    assert batch_cfg.analysis["ridge_method"] == "butterfly_curvature"
+    assert batch_cfg.analysis["butterfly"]["trace_method"] == "radial_sector"
+
+
+def test_cli_inspect_recommend_supports_native_and_fallback(monkeypatch, capsys) -> None:
+    import butterfly_saxs.cli as cli_module
+
+    # Case 1: inspect_frame natively supports recommend=True.
+    native_calls = []
+
+    def native_inspect(source, *, recommend=False, nominal_draw_axis_deg=90.0, **kwargs):
+        native_calls.append((source, recommend, nominal_draw_axis_deg))
+        return {
+            "shape": [8, 8],
+            "q_unit": "pixel-q",
+            "advisor": {"recommended_workflow": "annular"},
+        }
+
+    monkeypatch.setattr(cli_module, "inspect_frame", native_inspect)
+    assert main(["inspect", "frame.npy", "--recommend", "--nominal-draw-axis-deg", "85"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert native_calls == [("frame.npy", True, 85.0)]
+    assert report["advisor"]["recommended_workflow"] == "annular"
+
+    # Case 2: legacy inspect_frame without recommend parameter falls back to advise_frame.
+    def legacy_inspect(source, *, poni=None, config=None, frame=None, dataset=None,
+                       mask=None, mask_frame=None, mask_dataset=None, valid_mask=None):
+        del poni, config, frame, dataset, mask, mask_frame, mask_dataset, valid_mask
+        return {"shape": [8, 8], "q_unit": "pixel-q"}
+
+    monkeypatch.setattr(cli_module, "inspect_frame", legacy_inspect)
+    monkeypatch.setattr(
+        cli_module,
+        "advise_frame",
+        lambda image_path, **kw: {"source": image_path, "recommended_workflow": "curvature"},
+    )
+    assert main(["inspect", "frame.npy", "--recommend"]) == 0
+    report2 = json.loads(capsys.readouterr().out)
+    assert report2["advisor"]["recommended_workflow"] == "curvature"
+
+
+def test_cli_report_journal_style_forwards_non_default_and_preserves_default(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    import sys
+    from types import ModuleType
+    import butterfly_saxs.cli as cli_module
+
+    calls = []
+    fake_report_mod = ModuleType("butterfly_saxs.report")
+
+    def fake_build(output_dir, **kwargs):
+        calls.append((output_dir, kwargs))
+        return {"schema_version": "wingsaxs.analysis_report.v1", "exit_code": 0}
+
+    fake_report_mod.build_analysis_report = fake_build
+    monkeypatch.setitem(sys.modules, "butterfly_saxs.report", fake_report_mod)
+
+    # Default omits journal_style for backward compatibility.
+    assert main(["report", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert "journal_style" not in calls[-1][1]
+
+    # Explicit non-default style is forwarded cleanly.
+    assert main(["report", str(tmp_path), "--journal-style", "nature"]) == 0
+    capsys.readouterr()
+    assert calls[-1][1]["journal_style"] == "nature"
+

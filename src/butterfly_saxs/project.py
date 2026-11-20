@@ -250,6 +250,7 @@ class ProjectConfig:
             "ellipse_angle_deg", "ridge_snr_threshold", "ridge_min_peak_fraction",
             "ellipse_fixed_a", "ellipse_fixed_axis_ratio", "ridge_min_coverage",
             "full2d_multistart", "series", "start", "stop", "stride", "frame_range",
+            "preset",
         ):
             if key in merged:
                 analysis[key] = merged.pop(key)
@@ -484,9 +485,39 @@ def save_project_config(
     return save_project(config, path, force=force)
 
 
+def apply_workflow_preset(
+    config: ProjectConfig | None,
+    preset: str | None,
+) -> ProjectConfig | None:
+    """Apply a named workflow preset as defaults underneath explicit settings.
+
+    Returns ``config`` untouched when ``preset`` is ``None``.
+    """
+
+    if preset is None:
+        return config
+    from .campaign import workflow_preset_analysis
+    from .settings import deep_merge_mapping
+
+    preset_analysis = workflow_preset_analysis(preset)
+    if config is None:
+        return ProjectConfig(analysis=preset_analysis)
+    return ProjectConfig(
+        input_paths=config.input_paths,
+        poni_path=config.poni_path,
+        output_dir=config.output_dir,
+        q_unit=config.q_unit,
+        full2d=config.full2d,
+        analysis=deep_merge_mapping(preset_analysis, config.analysis),
+        export=config.export,
+        metadata=config.metadata,
+    )
+
+
 __all__ = [
     "ProjectConfig",
     "ProjectConfigError",
+    "apply_workflow_preset",
     "load_project",
     "save_project",
     "write_project",

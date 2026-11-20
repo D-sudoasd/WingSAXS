@@ -12,8 +12,10 @@ from dataclasses import dataclass
 import math
 from typing import Any
 
+from .. import butterfly_quality as _butterfly_quality
 from ..butterfly_quality import classify_ellipse_publication
 from ..settings import canonical_q_unit
+from .i18n import translate
 from .qt_compat import QT_AVAILABLE, QtWidgets, require_qt
 
 
@@ -312,6 +314,90 @@ def _format_value(value: float | None) -> str:
     return f"{value:.6g}"
 
 
+def _normalise_remediation_items(raw: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return ()
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        flag = str(entry.get("flag") or "").strip()
+        summary_en = str(entry.get("summary_en") or "").strip()
+        summary_zh = str(entry.get("summary_zh") or "").strip()
+        action = str(entry.get("recommended_action") or "").strip()
+        if not (flag or summary_en or summary_zh or action):
+            continue
+        dedupe_key = (flag, summary_en, summary_zh)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        params = entry.get("suggested_parameters")
+        suggested_parameters = dict(params) if isinstance(params, Mapping) else {}
+        items.append(
+            {
+                "flag": flag,
+                "severity": str(entry.get("severity") or "info").strip(),
+                "summary_en": summary_en,
+                "summary_zh": summary_zh,
+                "recommended_action": action,
+                "suggested_parameters": suggested_parameters,
+            }
+        )
+    return tuple(items)
+
+
+def _extract_remediation(
+    payload: Mapping[str, Any],
+    quality: Mapping[str, Any],
+    flags: Sequence[str],
+) -> tuple[dict[str, Any], ...]:
+    """Read structured remediation items from payload or build them lazily."""
+
+    for source in (quality, payload):
+        items = _normalise_remediation_items(source.get("remediation"))
+        if items:
+            return items
+    if not flags:
+        return ()
+    builder = getattr(_butterfly_quality, "build_quality_remediation", None)
+    if not callable(builder):
+        return ()
+    metrics = quality.get("metrics")
+    metrics_arg = metrics if isinstance(metrics, Mapping) else None
+    try:
+        built = builder(list(flags), metrics=metrics_arg)
+    except TypeError:
+        try:
+            built = builder(list(flags))
+        except Exception:  # pragma: no cover - defensive fallback
+            return ()
+    except Exception:  # pragma: no cover - defensive fallback
+        return ()
+    return _normalise_remediation_items(built)
+
+
+def _format_remediation_item(item: Mapping[str, Any], *, english: bool) -> str:
+    summary = str(item.get("summary_en" if english else "summary_zh") or "").strip()
+    if not summary:
+        summary = str(item.get("summary_zh" if english else "summary_en") or "").strip()
+    if not summary:
+        summary = str(item.get("recommended_action") or item.get("flag") or "").strip()
+    params = item.get("suggested_parameters")
+    if isinstance(params, Mapping) and params:
+        formatted_params = ", ".join(
+            f"{key}={value}"
+            for key, value in params.items()
+            if value is not None and str(value) != ""
+        )
+        if formatted_params:
+            if english:
+                summary = f"{summary} ({formatted_params})"
+            else:
+                summary = f"{summary}（{formatted_params}）"
+    return summary
+
+
 @dataclass(frozen=True)
 class ButterflyQualitySummaryState:
     """Language-neutral state rendered by :class:`ButterflyQualitySummary`."""
@@ -328,6 +414,7 @@ class ButterflyQualitySummaryState:
     next_step_key: str
     scientific_acceptance: bool = False
     trace_method: str = "curvature"
+    remediation: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -344,10 +431,21 @@ class ButterflyQualitySummaryState:
             "next_step_key": self.next_step_key,
             "scientific_acceptance": self.scientific_acceptance,
             "trace_method": self.trace_method,
+            "remediation": [dict(item) for item in self.remediation],
         }
 
     def reasons_text(self, *, english: bool = False) -> str:
         return "；".join(_reason_text(code, english=english) for code in self.reasons)
+
+    def remediation_text(self, *, english: bool = False, limit: int | None = None) -> str:
+        items = self.remediation if limit is None else self.remediation[:limit]
+        parts = [
+            text
+            for item in items
+            if (text := _format_remediation_item(item, english=english))
+        ]
+        separator = "; " if english else "；"
+        return separator.join(parts)
 
 
 def build_butterfly_quality_summary(
@@ -552,8 +650,10 @@ def build_butterfly_quality_summary(
         q_star = None
         l_ring = None
         side_support = "—"
+        remediation: tuple[dict[str, Any], ...] = ()
     else:
         side_support = _side_support(effective_payload)
+        remediation = _extract_remediation(effective_payload, quality, flags)
 
     return ButterflyQualitySummaryState(
         status_key=status_key,
@@ -567,6 +667,7 @@ def build_butterfly_quality_summary(
         reasons=tuple(reasons),
         next_step_key=next_step_key,
         trace_method=resolved_trace_method,
+        remediation=remediation,
     )
 
 
@@ -676,6 +777,17 @@ if QT_AVAILABLE:
             )
             bottom.addWidget(self.next_label, 1)
             outer.addLayout(bottom)
+
+            self.remediation_label = QtWidgets.QLabel(self)
+            self.remediation_label.setObjectName("butterflySummaryRemediation")
+            self.remediation_label.setWordWrap(True)
+            self.remediation_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
+            self.remediation_label.setVisible(False)
+            outer.addWidget(self.remediation_label)
+
             self.setAccessibleName("Butterfly quality summary")
             self._render()
 
@@ -800,6 +912,18 @@ if QT_AVAILABLE:
             )
             self.reason_label.setToolTip(reason_text or ("—"))
             self.next_label.setToolTip(next_pair[1 if english else 0])
+            remediation_short = state.remediation_text(english=english, limit=3)
+            remediation_full = state.remediation_text(english=english)
+            lang_code = "en" if english else "zh_CN"
+            if remediation_short:
+                prefix = translate(lang_code, "summary.remediation_prefix")
+                self.remediation_label.setText(prefix + remediation_short)
+                self.remediation_label.setToolTip(prefix + remediation_full)
+                self.remediation_label.setVisible(True)
+            else:
+                self.remediation_label.clear()
+                self.remediation_label.setToolTip("")
+                self.remediation_label.setVisible(False)
             self.scientific_label.setText(
                 "Scientific acceptance: not inferred"
                 if english
@@ -845,21 +969,20 @@ if QT_AVAILABLE:
             self.layout().invalidate()
             self.layout().activate()
             self.updateGeometry()
-            self.setAccessibleDescription(
-                " | ".join(
-                    (
-                        status_text,
-                        engineering_text,
-                        side_text,
-                        self.q_star_label.text(),
-                        self.l_ring_label.text(),
-                        self.unit_label.text(),
-                        self.reason_label.text(),
-                        self.next_label.text(),
-                        self.scientific_label.text(),
-                    )
-                )
-            )
+            description_parts = [
+                status_text,
+                engineering_text,
+                side_text,
+                self.q_star_label.text(),
+                self.l_ring_label.text(),
+                self.unit_label.text(),
+                self.reason_label.text(),
+                self.next_label.text(),
+            ]
+            if self.remediation_label.isVisible() and self.remediation_label.text():
+                description_parts.append(self.remediation_label.text())
+            description_parts.append(self.scientific_label.text())
+            self.setAccessibleDescription(" | ".join(description_parts))
 
         @staticmethod
         def _ensure_label_width(label: Any) -> None:
@@ -915,8 +1038,15 @@ if QT_AVAILABLE:
                     QtWidgets.QSizePolicy.Policy.Preferred,
                 )
             self._metrics_layout.setSpacing(6 if compact else 12)
-            self.setMinimumHeight(70 if compact else 62)
-            self.setMaximumHeight(96 if compact else 88)
+            has_remediation = bool(
+                hasattr(self, "remediation_label") and self.remediation_label.isVisible()
+            )
+            if has_remediation:
+                self.setMinimumHeight(86 if compact else 78)
+                self.setMaximumHeight(140 if compact else 128)
+            else:
+                self.setMinimumHeight(70 if compact else 62)
+                self.setMaximumHeight(96 if compact else 88)
 
 else:
 

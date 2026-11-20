@@ -14,11 +14,19 @@ from pathlib import Path
 from typing import Any
 
 from .butterfly_figure_export import new_figure_export_target
+from .i18n import translate
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 
 
 _WIDTHS_MM = (89.0, 183.0)
 _DPIS = (300, 600, 1200)
+_JOURNAL_STYLES = (
+    "default",
+    "nature",
+    "nature_comm",
+    "science",
+    "macromolecules",
+)
 
 
 def _figure_height_mm(width_mm: float) -> float:
@@ -192,10 +200,12 @@ if QT_AVAILABLE:
                 )
             width_mm = float(self.width_combo.currentData())
             dpi = int(self.dpi_combo.currentData())
+            journal_style = str(self.journal_style_combo.currentData() or "default")
             return {
                 "parent": parent,
                 "width_mm": width_mm,
                 "dpi": dpi,
+                "journal_style": journal_style,
             }
 
         def set_language(self, language: str) -> None:
@@ -236,6 +246,7 @@ if QT_AVAILABLE:
                 self.browse_button,
                 self.width_combo,
                 self.dpi_combo,
+                self.journal_style_combo,
                 self.start_button,
             ):
                 widget.setEnabled(not self._running)
@@ -388,6 +399,16 @@ if QT_AVAILABLE:
             self._dpi_label = QtWidgets.QLabel(content)
             self._dpi_label.setBuddy(self.dpi_combo)
             self.form.addRow(self._dpi_label, self.dpi_combo)
+
+            self.journal_style_combo = QtWidgets.QComboBox(content)
+            self.journal_style_combo.setObjectName("figureExportJournalStyleCombo")
+            for style_key in _JOURNAL_STYLES:
+                self.journal_style_combo.addItem("", style_key)
+            self.journal_style_combo.setCurrentIndex(0)
+            self.journal_style_combo.currentIndexChanged.connect(self._controls_changed)
+            self._journal_style_label = QtWidgets.QLabel(content)
+            self._journal_style_label.setBuddy(self.journal_style_combo)
+            self.form.addRow(self._journal_style_label, self.journal_style_combo)
 
             self.size_label = QtWidgets.QLabel(content)
             self.size_label.setObjectName("figureExportSizeLabel")
@@ -697,6 +718,13 @@ if QT_AVAILABLE:
             )
             for index, dpi in enumerate(_DPIS):
                 self.dpi_combo.setItemText(index, f"{dpi} dpi")
+            lang_code = "en" if english else "zh_CN"
+            self._journal_style_label.setText(translate(lang_code, "label.journal_style"))
+            for index, style_key in enumerate(_JOURNAL_STYLES):
+                self.journal_style_combo.setItemText(
+                    index,
+                    translate(lang_code, f"journal_style.{style_key}"),
+                )
             self._preview_caption.setText(
                 "Static paper-ratio cue only; this is not a rendered preview."
                 if english
@@ -765,6 +793,20 @@ if QT_AVAILABLE:
 
             apply_help(self, self._language)
 
+            style_help = translate(lang_code, "tooltip.figure_export_journal_style")
+            for widget in (self.journal_style_combo, self._journal_style_label):
+                widget.setToolTip(style_help)
+                widget.setWhatsThis(style_help)
+                widget.setAccessibleDescription(style_help)
+            for index, style_key in enumerate(_JOURNAL_STYLES):
+                item_help = translate(lang_code, f"tooltip.journal_style.{style_key}")
+                self.journal_style_combo.setItemData(
+                    index, item_help, QtCore.Qt.ItemDataRole.ToolTipRole
+                )
+                self.journal_style_combo.setItemData(
+                    index, item_help, QtCore.Qt.ItemDataRole.WhatsThisRole
+                )
+
         def _q_unit_display(self) -> str:
             unit = self._q_unit.strip() or "unknown"
             if unit.lower() in {"unknown", "pixel-q", "pixel_q", "pixel", "px"}:
@@ -809,6 +851,7 @@ else:
 __all__ = [
     "FigureExportDialog",
     "_DPIS",
+    "_JOURNAL_STYLES",
     "_WIDTHS_MM",
     "_figure_height_mm",
     "_pixel_size",
