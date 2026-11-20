@@ -19,6 +19,21 @@ from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
+from .journal_style import (
+    JournalPreset,
+    format_axis_label,
+    format_math_unit,
+    get_journal_preset,
+    get_residual_colormap,
+    get_saxs_colormap,
+    journal_rc_context,
+    make_saxs_norm,
+    mm_to_inches,
+    style_1d_axes,
+    style_2d_axes,
+    style_panel_label,
+)
+
 
 _BLUE = "#0072B2"
 _ORANGE = "#D55E00"
@@ -26,6 +41,39 @@ _GREEN = "#009E73"
 _PURPLE = "#CC79A7"
 _GRAY = "#666666"
 _MISSING = "#E5E7EB"
+
+_DEGENERATE_ZERO_PARAMETERS: frozenset[str] = frozenset({
+    "cx",
+    "cy",
+    "center_x",
+    "center_y",
+    "center_qx",
+    "center_qy",
+    "x0",
+    "y0",
+    "fixed_center",
+    "negative_fraction",
+})
+
+
+def _resolve_preset(journal_style: str | JournalPreset | None) -> JournalPreset | None:
+    if journal_style is None:
+        return None
+    return get_journal_preset(journal_style)
+
+
+def _is_degenerate_constant_parameter(name: str, rows: Sequence[Mapping[str, Any]]) -> bool:
+    """Return True for fixed-center / degenerate flat-zero diagnostic parameters."""
+    key = str(name or "").strip().lower()
+    values = [_parameter_row_value(row)[0] for row in rows]
+    finite = np.asarray([v for v in values if np.isfinite(v)], dtype=float)
+    if not finite.size:
+        return True
+    if key in _DEGENERATE_ZERO_PARAMETERS:
+        return bool(np.all(np.abs(finite) <= 1e-12))
+    if key == "coverage" and finite.size >= 2:
+        return bool(np.all(np.abs(finite - 1.0) <= 1e-12))
+    return False
 
 
 def _float(value: Any) -> float:
@@ -191,24 +239,33 @@ def _save(
     dpi: int,
     *,
     description: str,
+    preset: JournalPreset | None = None,
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     title = figure._suptitle.get_text() if figure._suptitle is not None else stem
     paths: dict[str, Path] = {}
-    for fmt in formats:
-        path = output_dir / f"{stem}.{fmt}"
-        if fmt == "png":
-            metadata = {"Title": title, "Description": description, "Software": "butterfly_saxs"}
-            figure.savefig(path, format=fmt, dpi=dpi, bbox_inches="tight", facecolor="white", metadata=metadata)
-        elif fmt == "tiff":
-            figure.savefig(path, format=fmt, dpi=dpi, bbox_inches="tight", facecolor="white")
-        elif fmt == "svg":
-            metadata = {"Title": title, "Description": description, "Creator": "butterfly_saxs"}
-            figure.savefig(path, format=fmt, bbox_inches="tight", facecolor="white", metadata=metadata)
-        else:
-            metadata = {"Title": title, "Subject": description, "Creator": "butterfly_saxs"}
-            figure.savefig(path, format=fmt, bbox_inches="tight", facecolor="white", metadata=metadata)
-        paths[f"{stem}.{fmt}"] = path
+
+    def _write_all() -> None:
+        for fmt in formats:
+            path = output_dir / f"{stem}.{fmt}"
+            if fmt == "png":
+                metadata = {"Title": title, "Description": description, "Software": "butterfly_saxs"}
+                figure.savefig(path, format=fmt, dpi=dpi, bbox_inches="tight", facecolor="white", metadata=metadata)
+            elif fmt == "tiff":
+                figure.savefig(path, format=fmt, dpi=dpi, bbox_inches="tight", facecolor="white")
+            elif fmt == "svg":
+                metadata = {"Title": title, "Description": description, "Creator": "butterfly_saxs"}
+                figure.savefig(path, format=fmt, bbox_inches="tight", facecolor="white", metadata=metadata)
+            else:
+                metadata = {"Title": title, "Subject": description, "Creator": "butterfly_saxs"}
+                figure.savefig(path, format=fmt, bbox_inches="tight", facecolor="white", metadata=metadata)
+            paths[f"{stem}.{fmt}"] = path
+
+    if preset is not None:
+        with journal_rc_context(preset):
+            _write_all()
+    else:
+        _write_all()
     return paths
 
 
@@ -231,8 +288,17 @@ def _attach_agg(figure: Figure) -> Figure:
     return figure
 
 
-def _masked_mesh(ax: Any, x: np.ndarray, y: np.ndarray, values: np.ndarray, *, cmap: str, norm: Normalize) -> Any:
-    color_map = matplotlib.colormaps[cmap].with_extremes(bad=_MISSING)
+def _masked_mesh(
+    ax: Any,
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    *,
+    cmap: str,
+    norm: Normalize,
+    bad_color: str = _MISSING,
+) -> Any:
+    color_map = matplotlib.colormaps[cmap].with_extremes(bad=bad_color)
     return ax.pcolormesh(
         x,
         y,
@@ -325,6 +391,8 @@ def _frame_overview(
     measurement: Mapping[str, Any],
     fit_record: Mapping[str, Any] | None,
     title: str,
+    *,
+    preset: JournalPreset | None = None,
 ) -> Figure:
     summary = measurement.get("summary", {})
     summary = summary if isinstance(summary, Mapping) else {}
@@ -333,57 +401,115 @@ def _frame_overview(
     polar = measurement.get("polar", {})
     polar = polar if isinstance(polar, Mapping) else {}
 
-    fig = _attach_agg(Figure(figsize=(12.2, 7.4), dpi=160, layout="constrained", facecolor="white"))
-    grid = fig.add_gridspec(2, 3, width_ratios=(1.12, 1.0, 1.0), height_ratios=(1, 1))
-    ax_q = fig.add_subplot(grid[:, 0])
-    ax_radial = fig.add_subplot(grid[0, 1])
-    ax_angular = fig.add_subplot(grid[1, 1])
-    ax_polar = fig.add_subplot(grid[0, 2], projection="polar")
-    ax_coverage = fig.add_subplot(grid[1, 2], projection="polar")
+    def _build() -> Figure:
+        if preset is not None:
+            figsize = (mm_to_inches(preset.double_col_mm), mm_to_inches(112.0))
+            fig_dpi = preset.dpi
+            cmap_name = preset.saxs_cmap
+            bad_color = preset.mask_color
+        else:
+            figsize = (12.2, 7.4)
+            fig_dpi = 160
+            cmap_name = "cividis"
+            bad_color = _MISSING
 
-    show = np.where(np.isfinite(image), image, np.nan)
-    norm, norm_label = _intensity_norm(show)
-    color = _masked_mesh(ax_q, qx, qy, show, cmap="cividis", norm=norm)
-    ax_q.set_aspect("equal", adjustable="box")
-    xlabel, ylabel = _q_xy_labels(q_unit)
-    ax_q.set_xlabel(xlabel)
-    ax_q.set_ylabel(ylabel)
-    ax_q.set_title("Observed intensity")
-    fig.colorbar(color, ax=ax_q, shrink=0.78, pad=0.02, label="Intensity (input units)")
-    points = _ridge_xy(measurement, fit_record)
-    if points is not None and len(points):
-        ax_q.scatter(points[:, 0], points[:, 1], s=11, facecolors="none", edgecolors="#F0E442", linewidths=0.75, label="Measured ridge")
-        # Auto placement converts every QuadMesh cell to a Path just to test
-        # legend collisions. Keep the single ridge key in a fixed corner;
-        # detector pixels remain on the original rasterized q mesh.
-        ax_q.legend(frameon=False, fontsize=7, loc="upper right")
+        fig = _attach_agg(Figure(figsize=figsize, dpi=fig_dpi, layout="constrained", facecolor="white"))
+        grid = fig.add_gridspec(2, 3, width_ratios=(1.12, 1.0, 1.0), height_ratios=(1, 1))
+        ax_q = fig.add_subplot(grid[:, 0])
+        ax_radial = fig.add_subplot(grid[0, 1])
+        ax_angular = fig.add_subplot(grid[1, 1])
+        ax_polar = fig.add_subplot(grid[0, 2], projection="polar")
+        ax_coverage = fig.add_subplot(grid[1, 2], projection="polar")
 
-    _plot_radial(ax_radial, radial, q_unit)
-    _plot_angular(ax_angular, angular)
-    polar_note = _plot_polar(ax_polar, ax_coverage, polar)
+        show = np.where(np.isfinite(image), image, np.nan)
+        if preset is not None:
+            norm = make_saxs_norm(show, mode="asinh")
+            norm_label = "asinh color scale; upper values clipped at the 99.5th percentile"
+            color = ax_q.pcolormesh(
+                qx,
+                qy,
+                np.ma.masked_invalid(show),
+                shading="auto",
+                cmap=get_saxs_colormap(cmap_name, preset=preset, mask_color=bad_color),
+                norm=norm,
+                rasterized=True,
+            )
+            ax_q.set_facecolor(bad_color)
+            style_2d_axes(ax_q, preset=preset, equal_aspect=True)
+            xlabel = format_axis_label(r"$q_x$", q_unit)
+            ylabel = format_axis_label(r"$q_y$", q_unit)
+        else:
+            norm, norm_label = _intensity_norm(show)
+            color = _masked_mesh(ax_q, qx, qy, show, cmap=cmap_name, norm=norm, bad_color=bad_color)
+            ax_q.set_aspect("equal", adjustable="box")
+            xlabel, ylabel = _q_xy_labels(q_unit)
+        ax_q.set_xlabel(xlabel)
+        ax_q.set_ylabel(ylabel)
+        ax_q.set_title("Observed intensity")
+        fig.colorbar(color, ax=ax_q, shrink=0.78, pad=0.02, label="Intensity (input units)")
+        points = _ridge_xy(measurement, fit_record)
+        if points is not None and len(points):
+            ax_q.scatter(points[:, 0], points[:, 1], s=11, facecolors="none", edgecolors="#F0E442", linewidths=0.75, label="Measured ridge")
+            # Auto placement converts every QuadMesh cell to a Path just to test
+            # legend collisions. Keep the single ridge key in a fixed corner;
+            # detector pixels remain on the original rasterized q mesh.
+            if preset is not None:
+                leg = ax_q.legend(
+                    frameon=True,
+                    facecolor="#FFFFFF",
+                    framealpha=0.92,
+                    edgecolor="#CCCCCC",
+                    fontsize=preset.legend_fontsize,
+                    loc="upper right",
+                )
+                for txt in leg.get_texts():
+                    txt.set_color("#111111")
+            else:
+                ax_q.legend(frameon=False, fontsize=7, loc="upper right")
 
-    frame_index = summary.get("frame_index")
-    status = str(summary.get("status", "")).strip()
-    subtitle = []
-    if frame_index is not None:
-        subtitle.append(f"Frame {frame_index}")
-    time_value, time_unit = _time_parts(summary)
-    if np.isfinite(time_value):
-        subtitle.append(f"t = {time_value:g} {time_unit or 'unit unspecified'}")
-    if status:
-        subtitle.append(status.replace("_", " "))
-    heading = title.strip() or "Frame measurement report"
-    if subtitle:
-        heading += "  |  " + " · ".join(subtitle)
-    fig.suptitle(heading, fontsize=12, fontweight="semibold")
-    notes = [f"Image map: {_normalization_note(norm_label)}"]
-    if polar_note:
-        notes.append(polar_note)
-    if _has_descriptive_sem(radial):
-        notes.append("Radial band: descriptive within-bin SEM, not fit uncertainty.")
-    fig.text(0.5, 0.012, " · ".join(notes), ha="center", va="bottom", fontsize=7, color=_GRAY)
-    _reserve_figure_footer(fig, bottom=0.055, top=0.94)
-    return fig
+        _plot_radial(ax_radial, radial, q_unit, preset=preset)
+        _plot_angular(ax_angular, angular, preset=preset)
+        polar_note = _plot_polar(ax_polar, ax_coverage, polar, preset=preset)
+
+        if preset is not None:
+            for ax_item, letter in (
+                (ax_q, "a"),
+                (ax_radial, "b"),
+                (ax_angular, "c"),
+                (ax_polar, "d"),
+                (ax_coverage, "e"),
+            ):
+                style_panel_label(ax_item, letter, preset=preset, x=-0.12, y=1.06)
+
+        frame_index = summary.get("frame_index")
+        status = str(summary.get("status", "")).strip()
+        subtitle = []
+        if frame_index is not None:
+            subtitle.append(f"Frame {frame_index}")
+        time_value, time_unit = _time_parts(summary)
+        if np.isfinite(time_value):
+            subtitle.append(f"t = {time_value:g} {time_unit or 'unit unspecified'}")
+        if status:
+            subtitle.append(status.replace("_", " "))
+        heading = title.strip() or "Frame measurement report"
+        if subtitle:
+            heading += "  |  " + " · ".join(subtitle)
+        suptitle_size = preset.panel_label_size if preset is not None else 12
+        footer_size = max(preset.tick_label_size - 0.5, 5.0) if preset is not None else 7
+        fig.suptitle(heading, fontsize=suptitle_size, fontweight="semibold")
+        notes = [f"Image map: {_normalization_note(norm_label)}"]
+        if polar_note:
+            notes.append(polar_note)
+        if _has_descriptive_sem(radial):
+            notes.append("Radial band: descriptive within-bin SEM, not fit uncertainty.")
+        fig.text(0.5, 0.012, " · ".join(notes), ha="center", va="bottom", fontsize=footer_size, color=_GRAY)
+        _reserve_figure_footer(fig, bottom=0.055, top=0.94)
+        return fig
+
+    if preset is not None:
+        with journal_rc_context(preset):
+            return _build()
+    return _build()
 
 
 def _profile_xy(rows: list[dict[str, Any]], *, coordinate: str, min_key: str, max_key: str, mean_key: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -410,38 +536,46 @@ def _profile_xy(rows: list[dict[str, Any]], *, coordinate: str, min_key: str, ma
     return np.asarray(x), np.asarray(y), np.asarray(sem), np.asarray(count)
 
 
-def _plot_radial(ax: Any, rows: list[dict[str, Any]], q_unit: str) -> None:
+def _plot_radial(ax: Any, rows: list[dict[str, Any]], q_unit: str, *, preset: JournalPreset | None = None) -> None:
     x, y, sem, count = _profile_xy(rows, coordinate="q_center", min_key="q_min", max_key="q_max", mean_key="mean")
     valid = np.isfinite(x) & np.isfinite(y)
     if np.any(valid):
-        ax.plot(x, y, color=_BLUE, lw=1.5, marker="o", ms=2.7, label="Bin mean")
+        lw = preset.line_linewidth if preset is not None else 1.5
+        ax.plot(x, y, color=_BLUE, lw=lw, marker="o", ms=2.5 if preset is not None else 2.7, label="Bin mean")
         band = valid & np.isfinite(sem)
         if np.any(band):
             ax.fill_between(x, y - sem, y + sem, where=band, color=_BLUE, alpha=0.20, linewidth=0, label="Descriptive SEM")
     else:
         ax.text(0.5, 0.5, "No finite radial bins", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
     ax.set_title("Radial mean intensity")
-    ax.set_xlabel(_q_label(q_unit))
+    ax.set_xlabel(format_axis_label(r"$q$", q_unit) if preset is not None else _q_label(q_unit))
     ax.set_ylabel("Intensity (input units)")
-    _styles(ax)
+    if preset is not None:
+        style_1d_axes(ax, preset=preset, grid=True)
+    else:
+        _styles(ax)
     if np.any(np.isfinite(sem)):
-        ax.legend(frameon=False, fontsize=7, loc="best")
+        ax.legend(frameon=False, fontsize=(preset.legend_fontsize if preset is not None else 7), loc="best")
 
 
-def _plot_angular(ax: Any, rows: list[dict[str, Any]]) -> None:
+def _plot_angular(ax: Any, rows: list[dict[str, Any]], *, preset: JournalPreset | None = None) -> None:
     x, y, _, _ = _profile_xy(rows, coordinate="angle_center_deg", min_key="angle_min_deg", max_key="angle_max_deg", mean_key="mean")
     valid = np.isfinite(x) & np.isfinite(y)
     if np.any(valid):
-        ax.plot(x, y, color=_ORANGE, lw=1.45, marker="o", ms=2.5)
+        lw = preset.line_linewidth if preset is not None else 1.45
+        ax.plot(x, y, color=_ORANGE, lw=lw, marker="o", ms=2.3 if preset is not None else 2.5)
         finite_x = x[np.isfinite(x)]
         if finite_x.size and np.min(finite_x) >= -180 and np.max(finite_x) <= 180:
             ax.set_xlim(-180, 180)
     else:
         ax.text(0.5, 0.5, "No finite angular bins", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
     ax.set_title("Angular mean intensity")
-    ax.set_xlabel("Azimuth (degree)")
+    ax.set_xlabel(format_axis_label(r"Azimuth $\chi$", "deg") if preset is not None else "Azimuth (degree)")
     ax.set_ylabel("Intensity (input units)")
-    _styles(ax)
+    if preset is not None:
+        style_1d_axes(ax, preset=preset, grid=True)
+    else:
+        _styles(ax)
 
 
 def _polar_arrays(polar: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -471,7 +605,7 @@ def _polar_arrays(polar: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, np.
     return q_edges, angle_edges, mean, coverage, count
 
 
-def _plot_polar(mean_ax: Any, coverage_ax: Any, polar: Mapping[str, Any]) -> str | None:
+def _plot_polar(mean_ax: Any, coverage_ax: Any, polar: Mapping[str, Any], *, preset: JournalPreset | None = None) -> str | None:
     if not polar:
         for ax, message in ((mean_ax, "No polar measurement"), (coverage_ax, "No coverage data")):
             ax.text(0.5, 0.5, message, transform=ax.transAxes, ha="center", va="center", color=_GRAY)
@@ -480,13 +614,18 @@ def _plot_polar(mean_ax: Any, coverage_ax: Any, polar: Mapping[str, Any]) -> str
     q_edges, angle_edges, mean, coverage, count = _polar_arrays(polar)
     theta_edges = np.deg2rad(angle_edges)
     mean_norm, mean_norm_label = _intensity_norm(mean)
-    mean_cmap = matplotlib.colormaps["cividis"].with_extremes(bad=_MISSING)
+    if preset is not None:
+        mean_cmap = get_saxs_colormap(preset.polar_cmap, preset=preset)
+        bad_color = preset.mask_color
+    else:
+        mean_cmap = matplotlib.colormaps["cividis"].with_extremes(bad=_MISSING)
+        bad_color = _MISSING
     mesh = mean_ax.pcolormesh(theta_edges, q_edges, np.ma.masked_invalid(mean), shading="auto", cmap=mean_cmap, norm=mean_norm, rasterized=True)
     mean_ax.set_theta_zero_location("E")
     mean_ax.set_theta_direction(1)
     mean_ax.set_title("Polar mean intensity", va="bottom")
     mean_ax.set_rlabel_position(24)
-    mean_ax.grid(alpha=0.24, linewidth=0.6)
+    mean_ax.grid(alpha=0.24, linewidth=0.5 if preset is not None else 0.6)
     fig = mean_ax.figure
     fig.colorbar(mesh, ax=mean_ax, shrink=0.72, pad=0.12, label="Mean intensity (input units)")
 
@@ -494,18 +633,18 @@ def _plot_polar(mean_ax: Any, coverage_ax: Any, polar: Mapping[str, Any]) -> str
     coverage_max = float(np.max(finite_coverage)) if finite_coverage.size else 1.0
     percent = coverage_max > 1.0 + 1e-8
     top = 100.0 if percent else 1.0
-    cover_cmap = matplotlib.colormaps["viridis"].with_extremes(bad=_MISSING)
+    cover_cmap = matplotlib.colormaps["viridis"].with_extremes(bad=bad_color)
     cover = coverage_ax.pcolormesh(theta_edges, q_edges, np.ma.masked_invalid(coverage), shading="auto", cmap=cover_cmap, norm=Normalize(0, top, clip=True), rasterized=True)
     coverage_ax.set_theta_zero_location("E")
     coverage_ax.set_theta_direction(1)
     coverage_ax.set_title("Observed angular coverage", va="bottom")
     coverage_ax.set_rlabel_position(24)
-    coverage_ax.grid(alpha=0.24, linewidth=0.6)
+    coverage_ax.grid(alpha=0.24, linewidth=0.5 if preset is not None else 0.6)
     coverage_label = "Coverage (%)" if percent else "Coverage (fraction)"
     fig.colorbar(cover, ax=coverage_ax, shrink=0.72, pad=0.12, label=coverage_label)
     candidate_count = _float(np.nansum(np.asarray(polar.get("candidate_count", 0), dtype=float)))
     if np.isfinite(candidate_count) and candidate_count > 0:
-        coverage_ax.text(0.5, -0.17, f"Candidates: {candidate_count:g}", transform=coverage_ax.transAxes, ha="center", va="top", fontsize=7, color=_GRAY)
+        coverage_ax.text(0.5, -0.17, f"Candidates: {candidate_count:g}", transform=coverage_ax.transAxes, ha="center", va="top", fontsize=(preset.tick_label_size if preset is not None else 7), color=_GRAY)
     return f"Polar mean: {_normalization_note(mean_norm_label)}"
 
 
@@ -519,6 +658,8 @@ def _frame_fit_figure(
     residual: Any | None,
     fit_record: Mapping[str, Any] | None,
     title: str,
+    *,
+    preset: JournalPreset | None = None,
 ) -> Figure:
     mod = np.asarray(model, dtype=float)
     if mod.shape != image.shape:
@@ -539,34 +680,59 @@ def _frame_fit_figure(
     pred = np.where(valid, mod, np.nan)
     resid = np.where(valid, residual_array, np.nan)
     safe_x, safe_y, _ = _coordinate_mesh(qx, qy, obs)
-    fig = _attach_agg(Figure(figsize=(12.4, 4.4), dpi=160, layout="constrained", facecolor="white"))
-    axes = [fig.add_subplot(1, 3, i + 1) for i in range(3)]
-    qx_label, qy_label = _q_xy_labels(q_unit)
-    norm, norm_label = _intensity_norm(np.concatenate((obs[np.isfinite(obs)], pred[np.isfinite(pred)])))
-    for ax, data, label in zip(axes[:2], (obs, pred), ("Observed intensity", "Supplied full2d model")):
-        mesh = _masked_mesh(ax, safe_x, safe_y, data, cmap="cividis", norm=norm)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel(qx_label)
-        ax.set_ylabel(qy_label)
-        ax.set_title(label)
-        fig.colorbar(mesh, ax=ax, shrink=0.80, pad=0.02, label=f"Intensity (input units); {norm_label}")
-    finite_resid = resid[np.isfinite(resid)]
-    limit = float(np.percentile(np.abs(finite_resid), 99.5)) if finite_resid.size else 1.0
-    if not np.isfinite(limit) or limit <= 0:
-        limit = 1.0
-    residual_cmap = matplotlib.colormaps["PuOr"].with_extremes(bad=_MISSING)
-    rmesh = axes[2].pcolormesh(safe_x, safe_y, np.ma.masked_invalid(resid), shading="auto", cmap=residual_cmap, norm=TwoSlopeNorm(vmin=-limit, vcenter=0, vmax=limit), rasterized=True)
-    axes[2].set_aspect("equal", adjustable="box")
-    axes[2].set_xlabel(qx_label)
-    axes[2].set_ylabel(qy_label)
-    axes[2].set_title("Residual (observed − model)")
-    fig.colorbar(rmesh, ax=axes[2], shrink=0.80, pad=0.02, label="Intensity difference (input units)")
-    heading = title.strip() or "Full2D fit diagnostic"
-    status = str((fit_record or {}).get("status", "")).strip()
-    if status:
-        heading += f"  |  {status.replace('_', ' ')}"
-    fig.suptitle(heading, fontsize=12, fontweight="semibold")
-    return fig
+
+    def _build() -> Figure:
+        figsize = (mm_to_inches(preset.double_col_mm), mm_to_inches(68.0)) if preset is not None else (12.4, 4.4)
+        fig = _attach_agg(Figure(figsize=figsize, dpi=(preset.dpi if preset is not None else 160), layout="constrained", facecolor="white"))
+        axes = [fig.add_subplot(1, 3, i + 1) for i in range(3)]
+        if preset is not None:
+            qx_label = format_axis_label(r"$q_x$", q_unit)
+            qy_label = format_axis_label(r"$q_y$", q_unit)
+            saxs_cmap_name = preset.saxs_cmap
+            bad_color = preset.mask_color
+            residual_cmap = get_residual_colormap(preset=preset)
+        else:
+            qx_label, qy_label = _q_xy_labels(q_unit)
+            saxs_cmap_name = "cividis"
+            bad_color = _MISSING
+            residual_cmap = matplotlib.colormaps["PuOr"].with_extremes(bad=_MISSING)
+        norm, norm_label = _intensity_norm(np.concatenate((obs[np.isfinite(obs)], pred[np.isfinite(pred)])))
+        for idx, (ax, data, label) in enumerate(zip(axes[:2], (obs, pred), ("Observed intensity", "Supplied full2d model"))):
+            mesh = _masked_mesh(ax, safe_x, safe_y, data, cmap=saxs_cmap_name, norm=norm, bad_color=bad_color)
+            if preset is not None:
+                style_2d_axes(ax, preset=preset, equal_aspect=True)
+                style_panel_label(ax, chr(ord("a") + idx), preset=preset)
+            else:
+                ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel(qx_label)
+            ax.set_ylabel(qy_label)
+            ax.set_title(label)
+            fig.colorbar(mesh, ax=ax, shrink=0.80, pad=0.02, label=f"Intensity (input units); {norm_label}")
+        finite_resid = resid[np.isfinite(resid)]
+        limit = float(np.percentile(np.abs(finite_resid), 99.5)) if finite_resid.size else 1.0
+        if not np.isfinite(limit) or limit <= 0:
+            limit = 1.0
+        rmesh = axes[2].pcolormesh(safe_x, safe_y, np.ma.masked_invalid(resid), shading="auto", cmap=residual_cmap, norm=TwoSlopeNorm(vmin=-limit, vcenter=0, vmax=limit), rasterized=True)
+        if preset is not None:
+            style_2d_axes(axes[2], preset=preset, equal_aspect=True)
+            style_panel_label(axes[2], "c", preset=preset)
+        else:
+            axes[2].set_aspect("equal", adjustable="box")
+        axes[2].set_xlabel(qx_label)
+        axes[2].set_ylabel(qy_label)
+        axes[2].set_title("Residual (observed − model)")
+        fig.colorbar(rmesh, ax=axes[2], shrink=0.80, pad=0.02, label="Intensity difference (input units)")
+        heading = title.strip() or "Full2D fit diagnostic"
+        status = str((fit_record or {}).get("status", "")).strip()
+        if status:
+            heading += f"  |  {status.replace('_', ' ')}"
+        fig.suptitle(heading, fontsize=(preset.panel_label_size if preset is not None else 12), fontweight="semibold")
+        return fig
+
+    if preset is not None:
+        with journal_rc_context(preset):
+            return _build()
+    return _build()
 
 
 def _record_rows(value: Any, *, id_key: str) -> list[dict[str, Any]]:
@@ -914,6 +1080,7 @@ def render_frame_report(
     title: str = "",
     formats: Sequence[str] = ("png", "svg", "pdf"),
     dpi: int = 160,
+    journal_style: str | JournalPreset | None = None,
 ) -> dict[str, Path]:
     """Render a compact frame overview and, when supplied, a full2d diagnostic.
 
@@ -926,6 +1093,7 @@ def render_frame_report(
         raise TypeError("measurement must be a mapping")
     if isinstance(dpi, bool) or int(dpi) <= 0:
         raise ValueError("dpi must be a positive integer")
+    preset = _resolve_preset(journal_style)
     fmt = _format_list(formats)
     observed, x, y, shown = _valid_image_inputs(image, qx, qy, valid_mask)
     output = Path(output_dir)
@@ -935,12 +1103,12 @@ def render_frame_report(
         suffix = f"_{int(frame_index):04d}" if frame_index is not None else ""
     except (TypeError, ValueError, OverflowError):
         suffix = ""
-    overview = _frame_overview(shown, x, y, q_unit, measurement, fit_record, title)
-    paths = _save(overview, output, f"frame{suffix}_overview", fmt, int(dpi), description="Observed q-space map, radial mean, angular mean, polar mean, and angular support coverage.")
+    overview = _frame_overview(shown, x, y, q_unit, measurement, fit_record, title, preset=preset)
+    paths = _save(overview, output, f"frame{suffix}_overview", fmt, int(dpi), description="Observed q-space map, radial mean, angular mean, polar mean, and angular support coverage.", preset=preset)
     overview.clear()
     if model is not None:
-        fit_figure = _frame_fit_figure(shown, x, y, valid_mask, q_unit, model, residual, fit_record, title)
-        paths.update(_save(fit_figure, output, f"frame{suffix}_full2d_fit", fmt, int(dpi), description="Measured intensity, supplied full2d model, and measured-minus-model residual in q space."))
+        fit_figure = _frame_fit_figure(shown, x, y, valid_mask, q_unit, model, residual, fit_record, title, preset=preset)
+        paths.update(_save(fit_figure, output, f"frame{suffix}_full2d_fit", fmt, int(dpi), description="Measured intensity, supplied full2d model, and measured-minus-model residual in q space.", preset=preset))
         fit_figure.clear()
     profiles, point_rows, arc_rows = _fit_payloads(fit_record, measurement)
     measured_profiles = [profile for profile in profiles if _has_profile_samples(profile, sample_key="raw_intensity")]
@@ -950,7 +1118,7 @@ def render_frame_report(
             stem = f"frame{suffix}_local_profiles_{page_index + 1:03d}"
             profile_figure = _local_profile_figure(page, page_index, len(pages), q_unit=q_unit, title=title)
             ids = ", ".join(str(row.get("point_id", "")) for row in page)
-            paths.update(_save(profile_figure, output, stem, fmt, int(dpi), description=f"Supplied observed local normal profiles and supplied profile fits; point IDs {ids}; complete source vectors in normal_profiles.csv and fit_details.json; no refit performed."))
+            paths.update(_save(profile_figure, output, stem, fmt, int(dpi), description=f"Supplied observed local normal profiles and supplied profile fits; point IDs {ids}; complete source vectors in normal_profiles.csv and fit_details.json; no refit performed.", preset=preset))
             profile_figure.clear()
     residual_profiles = [profile for profile in profiles if _has_profile_samples(profile, sample_key="residual")]
     if residual_profiles:
@@ -958,11 +1126,11 @@ def render_frame_report(
         for page_index, page in enumerate(residual_pages):
             residual_figure = _profile_residual_figure(page, page_index, len(residual_pages), q_unit=q_unit, title=title)
             ids = ", ".join(str(row.get("point_id", "")) for row in page)
-            paths.update(_save(residual_figure, output, f"frame{suffix}_local_profile_residuals_{page_index + 1:03d}", fmt, int(dpi), description=f"Stored observed-minus-local-fit profile residuals for point IDs {ids}; no missing residual samples are calculated or filled."))
+            paths.update(_save(residual_figure, output, f"frame{suffix}_local_profile_residuals_{page_index + 1:03d}", fmt, int(dpi), description=f"Stored observed-minus-local-fit profile residuals for point IDs {ids}; no missing residual samples are calculated or filled.", preset=preset))
             residual_figure.clear()
     if point_rows or arc_rows:
         support_figure = _fit_support_figure(point_rows, arc_rows, q_unit, title)
-        paths.update(_save(support_figure, output, f"frame{suffix}_fit_support", fmt, int(dpi), description="Recorded point residuals and localization scales with per-arc fit residual and observed-support diagnostics."))
+        paths.update(_save(support_figure, output, f"frame{suffix}_fit_support", fmt, int(dpi), description="Recorded point residuals and localization scales with per-arc fit residual and observed-support diagnostics.", preset=preset))
         support_figure.clear()
     return paths
 
@@ -1087,37 +1255,52 @@ def _profile_heatmap(
     unit: str | None,
     x_values: np.ndarray,
     x_label: str,
+    preset: JournalPreset | None = None,
 ) -> Figure:
     matrix, centers, q_edges = _intensity_matrix(profile_sets, summaries, kind=kind, unit=unit)
     y_edges = _time_edges(x_values, fallback_time=_is_time_axis(x_label))
-    fig = _attach_agg(Figure(figsize=(9.2, 4.8), dpi=160, layout="constrained", facecolor="white"))
-    ax = fig.add_subplot(1, 1, 1)
-    if matrix.size and centers.size:
-        norm, norm_label = _intensity_norm(matrix)
-        mesh = _masked_mesh(ax, q_edges, y_edges, matrix, cmap="cividis", norm=norm)
-        fig.colorbar(mesh, ax=ax, pad=0.02, label="Bin mean intensity (input units)")
-        if kind == "radial":
-            ax.set_xlabel(_q_label(unit))
-            ax.set_title("Radial mean intensity by frame")
+
+    def _build() -> Figure:
+        figsize = (mm_to_inches(preset.double_col_mm), mm_to_inches(90.0)) if preset is not None else (9.2, 4.8)
+        fig = _attach_agg(Figure(figsize=figsize, dpi=(preset.dpi if preset is not None else 160), layout="constrained", facecolor="white"))
+        ax = fig.add_subplot(1, 1, 1)
+        if matrix.size and centers.size:
+            norm, norm_label = _intensity_norm(matrix)
+            cmap_name = preset.saxs_cmap if preset is not None else "cividis"
+            bad_color = preset.mask_color if preset is not None else _MISSING
+            mesh = _masked_mesh(ax, q_edges, y_edges, matrix, cmap=cmap_name, norm=norm, bad_color=bad_color)
+            fig.colorbar(mesh, ax=ax, pad=0.02, label="Bin mean intensity (input units)")
+            if kind == "radial":
+                ax.set_xlabel(format_axis_label(r"$q$", unit) if preset is not None else _q_label(unit))
+                ax.set_title("Radial mean intensity by frame")
+            else:
+                ax.set_xlabel(format_axis_label(r"Azimuth $\chi$", "deg") if preset is not None else "Azimuth (degree)")
+                ax.set_title("Angular mean intensity by frame")
+                ax.set_xlim(-180, 180)
+            ax.set_ylabel(x_label)
+            if x_label.startswith("Frame index"):
+                ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+            if _is_time_axis(x_label) and len(x_values) > 1 and not (np.all(np.diff(x_values) > 0) or np.all(np.diff(x_values) < 0)):
+                ax.set_ylabel("Frame row (tick labels are time in s)")
+                ticks = np.arange(len(x_values), dtype=float)
+                ax.set_yticks(ticks)
+                ax.set_yticklabels([f"{value:g}" for value in x_values])
+            footer_size = max(preset.tick_label_size - 0.5, 5.0) if preset is not None else 7
+            fig.text(0.5, 0.012, _normalization_note(norm_label), ha="center", va="bottom", fontsize=footer_size, color=_GRAY)
+            _reserve_figure_footer(fig, bottom=0.065, top=0.985)
         else:
-            ax.set_xlabel("Azimuth (degree)")
-            ax.set_title("Angular mean intensity by frame")
-            ax.set_xlim(-180, 180)
-        ax.set_ylabel(x_label)
-        if x_label.startswith("Frame index"):
-            ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-        if _is_time_axis(x_label) and len(x_values) > 1 and not (np.all(np.diff(x_values) > 0) or np.all(np.diff(x_values) < 0)):
-            ax.set_ylabel("Frame row (tick labels are time in s)")
-            ticks = np.arange(len(x_values), dtype=float)
-            ax.set_yticks(ticks)
-            ax.set_yticklabels([f"{value:g}" for value in x_values])
-        fig.text(0.5, 0.012, _normalization_note(norm_label), ha="center", va="bottom", fontsize=7, color=_GRAY)
-        _reserve_figure_footer(fig, bottom=0.065, top=0.985)
-    else:
-        ax.text(0.5, 0.5, "No finite profile bins", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
-        ax.set_axis_off()
-    _styles(ax)
-    return fig
+            ax.text(0.5, 0.5, "No finite profile bins", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
+            ax.set_axis_off()
+        if preset is not None:
+            style_2d_axes(ax, preset=preset, equal_aspect=False)
+        else:
+            _styles(ax)
+        return fig
+
+    if preset is not None:
+        with journal_rc_context(preset):
+            return _build()
+    return _build()
 
 
 def _tensor_values(summary: Mapping[str, Any]) -> tuple[float, float]:
@@ -1233,7 +1416,14 @@ def _status_markers(ax: Any, x: np.ndarray, y: np.ndarray, summaries: Sequence[M
         ax.scatter(x[selected], y[selected], color=("#000000" if failed else color), marker=("x" if failed else "o"), s=24, zorder=3, label=f"{status.replace('_', ' ')}")
 
 
-def _intensity_anisotropy_figure(summaries: Sequence[Mapping[str, Any]], x: np.ndarray, x_label: str, unit: str | None) -> Figure:
+def _intensity_anisotropy_figure(
+    summaries: Sequence[Mapping[str, Any]],
+    x: np.ndarray,
+    x_label: str,
+    unit: str | None,
+    *,
+    preset: JournalPreset | None = None,
+) -> Figure:
     in_unit = np.asarray([unit is None or _canonical_q_unit(item.get("q_unit")) == unit for item in summaries])
     sum_values = np.asarray([_summary_scalar(item, "intensity_sum", "intensity_total") for item in summaries])
     mean_values = np.asarray([_summary_scalar(item, "intensity_mean", "mean_intensity", "intensity") for item in summaries])
@@ -1250,36 +1440,50 @@ def _intensity_anisotropy_figure(summaries: Sequence[Mapping[str, Any]], x: np.n
         (anisotropy, "Normalized tensor anisotropy", _ORANGE),
         (angle, "Principal tensor direction (degree)", _PURPLE),
     ]
-    fig = _attach_agg(Figure(figsize=(9.4, 6.5), dpi=160, layout="constrained", facecolor="white"))
-    axes = [fig.add_subplot(2, 2, index + 1) for index in range(4)]
-    for ax, (values, label, color) in zip(axes, series):
-        if np.any(np.isfinite(values)):
-            _status_markers(ax, x, values, summaries, color=color)
-            handles, labels = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(frameon=False, fontsize=7, loc="best")
-        else:
-            ax.text(0.5, 0.5, "Not available in summary data", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
-        ax.set_title(label)
-        ax.set_xlabel(x_label)
-        if label == "Normalized tensor anisotropy":
-            ax.set_ylabel(r"$(\lambda_{max}-\lambda_{min})/(\lambda_{max}+\lambda_{min})$")
-            ax.set_ylim(-0.03, 1.03)
-        elif label == "Principal tensor direction (degree)":
-            ax.set_ylabel("Direction from qx (degree)")
-        elif label == "Summed intensity":
-            ax.set_ylabel("Intensity sum (input units)")
-        else:
-            ax.set_ylabel("Mean intensity (input units)")
-        _styles(ax)
-    if x_label.startswith("Frame index"):
-        for ax in axes:
-            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    q_desc = f"; q unit: {unit}" if unit else ""
-    fig.suptitle(f"Intensity and in-plane tensor evolution{q_desc}", fontsize=12, fontweight="semibold")
-    fig.text(0.5, 0.012, "Tensor anisotropy is the normalized eigenvalue contrast; uncertainty is not estimated.", ha="center", va="bottom", fontsize=7, color=_GRAY)
-    _reserve_figure_footer(fig, bottom=0.06, top=0.94)
-    return fig
+
+    def _build() -> Figure:
+        figsize = (mm_to_inches(preset.double_col_mm), mm_to_inches(124.0)) if preset is not None else (9.4, 6.5)
+        fig = _attach_agg(Figure(figsize=figsize, dpi=(preset.dpi if preset is not None else 160), layout="constrained", facecolor="white"))
+        axes = [fig.add_subplot(2, 2, index + 1) for index in range(4)]
+        for idx, (ax, (values, label, color)) in enumerate(zip(axes, series)):
+            if np.any(np.isfinite(values)):
+                _status_markers(ax, x, values, summaries, color=color)
+                handles, labels = ax.get_legend_handles_labels()
+                if handles:
+                    ax.legend(frameon=False, fontsize=(preset.legend_fontsize if preset is not None else 7), loc="best")
+            else:
+                ax.text(0.5, 0.5, "Not available in summary data", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
+            ax.set_title(label)
+            ax.set_xlabel(x_label)
+            if label == "Normalized tensor anisotropy":
+                ax.set_ylabel(r"$(\lambda_{max}-\lambda_{min})/(\lambda_{max}+\lambda_{min})$")
+                ax.set_ylim(-0.03, 1.03)
+            elif label == "Principal tensor direction (degree)":
+                ax.set_ylabel("Direction from qx (degree)")
+            elif label == "Summed intensity":
+                ax.set_ylabel("Intensity sum (input units)")
+            else:
+                ax.set_ylabel("Mean intensity (input units)")
+            if preset is not None:
+                style_1d_axes(ax, preset=preset, grid=True)
+                style_panel_label(ax, chr(ord("a") + idx), preset=preset)
+            else:
+                _styles(ax)
+        if x_label.startswith("Frame index"):
+            for ax in axes:
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        unit_fmt = format_math_unit(unit) if (preset is not None and unit) else unit
+        q_desc = f"; q unit: {unit_fmt}" if unit_fmt else ""
+        fig.suptitle(f"Intensity and in-plane tensor evolution{q_desc}", fontsize=(preset.panel_label_size if preset is not None else 12), fontweight="semibold")
+        footer_size = max(preset.tick_label_size - 0.5, 5.0) if preset is not None else 7
+        fig.text(0.5, 0.012, "Tensor anisotropy is the normalized eigenvalue contrast; uncertainty is not estimated.", ha="center", va="bottom", fontsize=footer_size, color=_GRAY)
+        _reserve_figure_footer(fig, bottom=0.06, top=0.94)
+        return fig
+
+    if preset is not None:
+        with journal_rc_context(preset):
+            return _build()
+    return _build()
 
 
 def _flatten_parameter_rows(value: Any, frame_count: int) -> list[tuple[int | None, dict[str, Any]]]:
@@ -1427,6 +1631,8 @@ def _parameter_figure(
     summaries: Sequence[Mapping[str, Any]],
     x: np.ndarray,
     x_label: str,
+    *,
+    preset: JournalPreset | None = None,
 ) -> Figure:
     y = np.full(len(summaries), np.nan)
     err = np.full(len(summaries), np.nan)
@@ -1443,35 +1649,57 @@ def _parameter_figure(
         if row.get("status") is not None:
             status[index] = str(row.get("status"))
 
-    fig = _attach_agg(Figure(figsize=(7.7, 3.7), dpi=160, layout="constrained", facecolor="white"))
-    ax = fig.add_subplot(1, 1, 1)
-    finite = np.isfinite(y)
-    if np.any(finite):
-        ax.plot(x, y, color="#888888", lw=1.0, zorder=1)
-        for state in dict.fromkeys(status):
-            selected = (status == state) & finite & ~candidate_only
-            if not np.any(selected):
-                continue
-            failed = str(state).lower() in {"failed", "failure", "error", "bad_fit", "cancelled", "canceled"}
-            ax.scatter(x[selected], y[selected], color=("#000000" if failed else _BLUE), marker=("x" if failed else "o"), s=28, label=str(state).replace("_", " "), zorder=3)
-        if np.any(candidate_only & finite):
-            ax.scatter(x[candidate_only & finite], y[candidate_only & finite], facecolors="none", edgecolors=_ORANGE, marker="D", s=34, label="Candidate value only", zorder=4)
-        good_err = finite & np.isfinite(err)
-        if np.any(good_err):
-            ax.errorbar(x[good_err], y[good_err], yerr=err[good_err], fmt="none", ecolor=_GRAY, elinewidth=0.9, capsize=2, label="Reported standard error", zorder=2)
-        missing = ~finite
-        if np.any(missing):
-            ax.scatter(x[missing], np.full(np.count_nonzero(missing), 0.025), transform=ax.get_xaxis_transform(), marker="|", color=_GRAY, s=65, label="No finite estimate", zorder=3)
-        ax.legend(frameon=False, fontsize=7, loc="best")
-    else:
-        ax.text(0.5, 0.5, "No finite estimates", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
-    ax.set_title(_parameter_label(name, unit))
-    ax.set_xlabel(x_label)
-    ax.set_ylabel(_parameter_label(name, unit))
-    if x_label.startswith("Frame index"):
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    _styles(ax)
-    return fig
+    def _build() -> Figure:
+        figsize = (mm_to_inches(preset.mid_col_mm), mm_to_inches(64.0)) if preset is not None else (7.7, 3.7)
+        fig = _attach_agg(Figure(figsize=figsize, dpi=(preset.dpi if preset is not None else 160), layout="constrained", facecolor="white"))
+        ax = fig.add_subplot(1, 1, 1)
+        finite = np.isfinite(y)
+        if np.any(finite):
+            if preset is not None:
+                # Strict publication separation: estimates solid + filled; candidates dashed + hollow;
+                # failed/missing points create explicit NaN breaks and are never interpolated across.
+                est_mask = finite & ~candidate_only
+                cand_mask = finite & candidate_only
+                if np.any(est_mask):
+                    ax.plot(x, np.where(est_mask, y, np.nan), color=_BLUE, lw=preset.line_linewidth, ls="-", zorder=2)
+                if np.any(cand_mask):
+                    ax.plot(x, np.where(cand_mask, y, np.nan), color=_ORANGE, lw=max(preset.line_linewidth * 0.85, 0.7), ls="--", zorder=2)
+            else:
+                ax.plot(x, y, color="#888888", lw=1.0, zorder=1)
+            for state in dict.fromkeys(status):
+                selected = (status == state) & finite & ~candidate_only
+                if not np.any(selected):
+                    continue
+                failed = str(state).lower() in {"failed", "failure", "error", "bad_fit", "cancelled", "canceled"}
+                ax.scatter(x[selected], y[selected], color=("#000000" if failed else _BLUE), marker=("x" if failed else "o"), s=(18 if preset is not None else 28), label=str(state).replace("_", " "), zorder=3)
+            if np.any(candidate_only & finite):
+                ax.scatter(x[candidate_only & finite], y[candidate_only & finite], facecolors="white" if preset is not None else "none", edgecolors=_ORANGE, marker="D", s=(20 if preset is not None else 34), label="Candidate value only", zorder=4)
+            good_err = finite & np.isfinite(err)
+            if np.any(good_err):
+                ax.errorbar(x[good_err], y[good_err], yerr=err[good_err], fmt="none", ecolor=_GRAY, elinewidth=0.75 if preset is not None else 0.9, capsize=2, label="Reported standard error", zorder=2)
+            missing = ~finite
+            if np.any(missing):
+                ax.scatter(x[missing], np.full(np.count_nonzero(missing), 0.025), transform=ax.get_xaxis_transform(), marker="|", color=_GRAY, s=(40 if preset is not None else 65), label="No finite estimate", zorder=3)
+            ax.legend(frameon=False, fontsize=(preset.legend_fontsize if preset is not None else 7), loc="best")
+        else:
+            ax.text(0.5, 0.5, "No finite estimates", transform=ax.transAxes, ha="center", va="center", color=_GRAY)
+        display_unit = format_math_unit(unit) if preset is not None else unit
+        param_label = _parameter_label(name, display_unit)
+        ax.set_title(param_label)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(param_label)
+        if x_label.startswith("Frame index"):
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        if preset is not None:
+            style_1d_axes(ax, preset=preset, grid=True)
+        else:
+            _styles(ax)
+        return fig
+
+    if preset is not None:
+        with journal_rc_context(preset):
+            return _build()
+    return _build()
 
 
 def render_sequence_report(
@@ -1483,6 +1711,7 @@ def render_sequence_report(
     parameter_rows: Any,
     formats: Sequence[str] = ("png", "svg", "pdf"),
     dpi: int = 160,
+    journal_style: str | JournalPreset | None = None,
 ) -> dict[str, Path]:
     """Render sequence profiles, intensity/tensor trends, and long parameters.
 
@@ -1492,6 +1721,7 @@ def render_sequence_report(
 
     if isinstance(dpi, bool) or int(dpi) <= 0:
         raise ValueError("dpi must be a positive integer")
+    preset = _resolve_preset(journal_style)
     fmt = _format_list(formats)
     if any(not isinstance(row, Mapping) for row in summaries):
         raise TypeError("each summary must be a mapping")
@@ -1504,18 +1734,18 @@ def render_sequence_report(
     units = list(dict.fromkeys(_canonical_q_unit(row.get("q_unit")) for row in summary_rows))
     for unit in units:
         if _has_finite_profile_data(radial_profiles, summary_rows, kind="radial", unit=unit):
-            radial = _profile_heatmap(summary_rows, radial_profiles, kind="radial", unit=unit, x_values=x, x_label=x_label)
-            paths.update(_save(radial, output, f"sequence_radial_evolution_{_slug(unit)}", fmt, int(dpi), description=f"Observed radial mean intensity by frame; grouped by q unit {unit}; missing bins remain blank."))
+            radial = _profile_heatmap(summary_rows, radial_profiles, kind="radial", unit=unit, x_values=x, x_label=x_label, preset=preset)
+            paths.update(_save(radial, output, f"sequence_radial_evolution_{_slug(unit)}", fmt, int(dpi), description=f"Observed radial mean intensity by frame; grouped by q unit {unit}; missing bins remain blank.", preset=preset))
             radial.clear()
 
         if _has_finite_profile_data(angular_profiles, summary_rows, kind="angular", unit=unit):
-            angular = _profile_heatmap(summary_rows, angular_profiles, kind="angular", unit=unit, x_values=x, x_label=x_label)
-            paths.update(_save(angular, output, f"sequence_angular_evolution_{_slug(unit)}", fmt, int(dpi), description=f"Observed angular mean intensity by frame; grouped by q unit {unit}; missing bins remain blank."))
+            angular = _profile_heatmap(summary_rows, angular_profiles, kind="angular", unit=unit, x_values=x, x_label=x_label, preset=preset)
+            paths.update(_save(angular, output, f"sequence_angular_evolution_{_slug(unit)}", fmt, int(dpi), description=f"Observed angular mean intensity by frame; grouped by q unit {unit}; missing bins remain blank.", preset=preset))
             angular.clear()
 
         if _has_finite_intensity_summary(summary_rows, unit):
-            evolution = _intensity_anisotropy_figure(summary_rows, x, x_label, unit)
-            paths.update(_save(evolution, output, f"sequence_intensity_anisotropy_{_slug(unit)}", fmt, int(dpi), description=f"Intensity summaries and normalized in-plane tensor eigenvalue contrast by frame; grouped by q unit {unit}."))
+            evolution = _intensity_anisotropy_figure(summary_rows, x, x_label, unit, preset=preset)
+            paths.update(_save(evolution, output, f"sequence_intensity_anisotropy_{_slug(unit)}", fmt, int(dpi), description=f"Intensity summaries and normalized in-plane tensor eigenvalue contrast by frame; grouped by q unit {unit}.", preset=preset))
             evolution.clear()
 
     groups = _parameter_groups(parameter_rows, summary_rows)
@@ -1527,8 +1757,10 @@ def render_sequence_report(
             for row in rows
         ):
             continue
-        figure = _parameter_figure(name, unit, rows, summary_rows, x, x_label)
+        if preset is not None and _is_degenerate_constant_parameter(name, rows):
+            continue
+        figure = _parameter_figure(name, unit, rows, summary_rows, x, x_label, preset=preset)
         stem = f"sequence_parameter_{_slug(name)}_{_slug(unit)}"
-        paths.update(_save(figure, output, stem, fmt, int(dpi), description=f"Recorded parameter {name} ({unit}) by frame with missing values and reported standard errors."))
+        paths.update(_save(figure, output, stem, fmt, int(dpi), description=f"Recorded parameter {name} ({unit}) by frame with missing values and reported standard errors.", preset=preset))
         figure.clear()
     return paths

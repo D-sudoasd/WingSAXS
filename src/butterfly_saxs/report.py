@@ -726,9 +726,13 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                                                   "polar_arrays": (frame_folder / "polar_measurements.npz").relative_to(stage).as_posix()})
                     model = _get_array(archive, keys, "full2d__model_image", "full2d__model")
                     residual = _get_array(archive, keys, "full2d__residual_image", "full2d__residual")
+                    frame_render_kwargs: dict[str, Any] = {}
+                    if settings.get("journal_style") is not None:
+                        frame_render_kwargs["journal_style"] = settings["journal_style"]
                     figure_paths = render_frame_report(frame_folder, image=image, qx=qx, qy=qy, valid_mask=mask, q_unit=unit,
                                                        measurement=measurement, fit_record=plot_record, model=model, residual=residual,
-                                                       title=f"Frame {position}: {base['frame_id']}", formats=settings["formats"], dpi=settings["dpi"])
+                                                       title=f"Frame {position}: {base['frame_id']}", formats=settings["formats"], dpi=settings["dpi"],
+                                                       **frame_render_kwargs)
                     frame_report["figures"] = {key: path.relative_to(stage).as_posix() for key, path in figure_paths.items()}
                     frame_report["report_status"] = "completed"
                 except (ValueError, TypeError, FloatingPointError) as exc:
@@ -754,8 +758,12 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
             table.close()
         sequence_folder = stage / "sequence"
         sequence_folder.mkdir()
+        seq_render_kwargs: dict[str, Any] = {}
+        if settings.get("journal_style") is not None:
+            seq_render_kwargs["journal_style"] = settings["journal_style"]
         figures = render_sequence_report(sequence_folder, summaries=summaries, radial_profiles=radial,
-                                         angular_profiles=angular, parameter_rows=parameters, formats=settings["formats"], dpi=settings["dpi"])
+                                         angular_profiles=angular, parameter_rows=parameters, formats=settings["formats"], dpi=settings["dpi"],
+                                         **seq_render_kwargs)
         figures.update(render_lamellar_sequence_report(sequence_folder, frames=lamellar_frames,
             formats=settings["formats"], dpi=settings["dpi"]))
         summary_columns = list(dict.fromkeys(key for row in summaries for key in row)) or list(base_columns)
@@ -822,9 +830,16 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
 def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "", force: bool = False, resume: bool = False,
                                  radial_bins: int = 128, angular_bins: int = 72, formats: Sequence[str] = ("png", "svg", "pdf"),
                                  dpi: int = 180, lamellar_settings: Mapping[str, Any] | LamellarSettings | None = None,
-                                 progress: Callable[[str], Any] | None = None) -> dict[str, Any]:
+                                 progress: Callable[[str], Any] | None = None,
+                                 journal_style: str | None = None) -> dict[str, Any]:
     """Report one batch or all sample batches under a parent output directory."""
     from .lamellar_models import LamellarSettings
+
+    normalized_journal_style: str | None = None
+    if journal_style is not None:
+        from .journal_style import get_journal_preset
+
+        normalized_journal_style = get_journal_preset(journal_style).name
 
     defaults = LamellarSettings(mode="multi", period_source="ellipse").to_dict()
     if lamellar_settings is not None:
@@ -857,8 +872,10 @@ def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "
     root = Path(output_dir).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Batch output directory does not exist: {root}")
-    settings = {"radial_bins": radial_bins, "angular_bins": angular_bins, "formats": formats, "dpi": dpi,
-                "lamellar_settings": defaults}
+    settings: dict[str, Any] = {"radial_bins": radial_bins, "angular_bins": angular_bins, "formats": formats, "dpi": dpi,
+                                "lamellar_settings": defaults}
+    if normalized_journal_style is not None:
+        settings["journal_style"] = normalized_journal_style
     from .output_lock import output_lock
 
     with output_lock(root):
@@ -900,20 +917,66 @@ def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
             if not _same_contents(candidate, destination):
                 os.replace(candidate, destination)
         collection_tables[table_name] = destination.name
+
+    comparison_summary: dict[str, Any] | None = None
+    comparison_section = ""
+    if settings.get("journal_style") is not None:
+        from .comparison_report import build_comparison_report
+
+        sample_entries = []
+        for path, report in zip(summaries, reports, strict=True):
+            sample_entries.append({
+                "sample": str(path.parent.relative_to(root)),
+                "export_prefix": path.name.removesuffix("frame_summary.csv"),
+                "report_dir": str(Path(report["outputs"]["summary"]).parent),
+                "batch_dir": str(path.parent),
+            })
+        comparison_dir = root / "comparison_report"
+        comparison_summary = build_comparison_report(
+            sample_entries,
+            comparison_dir,
+            journal_style=str(settings["journal_style"]),
+            formats=settings["formats"],
+            dpi=settings["dpi"],
+        )
+        comp_html_rel = os.path.relpath(comparison_summary["outputs"]["html"], root).replace(os.sep, "/")
+        comp_ep_rel = os.path.relpath(comparison_summary["outputs"]["endpoint_summary_csv"], root).replace(os.sep, "/")
+        comp_evo_rel = os.path.relpath(comparison_summary["outputs"]["evolution_long_csv"], root).replace(os.sep, "/")
+        comparison_section = (
+            "<section><h2>Cross-Sample Comparison</h2><p>"
+            + " · ".join((
+                _link(comp_html_rel, "Open comparison report"),
+                _link(comp_ep_rel, "cross sample endpoint summary"),
+                _link(comp_evo_rel, "cross sample evolution long"),
+            ))
+            + "</p></section>"
+        )
+
     body = "".join(f'<section><h2>{html.escape(str(path.parent.relative_to(root)))}</h2><p>'
                    f'{_link(os.path.relpath(report["outputs"]["index"], root).replace(os.sep, "/"), "Open data and figures")}</p>'
                    f'<p>{report["counts"]["reported"]}/{report["counts"]["frames"]} frames reported</p></section>'
                    for path, report in zip(summaries, reports, strict=True))
     table_links = " · ".join(_link(path, label.replace("_", " ")) for label, path in collection_tables.items())
-    document = _page("WingSAXS sample reports", f'<section><h2>All samples</h2><p>{table_links}</p></section>' + body)
+    document = _page("WingSAXS sample reports", f'<section><h2>All samples</h2><p>{table_links}</p></section>' + comparison_section + body)
     if not collection.exists() or collection.read_text(encoding="utf-8") != document:
         collection.write_text(document, encoding="utf-8")
-    combined = {"schema_version": SCHEMA, "status": "ready_with_warnings" if any(report["exit_code"] for report in reports) else "ready",
+    combined_outputs = {
+        "index": str(collection),
+        "summary": str(root / "analysis_report_summary.json"),
+        **{key: str(root / value) for key, value in collection_tables.items()},
+    }
+    if comparison_summary is not None:
+        combined_outputs["comparison_index"] = comparison_summary["outputs"]["html"]
+        combined_outputs["comparison_endpoint_summary"] = comparison_summary["outputs"]["endpoint_summary_csv"]
+        combined_outputs["comparison_evolution_long"] = comparison_summary["outputs"]["evolution_long_csv"]
+    combined: dict[str, Any] = {
+            "schema_version": SCHEMA, "status": "ready_with_warnings" if any(report["exit_code"] for report in reports) else "ready",
             "operation_status": "completed", "exit_code": int(any(report["exit_code"] for report in reports)),
             "counts": {"samples": len(reports), **{key: sum(report["counts"][key] for report in reports) for key in ("frames", "reported", "incomplete", "warning_frames", "lamellar_scenes", "lamellar_incomplete")}},
             "samples": [{"sample": str(path.parent.relative_to(root)), "counts": report["counts"], "outputs": report["outputs"]} for path, report in zip(summaries, reports, strict=True)],
-            "outputs": {"index": str(collection), "summary": str(root / "analysis_report_summary.json"),
-                        **{key: str(root / value) for key, value in collection_tables.items()}}}
+            "outputs": combined_outputs}
+    if comparison_summary is not None:
+        combined["comparison_report"] = comparison_summary
     summary = root / "analysis_report_summary.json"
     text = json.dumps(combined, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     if not summary.exists() or summary.read_text(encoding="utf-8") != text:
