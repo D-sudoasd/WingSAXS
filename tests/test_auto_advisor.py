@@ -504,3 +504,70 @@ def test_bright_axis_convention_reference_vs_draw_for_equatorial_bridge_butterfl
     assert res_explicit["symmetry"]["orthogonal_flip_detected"] is False
     assert res_explicit["symmetry"]["morphology_class"] == "four_lobe_butterfly"
 
+
+def test_advise_frame_loads_poni_once_and_supports_beamstop_and_geometry_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import butterfly_saxs.geometry as geom_mod
+
+    q, chi_deg, r_px, center = _make_grid((128, 128), dq=0.01)
+    image = _make_four_lobe_butterfly(q, chi_deg, bisector_deg=90.0, half_opening_deg=34.0, q_star=0.28)
+    image[r_px <= 8.0] = 0.0
+    qx = q * np.cos(np.deg2rad(chi_deg))
+    qy = q * np.sin(np.deg2rad(chi_deg))
+
+    npz_path = tmp_path / "frame.npz"
+    np.savez(npz_path, data=image, qx=qx, qy=qy, q=q, q_unit=np.asarray("nm^-1"))
+    fake_poni = tmp_path / "fake.poni"
+    fake_poni.write_text("# dummy\n", encoding="utf-8")
+
+    class _FakeAI:
+        def qArray(self, shape: tuple[int, int]) -> np.ndarray:
+            return q
+
+        def center_array(self, shape: tuple[int, int], unit: str = "chi_rad", scale: bool = True) -> np.ndarray:
+            return np.deg2rad(chi_deg)
+
+        def getFit2D(self) -> dict[str, float]:
+            return {"centerX": center[0], "centerY": center[1]}
+
+    load_calls = 0
+    fake_ai = _FakeAI()
+
+    def _counting_load_poni(poni_arg):
+        nonlocal load_calls
+        if poni_arg is fake_ai:
+            return fake_ai
+        load_calls += 1
+        return fake_ai
+
+    monkeypatch.setattr(geom_mod, "load_poni", _counting_load_poni)
+
+    res = advise_frame(npz_path, poni_path=fake_poni, nominal_draw_axis_deg=90.0)
+    json.dumps(res, allow_nan=False)
+    assert load_calls == 1
+    assert res["beamstop"]["unmasked_beamstop"] is True
+
+    # Supplying beamstop_radius_px masks the unmasked beamstop in memory without mutating files
+    res_bs = advise_frame(npz_path, poni_path=fake_poni, beamstop_radius_px=10.0, nominal_draw_axis_deg=90.0)
+    json.dumps(res_bs, allow_nan=False)
+    assert load_calls == 2  # +1 single load for second call
+    assert res_bs["beamstop"]["unmasked_beamstop"] is False
+    assert res_bs["provenance"]["beamstop_radius_px"] == pytest.approx(10.0)
+
+    # Passing geometry_cache avoids loading PONI completely
+    geom_maps = geom_mod.GeometryMaps(
+        q_nm_inv=q,
+        chi_rad=np.deg2rad(chi_deg),
+        qx_nm_inv=qx,
+        qy_nm_inv=qy,
+        valid_mask=np.ones_like(image, dtype=bool),
+        metadata={"q_unit": "nm^-1"},
+    )
+    cache = geom_mod.build_geometry_cache(geom_maps, beamstop_radius_px=10.0, beam_center_xy=center, pixel_dq=0.01)
+    res_cached = advise_frame(npz_path, geometry_cache=cache, nominal_draw_axis_deg=90.0)
+    json.dumps(res_cached, allow_nan=False)
+    assert load_calls == 2  # zero additional PONI loads
+    assert res_cached["beamstop"]["unmasked_beamstop"] is False
+    assert res_cached["symmetry"]["morphology_class"] == "four_lobe_butterfly"
+

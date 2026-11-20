@@ -133,6 +133,13 @@ def unwrap_periodic_angles_deg(
     return unwrapped
 
 
+def _normalise_intensity_mode(intensity_mode: str) -> str:
+    mode = str(intensity_mode or "calibrated").strip().lower()
+    if mode not in {"calibrated", "raw"}:
+        raise ValueError(f"intensity_mode must be 'calibrated' or 'raw', got {intensity_mode!r}")
+    return mode
+
+
 def _validate_2d_inputs(
     image: Any,
     qx: Any,
@@ -168,11 +175,192 @@ def _validate_2d_inputs(
         inclusion = raw_mask.astype(bool, copy=False)
 
     q_mag = np.hypot(qx_arr, qy_arr)
-    geometry = np.isfinite(qx_arr) & np.isfinite(qy_arr) & np.isfinite(q_mag)
+    geometry = np.isfinite(q_mag)
     if not np.any(geometry):
         raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
     usable = geometry & inclusion & np.isfinite(img)
     return img, qx_arr, qy_arr, geometry, usable
+
+
+def _resolve_2d_context(
+    image: Any,
+    qx: Any,
+    qy: Any,
+    valid_mask: Any = None,
+    *,
+    geometry_cache: Any = None,
+    sigma: Any = None,
+    required_q_max: float | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray,
+    np.ndarray | None,
+    float | None,
+]:
+    """Validate and resolve 2D inputs, reusing ``SAXSGeometryCache`` ROI when valid.
+
+    Returns ``(img, qx, qy, q_mag_or_None, chi_deg_or_None, geom_mask_or_None, inclusion, sigma_or_None, pixel_dq_hint)``.
+    When ``geometry_cache`` is ``None`` and ``required_q_max`` is given, ``q_mag``,
+    ``chi_deg``, and ``geom_mask`` are left ``None`` so callers can pre-filter by
+    the ``|qx|, |qy| <= required_q_max`` bounding box before computing ``hypot``.
+    """
+    try:
+        img = np.asarray(image, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("image must be a numeric two-dimensional array") from exc
+    if img.ndim != 2 or img.size == 0:
+        raise ValueError("image must be a non-empty two-dimensional array")
+
+    sig_arr: np.ndarray | None = None
+    if sigma is not None:
+        try:
+            sig_arr = np.asarray(sigma, dtype=float)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("sigma must be a numeric two-dimensional array") from exc
+        if sig_arr.ndim != 2 or sig_arr.shape != img.shape:
+            raise ValueError(f"sigma shape {sig_arr.shape!r} must match image shape {img.shape!r}")
+
+    if geometry_cache is not None:
+        cache_shape = tuple(geometry_cache.shape)
+        roi_shape = tuple(geometry_cache.q_mag_roi.shape)
+        cache_q_roi_max = getattr(geometry_cache, "q_roi_max", None)
+        img_is_roi = (img.shape == roi_shape) and (roi_shape != cache_shape)
+        can_use_roi = (
+            img_is_roi
+            or cache_q_roi_max is None
+            or (required_q_max is not None and float(required_q_max) <= float(cache_q_roi_max) + 1.0e-12)
+        )
+        if can_use_roi:
+            if img.shape == cache_shape and roi_shape != cache_shape:
+                img = geometry_cache.slice_frame(img)
+                if sig_arr is not None:
+                    sig_arr = geometry_cache.slice_frame(sig_arr)
+            elif img.shape != roi_shape:
+                raise ValueError(
+                    f"image shape {img.shape!r} does not match geometry_cache shape {cache_shape!r} "
+                    f"or ROI shape {roi_shape!r}"
+                )
+            qx_arr = geometry_cache.qx_roi
+            qy_arr = geometry_cache.qy_roi
+            q_mag = geometry_cache.q_mag_roi
+            chi_deg = geometry_cache.chi_deg_roi
+            geom_mask = (
+                geometry_cache.geometry_roi_mask
+                if getattr(geometry_cache, "geometry_roi_mask", None) is not None
+                else np.isfinite(q_mag)
+            )
+            cache_valid = geometry_cache.valid_roi
+            if valid_mask is None:
+                inclusion = cache_valid
+            else:
+                raw_vm = np.asarray(valid_mask, dtype=bool)
+                if raw_vm.shape == cache_shape and roi_shape != cache_shape:
+                    raw_vm = geometry_cache.slice_frame(raw_vm)
+                elif raw_vm.shape != roi_shape:
+                    raise ValueError(
+                        f"valid_mask shape {raw_vm.shape!r} does not match geometry_cache shape"
+                    )
+                inclusion = cache_valid & raw_vm
+            return (
+                img,
+                qx_arr,
+                qy_arr,
+                q_mag,
+                chi_deg,
+                geom_mask,
+                inclusion,
+                sig_arr,
+                getattr(geometry_cache, "pixel_dq", None),
+            )
+
+        # Fallback to full geometry inside cache when requested q_window exceeds cached q_roi_max
+        if img.shape != cache_shape:
+            raise ValueError(
+                f"image shape {img.shape!r} does not match geometry_cache full shape {cache_shape!r}"
+            )
+        geom_obj = geometry_cache.geometry
+        if hasattr(geom_obj, "qx_nm_inv"):
+            qx_arr = geom_obj.qx_nm_inv
+            qy_arr = geom_obj.qy_nm_inv
+            q_mag = geom_obj.q_nm_inv
+            chi_deg = (
+                geom_obj.chi_deg
+                if geom_obj.chi_deg is not None
+                else np.mod(np.degrees(geom_obj.chi_rad), 360.0)
+            )
+        else:
+            qx_arr = np.asarray(geom_obj["qx"], dtype=float)
+            qy_arr = np.asarray(geom_obj["qy"], dtype=float)
+            q_mag = (
+                np.asarray(geom_obj["q"], dtype=float)
+                if "q" in geom_obj and geom_obj["q"] is not None
+                else np.hypot(qx_arr, qy_arr)
+            )
+            chi_deg = (
+                np.asarray(geom_obj["chi_deg"], dtype=float)
+                if "chi_deg" in geom_obj and geom_obj["chi_deg"] is not None
+                else None
+            )
+        geom_mask = np.isfinite(q_mag)
+        cache_valid = geometry_cache.valid_mask
+        if valid_mask is None:
+            inclusion = cache_valid
+        else:
+            raw_vm = np.asarray(valid_mask, dtype=bool)
+            if raw_vm.shape != cache_shape:
+                raise ValueError(
+                    f"valid_mask shape {raw_vm.shape!r} does not match image shape {cache_shape!r}"
+                )
+            inclusion = cache_valid & raw_vm
+        return (
+            img,
+            qx_arr,
+            qy_arr,
+            q_mag,
+            chi_deg,
+            geom_mask,
+            inclusion,
+            sig_arr,
+            getattr(geometry_cache, "pixel_dq", None),
+        )
+
+    if qx is None or qy is None:
+        raise ValueError("qx and qy must be supplied when image is provided without geometry_cache")
+    shape = img.shape
+    try:
+        qx_arr = np.asarray(qx, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("qx must be a numeric two-dimensional array") from exc
+    if qx_arr.ndim != 2 or qx_arr.shape != shape:
+        raise ValueError(f"qx shape {qx_arr.shape!r} must match image shape {shape!r}")
+    try:
+        qy_arr = np.asarray(qy, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("qy must be a numeric two-dimensional array") from exc
+    if qy_arr.ndim != 2 or qy_arr.shape != shape:
+        raise ValueError(f"qy shape {qy_arr.shape!r} must match image shape {shape!r}")
+
+    if valid_mask is None:
+        inclusion = np.ones(shape, dtype=bool)
+    else:
+        raw_mask = np.asarray(valid_mask)
+        if raw_mask.shape != shape:
+            raise ValueError(f"valid_mask shape {raw_mask.shape!r} must match image shape {shape!r}")
+        inclusion = raw_mask.astype(bool, copy=False)
+
+    if required_q_max is not None:
+        return img, qx_arr, qy_arr, None, None, None, inclusion, sig_arr, None
+
+    q_mag = np.hypot(qx_arr, qy_arr)
+    geom_mask = np.isfinite(q_mag)
+    if not np.any(geom_mask):
+        raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
+    return img, qx_arr, qy_arr, q_mag, None, geom_mask, inclusion, sig_arr, None
 
 
 def _validate_q_window(q_window: Any) -> tuple[float, float]:
@@ -203,36 +391,123 @@ def _bin_azimuthal_from_2d(
     img: np.ndarray,
     qx: np.ndarray,
     qy: np.ndarray,
-    geometry: np.ndarray,
-    usable: np.ndarray,
+    geometry: np.ndarray | None,
+    usable: np.ndarray | None,
     *,
     q_window: tuple[float, float] | None,
     n_bins: int,
+    q_mag: np.ndarray | None = None,
+    chi_deg: np.ndarray | None = None,
+    inclusion: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | None], tuple[float | None, float | None]]:
-    """Bin observed 2D pixels into ``n_bins`` uniform bins over ``[0, 360)``."""
-    q_mag = np.hypot(qx, qy)
+    """Bin observed 2D pixels into ``n_bins`` uniform bins over ``[0, 360)`` with q-band pre-filtering."""
+    step = 360.0 / float(n_bins)
+    inv_step = float(n_bins) / 360.0
+    centers = (np.arange(n_bins, dtype=float) + 0.5) * step
+    empty_quads: dict[str, float | None] = {"QI": None, "QII": None, "QIII": None, "QIV": None}
+
     if q_window is not None:
         q_min, q_max = _validate_q_window(q_window)
-        in_band = (q_mag >= q_min) & (q_mag <= q_max) & (q_mag > 0.0)
         q_bounds: tuple[float | None, float | None] = (q_min, q_max)
+        if q_mag is None:
+            # Fast bounding-box pre-filter skips hypot & arctan2 on ~99% of detector pixels
+            in_box = (np.abs(qx) <= q_max) & (np.abs(qy) <= q_max)
+            if not np.any(in_box):
+                if not np.any(np.isfinite(qx) & np.isfinite(qy)):
+                    raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
+                return (
+                    centers,
+                    np.full(n_bins, np.nan, dtype=float),
+                    np.zeros(n_bins, dtype=np.int64),
+                    np.zeros(n_bins, dtype=np.int64),
+                    empty_quads,
+                    q_bounds,
+                )
+            bx = qx[in_box]
+            by = qy[in_box]
+            bq = np.hypot(bx, by)
+            in_band = np.isfinite(bq) & (bq >= q_min) & (bq <= q_max) & (bq > 0.0)
+            if not np.any(in_band):
+                return (
+                    centers,
+                    np.full(n_bins, np.nan, dtype=float),
+                    np.zeros(n_bins, dtype=np.int64),
+                    np.zeros(n_bins, dtype=np.int64),
+                    empty_quads,
+                    q_bounds,
+                )
+            cand_x = bx[in_band]
+            cand_y = by[in_band]
+            cand_img = img[in_box][in_band]
+            if usable is not None:
+                obs_sel = usable[in_box][in_band]
+            elif inclusion is not None:
+                obs_sel = inclusion[in_box][in_band] & np.isfinite(cand_img)
+            else:
+                obs_sel = np.isfinite(cand_img)
+            cand_angles = np.mod(np.degrees(np.arctan2(cand_y, cand_x)), 360.0)
+        else:
+            geom_m = geometry if geometry is not None else np.isfinite(q_mag)
+            cand_mask = geom_m & (q_mag >= q_min) & (q_mag <= q_max) & (q_mag > 0.0)
+            if not np.any(cand_mask):
+                return (
+                    centers,
+                    np.full(n_bins, np.nan, dtype=float),
+                    np.zeros(n_bins, dtype=np.int64),
+                    np.zeros(n_bins, dtype=np.int64),
+                    empty_quads,
+                    q_bounds,
+                )
+            cand_x = qx[cand_mask]
+            cand_y = qy[cand_mask]
+            cand_img = img[cand_mask]
+            if usable is not None:
+                obs_sel = usable[cand_mask]
+            elif inclusion is not None:
+                obs_sel = inclusion[cand_mask] & np.isfinite(cand_img)
+            else:
+                obs_sel = np.isfinite(cand_img)
+            if chi_deg is not None:
+                cand_angles = np.mod(chi_deg[cand_mask], 360.0)
+            else:
+                cand_angles = np.mod(np.degrees(np.arctan2(cand_y, cand_x)), 360.0)
     else:
-        in_band = q_mag > 0.0
-        obs_q = q_mag[usable & in_band]
+        if q_mag is None:
+            q_mag = np.hypot(qx, qy)
+        geom_m = geometry if geometry is not None else np.isfinite(q_mag)
+        if not np.any(geom_m):
+            raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
+        cand_mask = geom_m & (q_mag > 0.0)
+        if not np.any(cand_mask):
+            return (
+                centers,
+                np.full(n_bins, np.nan, dtype=float),
+                np.zeros(n_bins, dtype=np.int64),
+                np.zeros(n_bins, dtype=np.int64),
+                empty_quads,
+                (None, None),
+            )
+        cand_q = q_mag[cand_mask]
+        cand_x = qx[cand_mask]
+        cand_y = qy[cand_mask]
+        cand_img = img[cand_mask]
+        if usable is not None:
+            obs_sel = usable[cand_mask]
+        elif inclusion is not None:
+            obs_sel = inclusion[cand_mask] & np.isfinite(cand_img)
+        else:
+            obs_sel = np.isfinite(cand_img)
+        obs_q = cand_q[obs_sel]
         q_bounds = (_finite(np.min(obs_q)), _finite(np.max(obs_q))) if obs_q.size else (None, None)
+        if chi_deg is not None:
+            cand_angles = np.mod(chi_deg[cand_mask], 360.0)
+        else:
+            cand_angles = np.mod(np.degrees(np.arctan2(cand_y, cand_x)), 360.0)
 
-    cand_mask = geometry & in_band
-    obs_mask = usable & in_band
-
-    step = 360.0 / float(n_bins)
-    centers = (np.arange(n_bins, dtype=float) + 0.5) * step
-    angles_deg = np.mod(np.degrees(np.arctan2(qy, qx)), 360.0)
-
-    cand_angles = angles_deg[cand_mask]
-    obs_angles = angles_deg[obs_mask]
-    obs_vals = img[obs_mask]
-
-    cand_idx = np.clip(np.floor(cand_angles / step).astype(np.int64), 0, n_bins - 1)
-    obs_idx = np.clip(np.floor(obs_angles / step).astype(np.int64), 0, n_bins - 1)
+    cand_idx = np.floor(cand_angles * inv_step).astype(np.int64)
+    np.clip(cand_idx, 0, n_bins - 1, out=cand_idx)
+    obs_idx = cand_idx[obs_sel]
+    obs_vals = cand_img[obs_sel]
 
     geom_counts = np.bincount(cand_idx, minlength=n_bins).astype(np.int64)
     counts = np.bincount(obs_idx, minlength=n_bins).astype(np.int64)
@@ -240,18 +515,15 @@ def _bin_azimuthal_from_2d(
     intensity = np.full(n_bins, np.nan, dtype=float)
     np.divide(sums, counts, out=intensity, where=counts > 0)
 
-    # Quadrant observed means directly from observed pixels in the q band
-    q_obs_x = qx[obs_mask]
-    q_obs_y = qy[obs_mask]
-    quad_defs = {
-        "QI": (q_obs_x >= 0.0) & (q_obs_y >= 0.0),
-        "QII": (q_obs_x < 0.0) & (q_obs_y >= 0.0),
-        "QIII": (q_obs_x < 0.0) & (q_obs_y < 0.0),
-        "QIV": (q_obs_x >= 0.0) & (q_obs_y < 0.0),
-    }
+    # Quadrant observed means directly from observed pixels in the q band (via O(N) bincount)
+    q_obs_x = cand_x[obs_sel]
+    q_obs_y = cand_y[obs_sel]
+    quad_code = (q_obs_x < 0.0).astype(np.int8) | ((q_obs_y < 0.0).astype(np.int8) << 1)
+    q_cnt = np.bincount(quad_code, minlength=4)
+    q_sum = np.bincount(quad_code, weights=obs_vals, minlength=4) if obs_vals.size else np.zeros(4, dtype=float)
     quadrant_means: dict[str, float | None] = {}
-    for label, sel in quad_defs.items():
-        quadrant_means[label] = _finite(np.mean(obs_vals[sel])) if np.any(sel) else None
+    for label, code in (("QI", 0), ("QII", 1), ("QIII", 3), ("QIV", 2)):
+        quadrant_means[label] = _finite(q_sum[code] / q_cnt[code]) if q_cnt[code] > 0 else None
 
     return centers, intensity, counts, geom_counts, quadrant_means, q_bounds
 
@@ -485,13 +757,16 @@ def compute_azimuthal_harmonics_and_order(
     intensity: Any = None,
     counts: Any = None,
     reference_phase_deg: float | None = None,
+    geometry_cache: Any = None,
+    intensity_mode: str = "calibrated",
+    sigma: Any = None,
 ) -> dict[str, Any]:
     """Compute even Fourier harmonics, Friedel symmetry bisector, and Hermans order parameters.
 
-    Accepts either 2D arrays ``(image, qx, qy)`` (with optional ``valid_mask`` and
-    ``q_window``) OR a pre-binned 1D angular profile ``(angle_deg, intensity)``.
-    All quantities are derived strictly from observed pixels/bins; masked gaps
-    are never filled or mirrored.
+    Accepts either 2D arrays ``(image, qx, qy)`` (with optional ``valid_mask``,
+    ``q_window``, and ``geometry_cache``) OR a pre-binned 1D angular profile
+    ``(angle_deg, intensity)``. All quantities are derived strictly from
+    observed pixels/bins; masked gaps are never filled or mirrored.
 
     ``bright_axis_convention`` controls the expected axis for ``orthogonal_rotation_detected``
     and ``mounting_tilt_deg`` when ``expected_bright_axis_deg`` is omitted:
@@ -501,6 +776,7 @@ def compute_azimuthal_harmonics_and_order(
       ``(nominal_draw_axis_deg - 90) % 180`` (WingSAXS ``reference_axis_deg``, matching
       equatorial-bridged butterflies such as NO50S with vertical wire ``draw_axis_deg=90``).
     """
+    _normalise_intensity_mode(intensity_mode)
     q_unit_label, _, _ = _q_unit_info(q_unit)
     nominal_axis = float(nominal_draw_axis_deg) % 180.0
     nominal_reference_axis = float((nominal_axis - 90.0) % 180.0)
@@ -519,19 +795,31 @@ def compute_azimuthal_harmonics_and_order(
     q_bounds: tuple[float | None, float | None] = (None, None)
 
     if image is not None:
-        if qx is None or qy is None:
+        if geometry_cache is None and (qx is None or qy is None):
             raise ValueError("qx and qy must be supplied when image is provided")
         if isinstance(n_bins, (bool, np.bool_)) or int(n_bins) < 8:
             raise ValueError("n_bins must be an integer >= 8")
-        img, qx_arr, qy_arr, geometry, usable = _validate_2d_inputs(image, qx, qy, valid_mask)
+        req_q_max = _validate_q_window(q_window)[1] if q_window is not None else None
+        img, qx_arr, qy_arr, q_mag, chi_deg, geom_mask, inclusion, _, _ = _resolve_2d_context(
+            image,
+            qx,
+            qy,
+            valid_mask,
+            geometry_cache=geometry_cache,
+            sigma=sigma,
+            required_q_max=req_q_max,
+        )
         ang, prof, cnts, geom_cnts, quadrant_means, q_bounds = _bin_azimuthal_from_2d(
             img,
             qx_arr,
             qy_arr,
-            geometry,
-            usable,
+            geom_mask,
+            None,
             q_window=q_window,
             n_bins=int(n_bins),
+            q_mag=q_mag,
+            chi_deg=chi_deg,
+            inclusion=inclusion,
         )
         observed = np.isfinite(ang) & np.isfinite(prof) & (cnts > 0)
         geom_total = int(np.count_nonzero(geom_cnts > 0))
@@ -686,7 +974,10 @@ def compute_azimuthal_harmonics_and_order(
             return total
 
         grid_rad = np.linspace(0.0, 0.5 * math.pi, 360, endpoint=False)
-        losses = np.array([_mirror_loss(float(p)) for p in grid_rad], dtype=float)
+        losses = np.zeros_like(grid_rad)
+        for m, cm, sm in harm_terms:
+            val = -cm * np.sin(m * grid_rad) + sm * np.cos(m * grid_rad)
+            losses += val * val
         best_idx = int(np.argmin(losses))
         step_rad = 0.5 * math.pi / 360.0
         lo_rad = float(grid_rad[best_idx]) - 1.5 * step_rad
@@ -912,6 +1203,7 @@ def fit_c2_bridge_four_lobe(
     prefer_acute_opening: bool = True,
     loss: str = "linear",
     max_nfev: int = 5000,
+    include_flat_comparison: bool = True,
 ) -> dict[str, Any]:
     """Fit a Friedel-symmetric C2-bridge + 4-lobe periodic model to observed angular bins.
 
@@ -997,25 +1289,45 @@ def fit_c2_bridge_four_lobe(
     amp_hi = max(10.0 * y_range, 10.0 * y_abs_max, 1.0)
     c2_bound = max(5.0 * y_range, 5.0 * y_abs_max, 1.0)
 
-    # Seed candidate symmetry axes from harmonics
-    harm = compute_azimuthal_harmonics_and_order(
-        angle_deg=x,
-        intensity=y,
-        valid_mask=observed,
-        nominal_draw_axis_deg=nominal_draw_axis_deg,
-    )
+    # Seed candidate symmetry axes: skip full harmonics recompute when caller already seeded chi_sym
     seed_axes: list[float] = []
-    for candidate_axis in (
-        initial_chi_sym_deg,
-        harm.get("friedel_bisector_deg"),
-        harm.get("orthogonal_axis_deg"),
-        nominal_draw_axis_deg % 180.0,
-        (nominal_draw_axis_deg + 90.0) % 180.0,
-    ):
-        if candidate_axis is not None and math.isfinite(float(candidate_axis)):
-            ax_mod = float(candidate_axis) % 180.0
-            if not any(abs(float(_periodic_dist_deg(ax_mod, s, 180.0))) < 5.0 for s in seed_axes):
-                seed_axes.append(ax_mod)
+    if initial_chi_sym_deg is not None and math.isfinite(float(initial_chi_sym_deg)):
+        ax0 = float(initial_chi_sym_deg) % 180.0
+        seed_axes.append(ax0)
+        seed_axes.append((ax0 + 90.0) % 180.0)
+    else:
+        harm_ols, harm_orders, _ = _fit_even_harmonics_ols(xo, yo)
+        bisector_seed: float | None = None
+        orth_seed: float | None = None
+        if harm_orders:
+            harm_terms = [
+                (m, float(harm_ols[f"c{m}"]), float(harm_ols[f"s{m}"]))
+                for m in harm_orders
+                if harm_ols.get(f"c{m}") is not None and harm_ols.get(f"s{m}") is not None
+            ]
+            if harm_terms:
+                grid_rad = np.linspace(0.0, 0.5 * math.pi, 180, endpoint=False)
+                losses = np.zeros_like(grid_rad)
+                for m, cm, sm in harm_terms:
+                    val = -cm * np.sin(m * grid_rad) + sm * np.cos(m * grid_rad)
+                    losses += val * val
+                best_deg = float(math.degrees(float(grid_rad[int(np.argmin(losses))])) % 180.0)
+                bisector_seed = best_deg
+                orth_seed = (best_deg + 90.0) % 180.0
+        for candidate_axis in (
+            bisector_seed,
+            orth_seed,
+            nominal_draw_axis_deg % 180.0,
+            (nominal_draw_axis_deg + 90.0) % 180.0,
+        ):
+            if candidate_axis is not None and math.isfinite(float(candidate_axis)):
+                ax_mod = float(candidate_axis) % 180.0
+                if not any(abs(float(_periodic_dist_deg(ax_mod, s, 180.0))) < 5.0 for s in seed_axes):
+                    seed_axes.append(ax_mod)
+
+    _lobe_signs = np.array([-1.0, 1.0, -1.0, 1.0], dtype=float)
+    _lobe_offsets = np.array([0.0, 0.0, 180.0, 180.0], dtype=float)
+    _two_rad = 2.0 * (math.pi / 180.0)
 
     def _unpack(params: np.ndarray, include_c2: bool) -> tuple[float, float, float, float, list[float], list[float]]:
         if include_c2:
@@ -1048,8 +1360,9 @@ def fit_c2_bridge_four_lobe(
 
         centers0 = _butterfly_lobe_centers_deg(axis_seed, alpha_seed)
         amps0: list[float] = []
+        win_deg = max(12.0, 0.8 * initial_fwhm_deg)
         for mu in centers0:
-            near = np.abs(_periodic_dist_deg(xo, mu, 360.0)) <= max(12.0, 0.8 * initial_fwhm_deg)
+            near = np.abs(_periodic_dist_deg(xo, mu, 360.0)) <= win_deg
             est = float(np.max(resid0[near])) if np.any(near) else 0.25 * y_range
             amps0.append(float(np.clip(max(est, 0.05 * y_range), 1.0e-6, 0.95 * amp_hi)))
 
@@ -1069,22 +1382,109 @@ def fit_c2_bridge_four_lobe(
         eps_hi = np.where(np.isfinite(hi), 1.0e-9, 0.0)
         p0 = np.minimum(np.maximum(p0, lo + eps_lo), hi - eps_hi)
 
-        def _res(params: np.ndarray) -> np.ndarray:
-            c0_v, c2_v, chi_v, alpha_v, amps_v, sigs_v = _unpack(params, include_c2)
-            pred = evaluate_c2_bridge_four_lobe(
-                xo,
-                c0=c0_v,
-                c2=c2_v,
-                chi_sym_deg=chi_v,
-                alpha_deg=alpha_v,
-                lobe_amplitudes=amps_v,
-                lobe_sigmas_deg=sigs_v,
-            )
-            return pred - yo
+        if include_c2:
+            def _res(params: np.ndarray) -> np.ndarray:
+                c0_v = params[0]
+                c2_v = params[1]
+                chi_v = params[2]
+                alpha_v = params[3]
+                amps_arr = params[4:8]
+                mu = chi_v + _lobe_offsets + _lobe_signs * alpha_v
+                d = ((xo[None, :] - mu[:, None] + 180.0) % 360.0) - 180.0
+                if shared_width:
+                    inv_s = 1.0 / max(float(params[8]), 1.0e-6)
+                    u = d * inv_s
+                else:
+                    inv_s = 1.0 / np.maximum(params[8:12], 1.0e-6)
+                    u = d * inv_s[:, None]
+                g = np.exp(-0.5 * (u * u))
+                return c0_v + c2_v * np.cos(_two_rad * (xo - chi_v)) + (amps_arr @ g) - yo
+
+            def _jac(params: np.ndarray) -> np.ndarray:
+                c2_v = params[1]
+                chi_v = params[2]
+                alpha_v = params[3]
+                amps_arr = params[4:8]
+                mu = chi_v + _lobe_offsets + _lobe_signs * alpha_v
+                d = ((xo[None, :] - mu[:, None] + 180.0) % 360.0) - 180.0
+                if shared_width:
+                    inv_s = 1.0 / max(float(params[8]), 1.0e-6)
+                    u = d * inv_s
+                    g = np.exp(-0.5 * (u * u))
+                    L = amps_arr[:, None] * g
+                    dL_dmu = L * (u * inv_s)
+                    dL_dsig = L * ((u * u) * inv_s)
+                else:
+                    inv_s = 1.0 / np.maximum(params[8:12], 1.0e-6)
+                    u = d * inv_s[:, None]
+                    g = np.exp(-0.5 * (u * u))
+                    L = amps_arr[:, None] * g
+                    dL_dmu = L * (u * inv_s[:, None])
+                    dL_dsig = L * ((u * u) * inv_s[:, None])
+                phase = _two_rad * (xo - chi_v)
+                J = np.empty((n_obs, params.size), dtype=float)
+                J[:, 0] = 1.0
+                J[:, 1] = np.cos(phase)
+                J[:, 2] = _two_rad * c2_v * np.sin(phase) + np.sum(dL_dmu, axis=0)
+                J[:, 3] = _lobe_signs @ dL_dmu
+                J[:, 4:8] = g.T
+                if shared_width:
+                    J[:, 8] = np.sum(dL_dsig, axis=0)
+                else:
+                    J[:, 8:12] = dL_dsig.T
+                return J
+        else:
+            def _res(params: np.ndarray) -> np.ndarray:
+                c0_v = params[0]
+                chi_v = params[1]
+                alpha_v = params[2]
+                amps_arr = params[3:7]
+                mu = chi_v + _lobe_offsets + _lobe_signs * alpha_v
+                d = ((xo[None, :] - mu[:, None] + 180.0) % 360.0) - 180.0
+                if shared_width:
+                    inv_s = 1.0 / max(float(params[7]), 1.0e-6)
+                    u = d * inv_s
+                else:
+                    inv_s = 1.0 / np.maximum(params[7:11], 1.0e-6)
+                    u = d * inv_s[:, None]
+                g = np.exp(-0.5 * (u * u))
+                return c0_v + (amps_arr @ g) - yo
+
+            def _jac(params: np.ndarray) -> np.ndarray:
+                chi_v = params[1]
+                alpha_v = params[2]
+                amps_arr = params[3:7]
+                mu = chi_v + _lobe_offsets + _lobe_signs * alpha_v
+                d = ((xo[None, :] - mu[:, None] + 180.0) % 360.0) - 180.0
+                if shared_width:
+                    inv_s = 1.0 / max(float(params[7]), 1.0e-6)
+                    u = d * inv_s
+                    g = np.exp(-0.5 * (u * u))
+                    L = amps_arr[:, None] * g
+                    dL_dmu = L * (u * inv_s)
+                    dL_dsig = L * ((u * u) * inv_s)
+                else:
+                    inv_s = 1.0 / np.maximum(params[7:11], 1.0e-6)
+                    u = d * inv_s[:, None]
+                    g = np.exp(-0.5 * (u * u))
+                    L = amps_arr[:, None] * g
+                    dL_dmu = L * (u * inv_s[:, None])
+                    dL_dsig = L * ((u * u) * inv_s[:, None])
+                J = np.empty((n_obs, params.size), dtype=float)
+                J[:, 0] = 1.0
+                J[:, 1] = np.sum(dL_dmu, axis=0)
+                J[:, 2] = _lobe_signs @ dL_dmu
+                J[:, 3:7] = g.T
+                if shared_width:
+                    J[:, 7] = np.sum(dL_dsig, axis=0)
+                else:
+                    J[:, 7:11] = dL_dsig.T
+                return J
 
         return least_squares(
             _res,
             p0,
+            jac=_jac,
             bounds=(lo, hi),
             loss=loss,
             f_scale=max(0.05 * y_range, 1.0e-12),
@@ -1095,14 +1495,15 @@ def fit_c2_bridge_four_lobe(
     best_c2_sse = float("inf")
     initial_centers_used: tuple[float, ...] = ()
 
-    for ax_seed in seed_axes[:4]:
-        alpha_est, _ = _detect_folded_lobe_opening(xo, yo, ax_seed)
+    for ax_idx, ax_seed in enumerate(seed_axes[:4]):
         alpha_candidates: list[float] = []
         if initial_alpha_deg is not None and math.isfinite(float(initial_alpha_deg)):
-            alpha_candidates.append(float(np.clip(initial_alpha_deg, alpha_lo + 1.0, alpha_hi - 1.0)))
+            a_init = float(initial_alpha_deg) if ax_idx == 0 else (90.0 - float(initial_alpha_deg))
+            alpha_candidates.append(float(np.clip(a_init, alpha_lo + 1.0, alpha_hi - 1.0)))
+        alpha_est, _ = _detect_folded_lobe_opening(xo, yo, ax_seed)
         if alpha_est is not None:
             a_clipped = float(np.clip(alpha_est, alpha_lo + 1.0, alpha_hi - 1.0))
-            if not any(abs(a_clipped - existing) < 4.0 for existing in alpha_candidates):
+            if not any(abs(a_clipped - existing) < 6.0 for existing in alpha_candidates):
                 alpha_candidates.append(a_clipped)
         if not alpha_candidates:
             alpha_candidates = [float(np.clip(35.0, alpha_lo + 1.0, alpha_hi - 1.0))]
@@ -1116,6 +1517,9 @@ def fit_c2_bridge_four_lobe(
                 best_c2_sse = sse
                 best_c2_fit = res
                 initial_centers_used = _butterfly_lobe_centers_deg(ax_seed, a_seed)
+        # Early exit when an effectively exact noiseless fit is already found
+        if best_c2_sse <= 1.0e-10 * (y_range ** 2) * n_obs:
+            break
 
     if best_c2_fit is None:
         flags.append("c2_four_lobe_fit_failed")
@@ -1212,16 +1616,17 @@ def fit_c2_bridge_four_lobe(
     n_params_flat = n_params_c2 - 1
     best_flat_fit = None
     best_flat_sse = float("inf")
-    flat_seeds = [(chi_sym, alpha_deg), ((chi_sym + 90.0) % 180.0, max(alpha_lo + 1.0, min(alpha_hi - 1.0, 90.0 - alpha_deg)))]
-    for ax_s, a_s in flat_seeds:
-        try:
-            fres = _fit_one_seed(ax_s, float(np.clip(a_s, alpha_lo + 0.5, alpha_hi - 0.5)), include_c2=False)
-        except (ValueError, RuntimeError, FloatingPointError):
-            continue
-        fsse = float(np.sum(fres.fun ** 2))
-        if math.isfinite(fsse) and fsse < best_flat_sse:
-            best_flat_sse = fsse
-            best_flat_fit = fres
+    if include_flat_comparison:
+        flat_seeds = [(chi_sym, alpha_deg), ((chi_sym + 90.0) % 180.0, max(alpha_lo + 1.0, min(alpha_hi - 1.0, 90.0 - alpha_deg)))]
+        for ax_s, a_s in flat_seeds:
+            try:
+                fres = _fit_one_seed(ax_s, float(np.clip(a_s, alpha_lo + 0.5, alpha_hi - 0.5)), include_c2=False)
+            except (ValueError, RuntimeError, FloatingPointError):
+                continue
+            fsse = float(np.sum(fres.fun ** 2))
+            if math.isfinite(fsse) and fsse < best_flat_sse:
+                best_flat_sse = fsse
+                best_flat_fit = fres
 
     flat_comparison: dict[str, Any] | None = None
     if best_flat_fit is not None:
@@ -1329,6 +1734,26 @@ def _interpolate_crossing(x0: float, x1: float, y0: float, y1: float, target: fl
         return float(x0)
     frac = min(1.0, max(0.0, (target - y0) / (y1 - y0)))
     return float(x0 + frac * (x1 - x0))
+
+
+def _integrate_observed_segments_weights(
+    x: np.ndarray,
+    valid: np.ndarray,
+    dx_bins: np.ndarray,
+) -> np.ndarray:
+    """Return exact per-bin linear weights matching :func:`_integrate_observed_segments`."""
+    weights = np.zeros(x.shape, dtype=float)
+    for a, b in _contiguous_segments(valid):
+        n_seg = b - a
+        if n_seg == 1:
+            weights[a] = float(dx_bins[a])
+        else:
+            dx_int = np.diff(x[a:b])
+            weights[a] = 0.5 * float(dx_bins[a]) + 0.5 * float(dx_int[0])
+            weights[b - 1] = 0.5 * float(dx_bins[b - 1]) + 0.5 * float(dx_int[-1])
+            if n_seg > 2:
+                weights[a + 1 : b - 1] = 0.5 * (dx_int[:-1] + dx_int[1:])
+    return weights
 
 
 def _integrate_observed_segments(x: np.ndarray, y: np.ndarray, dx_bins: np.ndarray) -> float | None:
@@ -1604,6 +2029,8 @@ def _summarize_radial_channel(
     channel_name: str,
     zero_pixel_fraction: np.ndarray | None = None,
     background_level: float | None = None,
+    intensity_mode: str = "calibrated",
+    sigma_radial: np.ndarray | None = None,
 ) -> dict[str, Any]:
     q_centers = 0.5 * (q_edges[:-1] + q_edges[1:])
     dq_bins = q_edges[1:] - q_edges[:-1]
@@ -1653,8 +2080,23 @@ def _summarize_radial_channel(
     )
     kratky_peak["kratky_background_subtracted"] = True
     kratky_peak["I_bg_estimate"] = _finite(I_bg)
-    q_win = _integrate_observed_segments(q_centers, kratky_raw, dq_bins)
-    q_win_bg_sub = _integrate_observed_segments(q_centers, kratky_sub, dq_bins)
+
+    if intensity_mode == "raw":
+        q_win = None
+        q_win_bg_sub = None
+        q_win_stat_stderr = None
+    else:
+        q_win = _integrate_observed_segments(q_centers, kratky_raw, dq_bins)
+        q_win_bg_sub = _integrate_observed_segments(q_centers, kratky_sub, dq_bins)
+        q_win_stat_stderr = None
+        if sigma_radial is not None:
+            sig_ok = obs_mask & np.isfinite(sigma_radial) & (sigma_radial >= 0.0)
+            if np.any(sig_ok):
+                seg_w = _integrate_observed_segments_weights(q_centers, obs_mask, dq_bins)
+                qwin_var = float(np.sum(((q_centers[sig_ok] ** 2) * seg_w[sig_ok] * sigma_radial[sig_ok]) ** 2))
+                if math.isfinite(qwin_var) and qwin_var >= 0.0:
+                    q_win_stat_stderr = _finite(math.sqrt(qwin_var))
+
     obs_bins = int(np.count_nonzero(obs_mask))
     cand_bins = int(np.count_nonzero(candidate_counts > 0))
     radial_cov = float(obs_bins / cand_bins) if cand_bins > 0 else 0.0
@@ -1664,6 +2106,7 @@ def _summarize_radial_channel(
         "q_centers": _finite_list(q_centers),
         "q_edges": _finite_list(q_edges),
         "I_q": _finite_list(I_q),
+        "sigma_radial": _finite_list(sigma_radial) if sigma_radial is not None else None,
         "q2_I_q": _finite_list(kratky_raw),
         "q2_I_sub_q": _finite_list(kratky_sub),
         "I_bg_estimate": _finite(I_bg),
@@ -1678,6 +2121,7 @@ def _summarize_radial_channel(
         "kratky_peak": kratky_peak,
         "q_win_invariant": q_win,
         "q_win_bg_subtracted": q_win_bg_sub,
+        "q_win_stat_stderr": q_win_stat_stderr,
     }
 
 
@@ -1723,7 +2167,8 @@ def _compute_cosine_correlation_1d(
     dq_nm = dq_bins * q_scale_nm_inv
     # Scale q^2 I(q) consistently to nm^-1 axis: q_nm^2 * I = (q_scale^2) * kratky
     k_nm = kratky * (q_scale_nm_inv ** 2)
-    q_win_nm = _integrate_observed_segments(q_nm, k_nm, dq_nm)
+    quad_w = _integrate_observed_segments_weights(q_nm, valid, dq_nm)
+    q_win_nm = _finite(float(np.dot(k_nm[valid], quad_w[valid])))
     if q_win_nm is None or q_win_nm <= 0.0:
         return {
             "status": "unavailable",
@@ -1747,11 +2192,8 @@ def _compute_cosine_correlation_1d(
 
     n_pts = max(int(n_r), 16)
     r_grid = np.linspace(0.0, r_max, n_pts, dtype=float)
-    k_vals = np.zeros(n_pts, dtype=float)
-    for idx_r, r_val in enumerate(r_grid):
-        integrand = k_nm * np.cos(q_nm * r_val)
-        val = _integrate_observed_segments(q_nm, integrand, dq_nm)
-        k_vals[idx_r] = (val / q_win_nm) if val is not None else np.nan
+    weighted_k = k_nm[valid] * quad_w[valid]
+    k_vals = (np.cos(np.outer(r_grid, obs_q_nm)) @ weighted_k) / q_win_nm
 
     # First positive interior maximum (classic 1D correlation peak; ignores negative Gibbs ripples in the trough)
     first_max_r: float | None = None
@@ -1784,20 +2226,24 @@ def _compute_cosine_correlation_1d(
     }
 
 
-def _detect_wing_angles_for_sectors(
-    img: np.ndarray,
-    qx: np.ndarray,
-    qy: np.ndarray,
-    geometry: np.ndarray,
-    usable: np.ndarray,
+def _detect_wing_angles_from_1d_pixels(
+    angles_obs_deg: np.ndarray,
+    img_obs: np.ndarray,
     *,
-    q_window: tuple[float, float],
     nominal_draw_axis_deg: float,
+    n_bins: int = 180,
 ) -> tuple[list[float], str]:
-    """Detect butterfly wing ray angles strictly from observed pixels in ``q_window``."""
-    ang, prof, cnts, _, _, _ = _bin_azimuthal_from_2d(
-        img, qx, qy, geometry, usable, q_window=q_window, n_bins=180
-    )
+    """Detect butterfly wing ray angles directly from already-filtered 1D observed pixels."""
+    if angles_obs_deg.size < 16:
+        return [], "insufficient_azimuthal_support"
+    step = 360.0 / float(n_bins)
+    ang = (np.arange(n_bins, dtype=float) + 0.5) * step
+    idx = np.floor(angles_obs_deg * (float(n_bins) / 360.0)).astype(np.int64)
+    np.clip(idx, 0, n_bins - 1, out=idx)
+    cnts = np.bincount(idx, minlength=n_bins).astype(np.int64)
+    sums = np.bincount(idx, weights=img_obs, minlength=n_bins).astype(float)
+    prof = np.full(n_bins, np.nan, dtype=float)
+    np.divide(sums, cnts, out=prof, where=cnts > 0)
     obs = np.isfinite(prof) & (cnts > 0)
     if int(np.count_nonzero(obs)) < 16:
         return [], "insufficient_azimuthal_support"
@@ -1820,6 +2266,7 @@ def _detect_wing_angles_for_sectors(
             initial_chi_sym_deg=bisector,
             initial_alpha_deg=harm.get("wing_half_opening_estimate_deg"),
             max_nfev=1500,
+            include_flat_comparison=False,
         )
         if fit.get("success") and fit.get("lobe_centers_deg"):
             centers = [float(c) for c in fit["lobe_centers_deg"] if c is not None]
@@ -1833,10 +2280,70 @@ def _detect_wing_angles_for_sectors(
     return [float(bisector % 360.0), float((bisector + 180.0) % 360.0)], "two_lobe_axis"
 
 
+def _detect_wing_angles_for_sectors(
+    img: np.ndarray,
+    qx: np.ndarray,
+    qy: np.ndarray,
+    geometry: np.ndarray | None,
+    usable: np.ndarray | None,
+    *,
+    q_window: tuple[float, float],
+    nominal_draw_axis_deg: float,
+    q_mag: np.ndarray | None = None,
+    chi_deg: np.ndarray | None = None,
+    inclusion: np.ndarray | None = None,
+) -> tuple[list[float], str]:
+    """Detect butterfly wing ray angles strictly from observed pixels in ``q_window``."""
+    ang, prof, cnts, _, _, _ = _bin_azimuthal_from_2d(
+        img,
+        qx,
+        qy,
+        geometry,
+        usable,
+        q_window=q_window,
+        n_bins=180,
+        q_mag=q_mag,
+        chi_deg=chi_deg,
+        inclusion=inclusion,
+    )
+    obs = np.isfinite(prof) & (cnts > 0)
+    if int(np.count_nonzero(obs)) < 16:
+        return [], "insufficient_azimuthal_support"
+    harm = compute_azimuthal_harmonics_and_order(
+        angle_deg=ang, intensity=prof, counts=cnts, nominal_draw_axis_deg=nominal_draw_axis_deg
+    )
+    a2 = harm.get("a2") or 0.0
+    a4 = harm.get("a4") or 0.0
+    bisector = harm.get("friedel_bisector_deg")
+    if bisector is None or (a2 < 0.03 and a4 < 0.03):
+        return [], "isotropic_no_distinct_wings"
+
+    if a4 >= 0.03:
+        fit = fit_c2_bridge_four_lobe(
+            ang,
+            prof,
+            counts=cnts,
+            nominal_draw_axis_deg=nominal_draw_axis_deg,
+            initial_chi_sym_deg=bisector,
+            initial_alpha_deg=harm.get("wing_half_opening_estimate_deg"),
+            max_nfev=1500,
+            include_flat_comparison=False,
+        )
+        if fit.get("success") and fit.get("lobe_centers_deg"):
+            centers = [float(c) for c in fit["lobe_centers_deg"] if c is not None]
+            if len(centers) == 4:
+                return centers, "c2_bridge_four_lobe"
+        alpha_est = harm.get("wing_half_opening_estimate_deg")
+        if alpha_est is not None:
+            return list(_butterfly_lobe_centers_deg(bisector, float(alpha_est))), "harmonic_folded_wings"
+
+    return [float(bisector % 360.0), float((bisector + 180.0) % 360.0)], "two_lobe_axis"
+
+
 def measure_radial_coarsening_observables(
     image: Any,
-    qx: Any,
-    qy: Any,
+    qx: Any = None,
+    qy: Any = None,
     *,
     valid_mask: Any = None,
     q_window: tuple[float, float] | None = None,
@@ -1849,15 +2356,21 @@ def measure_radial_coarsening_observables(
     compute_correlation: bool = False,
     r_max_nm: float | None = None,
     n_r: int = 128,
+    geometry_cache: Any = None,
+    intensity_mode: str = "calibrated",
+    sigma: Any = None,
+    systematic_k_uncertainty: float | str | None = None,
 ) -> dict[str, Any]:
     """Compute dual-channel direct I(q) & Kratky q^2 I(q) radial observables and Q_win.
 
     Extracts BOTH full-azimuth and butterfly lobe-sectored radial profiles strictly
     from observed pixels, returning direct ``I(q)`` peaks, Kratky ``q^2 I(q)``
-    peaks, window-bounded scattering invariant proxy ``Q_win``, and optional
-    calibrated 1D cosine correlation function ``K(r)``.
+    peaks, window-bounded scattering invariant proxy ``Q_win`` (strictly ``None``
+    when ``intensity_mode='raw'``), optional propagated statistical uncertainty
+    (``sigma_radial`` and ``q_win_stat_stderr`` when ``sigma`` is provided), and
+    optional calibrated 1D cosine correlation function ``K(r)``.
     """
-    img, qx_arr, qy_arr, geometry, usable = _validate_2d_inputs(image, qx, qy, valid_mask)
+    mode = _normalise_intensity_mode(intensity_mode)
     if isinstance(n_radial_bins, (bool, np.bool_)) or int(n_radial_bins) < 4:
         raise ValueError("n_radial_bins must be an integer >= 4")
     n_bins = int(n_radial_bins)
@@ -1865,43 +2378,110 @@ def measure_radial_coarsening_observables(
     if not math.isfinite(half_w) or not (0.0 < half_w <= 90.0):
         raise ValueError("sector_half_width_deg must be finite and in (0, 90]")
 
-    q_unit_label, q_scale_nm_inv, unit_caveat = _q_unit_info(q_unit)
-    q_mag = np.hypot(qx_arr, qy_arr)
-    angles_deg = np.mod(np.degrees(np.arctan2(qy_arr, qx_arr)), 360.0)
-
+    req_q_max: float | None = None
     if q_window is not None:
         q_min, q_max = _validate_q_window(q_window)
+        req_q_max = q_max
+
+    img, qx_arr, qy_arr, q_mag, chi_deg, geom_mask, inclusion, sig_arr, _ = _resolve_2d_context(
+        image,
+        qx,
+        qy,
+        valid_mask,
+        geometry_cache=geometry_cache,
+        sigma=sigma,
+        required_q_max=req_q_max,
+    )
+    q_unit_label, q_scale_nm_inv, unit_caveat = _q_unit_info(q_unit)
+
+    # Pre-filter strictly to pixels inside [q_min, q_max] BEFORE arctan2, binning, and sector checks
+    if q_window is not None and q_mag is None:
+        in_box = (np.abs(qx_arr) <= q_max) & (np.abs(qy_arr) <= q_max)
+        if not np.any(in_box):
+            if not np.any(np.isfinite(qx_arr) & np.isfinite(qy_arr)):
+                raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
+            q_c = np.empty(0, dtype=float)
+            qx_c = np.empty(0, dtype=float)
+            qy_c = np.empty(0, dtype=float)
+            img_c = np.empty(0, dtype=float)
+            inc_c = np.empty(0, dtype=bool)
+            sig_c = np.empty(0, dtype=float) if sig_arr is not None else None
+            chi_c = None
+        else:
+            bx = qx_arr[in_box]
+            by = qy_arr[in_box]
+            bq = np.hypot(bx, by)
+            in_q = np.isfinite(bq) & (bq >= q_min) & (bq <= q_max)
+            q_c = bq[in_q]
+            qx_c = bx[in_q]
+            qy_c = by[in_q]
+            img_c = img[in_box][in_q]
+            inc_c = inclusion[in_box][in_q]
+            sig_c = sig_arr[in_box][in_q] if sig_arr is not None else None
+            chi_c = None
     else:
-        obs_q = q_mag[usable]
-        if obs_q.size == 0:
-            obs_q = q_mag[geometry]
-        q_min = float(np.min(obs_q))
-        q_max = float(np.max(obs_q))
-        if q_min == q_max:
-            half = max(abs(q_min), 1.0) * 1.0e-6
-            q_min = max(0.0, q_min - half)
-            q_max = q_max + half
+        assert q_mag is not None and geom_mask is not None
+        if q_window is None:
+            usable_full = geom_mask & inclusion & np.isfinite(img)
+            obs_q = q_mag[usable_full]
+            if obs_q.size == 0:
+                obs_q = q_mag[geom_mask]
+            q_min = float(np.min(obs_q))
+            q_max = float(np.max(obs_q))
+            if q_min == q_max:
+                half = max(abs(q_min), 1.0) * 1.0e-6
+                q_min = max(0.0, q_min - half)
+                q_max = q_max + half
+        in_q = geom_mask & (q_mag >= q_min) & (q_mag <= q_max)
+        q_c = q_mag[in_q]
+        qx_c = qx_arr[in_q]
+        qy_c = qy_arr[in_q]
+        img_c = img[in_q]
+        inc_c = inclusion[in_q]
+        sig_c = sig_arr[in_q] if sig_arr is not None else None
+        chi_c = np.mod(chi_deg[in_q], 360.0) if chi_deg is not None else None
+
+    obs_c = inc_c & np.isfinite(img_c)
+    if sig_c is not None and np.any(obs_c & np.isfinite(sig_c) & (sig_c < 0.0)):
+        raise ValueError("sigma must be non-negative on valid observed pixels")
 
     q_edges = np.linspace(q_min, q_max, n_bins + 1, dtype=float)
-    in_q = (q_mag >= q_min) & (q_mag <= q_max)
-    q_idx = np.searchsorted(q_edges, q_mag, side="right") - 1
-    q_idx[q_mag == q_edges[-1]] = n_bins - 1
+    inv_dq = float(n_bins) / max(q_max - q_min, 1.0e-30)
+    q_idx_c = np.floor((q_c - q_min) * inv_dq).astype(np.int64)
+    np.clip(q_idx_c, 0, n_bins - 1, out=q_idx_c)
 
-    def _bin_radial(
-        cand_sel: np.ndarray, obs_sel: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        c_cnt = np.bincount(q_idx[cand_sel], minlength=n_bins).astype(np.int64)
-        o_cnt = np.bincount(q_idx[obs_sel], minlength=n_bins).astype(np.int64)
-        o_sum = np.bincount(q_idx[obs_sel], weights=img[obs_sel], minlength=n_bins).astype(float)
+    def _bin_radial_1d(
+        cand_sel: np.ndarray | None,
+        obs_sel: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+        c_idx = q_idx_c if cand_sel is None else q_idx_c[cand_sel]
+        o_idx = q_idx_c[obs_sel]
+        o_img = img_c[obs_sel]
+        c_cnt = np.bincount(c_idx, minlength=n_bins).astype(np.int64)
+        o_cnt = np.bincount(o_idx, minlength=n_bins).astype(np.int64)
+        o_sum = np.bincount(o_idx, weights=o_img, minlength=n_bins).astype(float)
         o_mean = np.full(n_bins, np.nan, dtype=float)
         np.divide(o_sum, o_cnt, out=o_mean, where=o_cnt > 0)
-        z_sel = obs_sel & (np.abs(img) <= 1.0e-12)
-        z_cnt = np.bincount(q_idx[z_sel], minlength=n_bins).astype(np.int64)
+        z_mask = np.abs(o_img) <= 1.0e-12
+        z_cnt = np.bincount(o_idx[z_mask], minlength=n_bins).astype(np.int64) if np.any(z_mask) else np.zeros(n_bins, dtype=np.int64)
         z_frac = np.divide(z_cnt, o_cnt, out=np.zeros(n_bins, dtype=float), where=o_cnt > 0)
-        return o_mean, o_cnt, c_cnt, z_frac
+
+        se_rad: np.ndarray | None = None
+        if sig_c is not None:
+            o_sig = sig_c[obs_sel]
+            sig_ok = np.isfinite(o_sig) & (o_sig >= 0.0)
+            if np.any(sig_ok):
+                s_idx = o_idx[sig_ok]
+                s_val = o_sig[sig_ok]
+                s_cnt = np.bincount(s_idx, minlength=n_bins).astype(float)
+                s_var = np.bincount(s_idx, weights=s_val * s_val, minlength=n_bins).astype(float)
+                se_rad = np.full(n_bins, np.nan, dtype=float)
+                good_s = s_cnt > 0
+                se_rad[good_s] = np.sqrt(s_var[good_s]) / s_cnt[good_s]
+        return o_mean, o_cnt, c_cnt, z_frac, se_rad
 
     # Full-azimuth channel
-    full_I, full_cnt, full_cand, full_zfrac = _bin_radial(geometry & in_q, usable & in_q)
+    full_I, full_cnt, full_cand, full_zfrac, full_se = _bin_radial_1d(None, obs_c)
     full_summary = _summarize_radial_channel(
         q_edges,
         full_I,
@@ -1912,29 +2492,32 @@ def measure_radial_coarsening_observables(
         channel_name="full_azimuth",
         zero_pixel_fraction=full_zfrac,
         background_level=background_level,
+        intensity_mode=mode,
+        sigma_radial=full_se,
     )
+
+    # Azimuthal angles computed strictly on the pre-filtered 1D in-window pixels
+    angles_c = chi_c if chi_c is not None else np.mod(np.degrees(np.arctan2(qy_c, qx_c)), 360.0)
+    pos_q = q_c > 0.0
 
     # Lobe-sectored channel
     if lobe_angles_deg is not None:
         sector_angles = [float(a) % 360.0 for a in lobe_angles_deg if math.isfinite(float(a))]
         sector_source = "user_supplied"
     else:
-        sector_angles, sector_source = _detect_wing_angles_for_sectors(
-            img,
-            qx_arr,
-            qy_arr,
-            geometry,
-            usable,
-            q_window=(q_min, q_max),
+        pos_obs = obs_c & pos_q
+        sector_angles, sector_source = _detect_wing_angles_from_1d_pixels(
+            angles_c[pos_obs],
+            img_c[pos_obs],
             nominal_draw_axis_deg=nominal_draw_axis_deg,
         )
 
-    if sector_angles:
-        in_sector = np.zeros(img.shape, dtype=bool)
+    if sector_angles and angles_c.size > 0:
+        in_sector = np.zeros(angles_c.shape, dtype=bool)
         for ray_deg in sector_angles:
-            in_sector |= np.abs(_periodic_dist_deg(angles_deg, ray_deg, 360.0)) <= half_w
-        in_sector &= q_mag > 0.0
-        lobe_I, lobe_cnt, lobe_cand, lobe_zfrac = _bin_radial(geometry & in_q & in_sector, usable & in_q & in_sector)
+            in_sector |= np.abs(((angles_c - ray_deg + 180.0) % 360.0) - 180.0) <= half_w
+        in_sector &= pos_q
+        lobe_I, lobe_cnt, lobe_cand, lobe_zfrac, lobe_se = _bin_radial_1d(in_sector, obs_c & in_sector)
         lobe_summary = _summarize_radial_channel(
             q_edges,
             lobe_I,
@@ -1945,6 +2528,8 @@ def measure_radial_coarsening_observables(
             channel_name="lobe_sectored",
             zero_pixel_fraction=lobe_zfrac,
             background_level=background_level,
+            intensity_mode=mode,
+            sigma_radial=lobe_se,
         )
         lobe_summary["lobe_angles_deg"] = sector_angles
         lobe_summary["sector_half_width_deg"] = half_w
@@ -1959,6 +2544,9 @@ def measure_radial_coarsening_observables(
             "direct_peak": None,
             "kratky_peak": None,
             "q_win_invariant": None,
+            "q_win_bg_subtracted": None,
+            "q_win_stat_stderr": None,
+            "sigma_radial": None,
         }
 
     # Primary top-level peaks: prefer lobe-sectored when detected and populated, else full-azimuth
@@ -1998,8 +2586,15 @@ def measure_radial_coarsening_observables(
     ]
     if unit_caveat is not None:
         caveats.append(unit_caveat)
+    if mode == "raw":
+        caveats.append(
+            "intensity_mode='raw': q_win_invariant and q_win_bg_subtracted are withheld (None) "
+            "because uncalibrated raw detector counts cannot produce an absolute scattering invariant."
+        )
 
     flags: list[str] = []
+    if mode == "raw":
+        flags.append("raw_intensity_mode_q_win_withheld")
     if q_scale_nm_inv is None:
         flags.append("uncalibrated_pixel_q" if q_unit_label == "pixel-q" else "spacing_unavailable_unknown_q_unit")
     if direct_pk["edge_hit"]:
@@ -2013,10 +2608,13 @@ def measure_radial_coarsening_observables(
 
     direct_low_q_edge_hit = bool(direct_pk["edge_hit"] and direct_pk["edge_hit_side"] == "low_q")
     kratky_low_q_edge_hit = bool(kratky_pk["edge_hit"] and kratky_pk["edge_hit_side"] == "low_q")
+    has_sigma = full_se is not None
+    sys_k = "unavailable" if systematic_k_uncertainty is None else systematic_k_uncertainty
 
     return json_safe({
         "status": "estimated" if full_summary["status"] == "estimated" else "unavailable",
         "q_unit": q_unit_label,
+        "intensity_mode": mode,
         "q_window": [q_min, q_max],
         "peak_channel_source": primary_source,
         "I_bg_estimate": primary.get("I_bg_estimate"),
@@ -2038,7 +2636,11 @@ def measure_radial_coarsening_observables(
         "kratky_low_q_edge_hit": kratky_low_q_edge_hit,
         "q_win_invariant": full_summary["q_win_invariant"],
         "q_win_bg_subtracted": full_summary["q_win_bg_subtracted"],
-        "q_win_units": f"intensity * ({q_unit_label})^3",
+        "q_win_stat_stderr": full_summary["q_win_stat_stderr"],
+        "sigma_radial": full_summary["sigma_radial"],
+        "sigma_source": "supplied_statistical_sigma" if has_sigma else "unavailable",
+        "systematic_k_uncertainty": sys_k,
+        "q_win_units": f"intensity * ({q_unit_label})^3" if mode == "calibrated" else None,
         "full_azimuth": full_summary,
         "lobe_sectored": lobe_summary,
         "correlation_function": correlation,
@@ -2133,10 +2735,27 @@ def _fit_1d_transverse_gaussian(
     hi = np.array([np.inf, max(10.0 * y_range, 10.0 * abs(y_max), 1.0), 0.45 * q_perp_max, sig_hi], dtype=float)
 
     def _model(p: np.ndarray, x: np.ndarray) -> np.ndarray:
-        return p[0] + p[1] * np.exp(-0.5 * ((x - p[2]) / p[3]) ** 2)
+        u = (x - p[2]) / p[3]
+        return p[0] + p[1] * np.exp(-0.5 * (u * u))
+
+    def _res_1d(p: np.ndarray) -> np.ndarray:
+        u = (xo - p[2]) / p[3]
+        return p[0] + p[1] * np.exp(-0.5 * (u * u)) - yo
+
+    def _jac_1d(p: np.ndarray) -> np.ndarray:
+        inv_s = 1.0 / p[3]
+        u = (xo - p[2]) * inv_s
+        g = np.exp(-0.5 * (u * u))
+        ag = p[1] * g
+        J = np.empty((n_obs, 4), dtype=float)
+        J[:, 0] = 1.0
+        J[:, 1] = g
+        J[:, 2] = ag * (u * inv_s)
+        J[:, 3] = ag * ((u * u) * inv_s)
+        return J
 
     try:
-        fit = least_squares(lambda p: _model(p, xo) - yo, p0, bounds=(lo, hi), loss="linear", max_nfev=1500)
+        fit = least_squares(_res_1d, p0, jac=_jac_1d, bounds=(lo, hi), loss="linear", max_nfev=1500)
     except (ValueError, RuntimeError, FloatingPointError):
         return {"valid": False, "reason": "transverse_optimizer_failed", "support_fraction": support_frac, "n_observed_bins": n_obs}
 
@@ -2368,8 +2987,8 @@ def _fit_streak_width_models(
 
 def measure_perpendicular_streak_width(
     image: Any,
-    qx: Any,
-    qy: Any,
+    qx: Any = None,
+    qy: Any = None,
     *,
     valid_mask: Any = None,
     q_window: tuple[float, float],
@@ -2382,6 +3001,9 @@ def measure_perpendicular_streak_width(
     min_slice_pixels: int = 12,
     min_slice_r2: float = 0.5,
     nominal_draw_axis_deg: float = 90.0,
+    geometry_cache: Any = None,
+    intensity_mode: str = "calibrated",
+    sigma: Any = None,
 ) -> dict[str, Any]:
     """Measure transverse butterfly streak width ``dq_perp(q)`` along detected wing rays.
 
@@ -2390,7 +3012,7 @@ def measure_perpendicular_streak_width(
     only) using both linear (Williamson-Hall) and quadrature (Gaussian-convolution)
     fits on strictly observed transverse slices.
     """
-    img, qx_arr, qy_arr, geometry, usable = _validate_2d_inputs(image, qx, qy, valid_mask)
+    _normalise_intensity_mode(intensity_mode)
     q_min, q_max = _validate_q_window(q_window)
     if isinstance(n_q_slices, (bool, np.bool_)) or int(n_q_slices) < 3:
         raise ValueError("n_q_slices must be an integer >= 3")
@@ -2399,6 +3021,22 @@ def measure_perpendicular_streak_width(
     if not math.isfinite(half_ang) or not (1.0 <= half_ang <= 60.0):
         raise ValueError("transverse_half_angle_deg must be finite and in [1, 60]")
 
+    # Conservative radial upper bound covering all transverse slices before resolving ROI
+    tan_half_max = math.tan(math.radians(half_ang))
+    q_perp_prelim = q_max * tan_half_max
+    if min_q_perp_half_width is not None and math.isfinite(float(min_q_perp_half_width)):
+        q_perp_prelim = max(q_perp_prelim, float(min_q_perp_half_width))
+    q_roi_prelim = math.hypot(q_max, max(q_perp_prelim, 0.25 * q_max))
+
+    img, qx_arr, qy_arr, q_mag, chi_deg, geom_mask, inclusion, _, pixel_dq_hint = _resolve_2d_context(
+        image,
+        qx,
+        qy,
+        valid_mask,
+        geometry_cache=geometry_cache,
+        sigma=sigma,
+        required_q_max=q_roi_prelim,
+    )
     q_unit_label, q_scale_nm_inv, unit_caveat = _q_unit_info(q_unit)
 
     if wing_angles_deg is not None:
@@ -2409,10 +3047,13 @@ def measure_perpendicular_streak_width(
             img,
             qx_arr,
             qy_arr,
-            geometry,
-            usable,
+            geom_mask,
+            None,
             q_window=(q_min, q_max),
             nominal_draw_axis_deg=nominal_draw_axis_deg,
+            q_mag=q_mag,
+            chi_deg=chi_deg,
+            inclusion=inclusion,
         )
 
     caveats = [
@@ -2443,18 +3084,66 @@ def measure_perpendicular_streak_width(
             "caveats": caveats,
         })
 
-    # Estimate typical pixel reciprocal spacing for adaptive transverse binning
-    dx_med = float(np.nanmedian(np.abs(np.diff(qx_arr, axis=1)))) if qx_arr.shape[1] > 1 else 0.0
-    dy_med = float(np.nanmedian(np.abs(np.diff(qy_arr, axis=0)))) if qy_arr.shape[0] > 1 else 0.0
-    pixel_dq = max(min(v for v in (dx_med, dy_med) if v > 0.0) if (dx_med > 0.0 or dy_med > 0.0) else (q_max - q_min) / 100.0, 1.0e-9)
+    # Fast pixel reciprocal spacing estimate (reuse cache or strided subsample; avoids 2.48M-px nanmedian)
+    if pixel_dq_hint is not None and math.isfinite(float(pixel_dq_hint)) and float(pixel_dq_hint) > 0.0:
+        pixel_dq = float(pixel_dq_hint)
+    else:
+        stride_y = max(1, qx_arr.shape[0] // 64)
+        stride_x = max(1, qx_arr.shape[1] // 64)
+        dx_med = (
+            float(np.nanmedian(np.abs(np.diff(qx_arr[::stride_y, :], axis=1))))
+            if qx_arr.shape[1] > 1
+            else 0.0
+        )
+        dy_med = (
+            float(np.nanmedian(np.abs(np.diff(qy_arr[:, ::stride_x], axis=0))))
+            if qy_arr.shape[0] > 1
+            else 0.0
+        )
+        pixel_dq = max(
+            min(v for v in (dx_med, dy_med) if v > 0.0)
+            if (dx_med > 0.0 or dy_med > 0.0)
+            else (q_max - q_min) / 100.0,
+            1.0e-9,
+        )
 
     slice_edges = np.linspace(q_min, q_max, n_slices + 1, dtype=float)
     slice_centers = 0.5 * (slice_edges[:-1] + slice_edges[1:])
     slice_half_w = 0.5 * (slice_edges[1:] - slice_edges[:-1])
 
-    obs_qx = qx_arr[usable]
-    obs_qy = qy_arr[usable]
-    obs_img = img[usable]
+    # Exact radial ROI upper bound covering every slice of every wing
+    q_perp_upper = max(
+        q_max * tan_half_max,
+        float(min_q_perp_half_width)
+        if (min_q_perp_half_width is not None and math.isfinite(float(min_q_perp_half_width)))
+        else 6.0 * pixel_dq,
+    )
+    q_roi_upper = math.hypot(q_max, q_perp_upper)
+
+    if q_mag is None:
+        in_box = (np.abs(qx_arr) <= q_roi_upper) & (np.abs(qy_arr) <= q_roi_upper)
+        if not np.any(in_box):
+            if not np.any(np.isfinite(qx_arr) & np.isfinite(qy_arr)):
+                raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
+            obs_qx = np.empty(0, dtype=float)
+            obs_qy = np.empty(0, dtype=float)
+            obs_img = np.empty(0, dtype=float)
+        else:
+            bx = qx_arr[in_box]
+            by = qy_arr[in_box]
+            bimg = img[in_box]
+            binc = inclusion[in_box]
+            bq = np.hypot(bx, by)
+            in_ring = np.isfinite(bq) & (bq >= q_min) & (bq <= q_roi_upper) & binc & np.isfinite(bimg)
+            obs_qx = bx[in_ring]
+            obs_qy = by[in_ring]
+            obs_img = bimg[in_ring]
+    else:
+        assert geom_mask is not None
+        in_ring = geom_mask & inclusion & np.isfinite(img) & (q_mag >= q_min) & (q_mag <= q_roi_upper)
+        obs_qx = qx_arr[in_ring]
+        obs_qy = qy_arr[in_ring]
+        obs_img = img[in_ring]
 
     wings_out: list[dict[str, Any]] = []
     all_flags: list[str] = []
@@ -2478,6 +3167,34 @@ def measure_perpendicular_streak_width(
         tan_half = math.tan(math.radians(safe_half_ang))
         tan_neighbor_cap = math.tan(math.radians(max(6.0, 0.46 * min_neighbor_sep)))
 
+        # Precompute per-slice q_perp_max and filter & sort once per wing (replaces 12x full scans)
+        slice_q_perp_max = np.empty(n_slices, dtype=float)
+        for s_idx in range(n_slices):
+            qc = float(slice_centers[s_idx])
+            qpm = qc * tan_half
+            if min_q_perp_half_width is not None and math.isfinite(float(min_q_perp_half_width)):
+                qpm = max(qpm, float(min_q_perp_half_width))
+            else:
+                qpm = max(qpm, 6.0 * pixel_dq)
+            if min_neighbor_sep < 160.0:
+                qpm = min(qpm, max(qc * tan_neighbor_cap, 4.0 * pixel_dq))
+            slice_q_perp_max[s_idx] = qpm
+
+        wing_q_perp_cap = float(np.max(slice_q_perp_max)) if n_slices > 0 else q_perp_upper
+        in_wing = (q_par >= q_min) & (q_par <= q_max) & (np.abs(q_perp) <= wing_q_perp_cap)
+        if np.any(in_wing):
+            qp_w = q_par[in_wing]
+            qt_w = q_perp[in_wing]
+            im_w = obs_img[in_wing]
+            order_w = np.argsort(qp_w)
+            qp_s = qp_w[order_w]
+            qt_s = qt_w[order_w]
+            im_s = im_w[order_w]
+        else:
+            qp_s = np.empty(0, dtype=float)
+            qt_s = np.empty(0, dtype=float)
+            im_s = np.empty(0, dtype=float)
+
         slices_out: list[dict[str, Any]] = []
         valid_q_list: list[float] = []
         valid_fwhm_list: list[float] = []
@@ -2485,17 +3202,22 @@ def measure_perpendicular_streak_width(
         for s_idx in range(n_slices):
             qc = float(slice_centers[s_idx])
             hw_par = float(slice_half_w[s_idx])
-            q_perp_max = qc * tan_half
-            if min_q_perp_half_width is not None and math.isfinite(float(min_q_perp_half_width)):
-                q_perp_max = max(q_perp_max, float(min_q_perp_half_width))
-            else:
-                q_perp_max = max(q_perp_max, 6.0 * pixel_dq)
-            # Never cross into the neighboring wing sector
-            if min_neighbor_sep < 160.0:
-                q_perp_max = min(q_perp_max, max(qc * tan_neighbor_cap, 4.0 * pixel_dq))
+            q_perp_max = float(slice_q_perp_max[s_idx])
 
-            sel = (q_par >= qc - hw_par) & (q_par <= qc + hw_par) & (np.abs(q_perp) <= q_perp_max)
-            n_px = int(np.count_nonzero(sel))
+            lo_i = int(np.searchsorted(qp_s, qc - hw_par, side="left"))
+            hi_i = int(np.searchsorted(qp_s, qc + hw_par, side="right"))
+            if hi_i > lo_i:
+                qt_seg = qt_s[lo_i:hi_i]
+                im_seg = im_s[lo_i:hi_i]
+                sel_perp = np.abs(qt_seg) <= q_perp_max
+                p_vals = qt_seg[sel_perp]
+                i_vals = im_seg[sel_perp]
+                n_px = int(p_vals.size)
+            else:
+                p_vals = np.empty(0, dtype=float)
+                i_vals = np.empty(0, dtype=float)
+                n_px = 0
+
             if n_px < int(min_slice_pixels):
                 slices_out.append({
                     "q_center": _finite(qc),
@@ -2519,9 +3241,8 @@ def measure_perpendicular_streak_width(
 
             p_edges = np.linspace(-q_perp_max, q_perp_max, nb + 1, dtype=float)
             p_centers = 0.5 * (p_edges[:-1] + p_edges[1:])
-            p_vals = q_perp[sel]
-            i_vals = obs_img[sel]
-            p_idx = np.clip(np.searchsorted(p_edges, p_vals, side="right") - 1, 0, nb - 1)
+            p_idx = np.floor((p_vals + q_perp_max) * (float(nb) / max(2.0 * q_perp_max, 1.0e-30))).astype(np.int64)
+            np.clip(p_idx, 0, nb - 1, out=p_idx)
             p_cnt = np.bincount(p_idx, minlength=nb).astype(np.int64)
             p_sum = np.bincount(p_idx, weights=i_vals, minlength=nb).astype(float)
             p_mean = np.full(nb, np.nan, dtype=float)
@@ -3006,6 +3727,329 @@ def fit_arrhenius_rate(
     })
 
 
+# ---------------------------------------------------------------------------
+# 6. Native Multi-Window & Azimuthal-Model Sensitivity Audit
+# ---------------------------------------------------------------------------
+
+
+def run_window_sensitivity_audit(
+    intensity: Any,
+    qx: Any = None,
+    qy: Any = None,
+    valid_mask: Any = None,
+    *,
+    q_unit: str = "nm^-1",
+    q_windows: Sequence[tuple[float, float]] = (
+        (0.25, 1.35),
+        (0.11, 1.35),
+        (0.12, 1.20),
+        (0.15, 1.00),
+    ),
+    nominal_draw_axis_deg: float = 90.0,
+    bright_axis_convention: str = "reference",
+    intensity_mode: str = "calibrated",
+    sigma: Any = None,
+    geometry_cache: Any = None,
+    n_radial_bins: int = 64,
+    n_azimuthal_bins: int = 180,
+    sector_half_width_deg: float = 20.0,
+    azimuthal_q_max: float = 0.45,
+    systematic_k_uncertainty: float | str | None = None,
+) -> dict[str, Any]:
+    """Compare direct/Kratky peaks, ``Q_win``, and flat vs C2-bridge models across q-windows.
+
+    Performs a single ROI pre-filter / geometry pass and evaluates every requested
+    ``q_window`` strictly on observed valid pixels, returning a strict-JSON
+    (``allow_nan=False``) audit summary.
+    """
+    mode = _normalise_intensity_mode(intensity_mode)
+    convention = str(bright_axis_convention or "reference").strip().lower()
+    if convention not in {"draw", "reference"}:
+        raise ValueError("bright_axis_convention must be 'draw' or 'reference'")
+    validated_windows = [_validate_q_window(w) for w in q_windows]
+    if not validated_windows:
+        raise ValueError("q_windows must contain at least one (q_min, q_max) pair")
+    if isinstance(n_radial_bins, (bool, np.bool_)) or int(n_radial_bins) < 4:
+        raise ValueError("n_radial_bins must be an integer >= 4")
+    if isinstance(n_azimuthal_bins, (bool, np.bool_)) or int(n_azimuthal_bins) < 12:
+        raise ValueError("n_azimuthal_bins must be an integer >= 12")
+
+    q_unit_label, _, unit_caveat = _q_unit_info(q_unit)
+    global_q_max = max(w[1] for w in validated_windows)
+    ref_span = max(w[1] - w[0] for w in validated_windows)
+
+    img, qx_arr, qy_arr, q_mag, chi_deg, geom_mask, inclusion, sig_arr, pixel_dq_hint = _resolve_2d_context(
+        intensity,
+        qx,
+        qy,
+        valid_mask,
+        geometry_cache=geometry_cache,
+        sigma=sigma,
+        required_q_max=global_q_max,
+    )
+
+    # Build a single compact in-memory ROI cache for the whole multi-window pass
+    if q_mag is None:
+        in_box = (np.abs(qx_arr) <= global_q_max) & (np.abs(qy_arr) <= global_q_max)
+        row_any = np.any(in_box, axis=1)
+        if not np.any(row_any):
+            if not np.any(np.isfinite(qx_arr) & np.isfinite(qy_arr)):
+                raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
+            sl = (slice(0, img.shape[0]), slice(0, img.shape[1]))
+        else:
+            col_any = np.any(in_box, axis=0)
+            y0 = int(np.argmax(row_any))
+            y1 = int(img.shape[0] - np.argmax(row_any[::-1]))
+            x0 = int(np.argmax(col_any))
+            x1 = int(img.shape[1] - np.argmax(col_any[::-1]))
+            sl = (slice(y0, y1), slice(x0, x1))
+        img_roi = np.ascontiguousarray(img[sl])
+        qx_roi = np.ascontiguousarray(qx_arr[sl])
+        qy_roi = np.ascontiguousarray(qy_arr[sl])
+        q_roi = np.hypot(qx_roi, qy_roi)
+        chi_roi = np.mod(np.degrees(np.arctan2(qy_roi, qx_roi)), 360.0)
+        geom_roi = np.isfinite(q_roi)
+        valid_roi = np.ascontiguousarray(inclusion[sl]) & geom_roi
+        sig_roi = np.ascontiguousarray(sig_arr[sl]) if sig_arr is not None else None
+    else:
+        img_roi = img
+        qx_roi = qx_arr
+        qy_roi = qy_arr
+        q_roi = q_mag
+        chi_roi = (
+            np.mod(chi_deg, 360.0)
+            if chi_deg is not None
+            else np.mod(np.degrees(np.arctan2(qy_roi, qx_roi)), 360.0)
+        )
+        geom_roi = geom_mask if geom_mask is not None else np.isfinite(q_roi)
+        valid_roi = inclusion & geom_roi
+        sig_roi = sig_arr
+
+    from .geometry import SAXSGeometryCache
+
+    pass_cache = SAXSGeometryCache(
+        geometry=geometry_cache.geometry if geometry_cache is not None else {"qx": qx_roi, "qy": qy_roi, "q": q_roi},
+        shape=img_roi.shape,
+        beam_center_xy=getattr(geometry_cache, "beam_center_xy", (0.0, 0.0)),
+        pixel_dq=float(pixel_dq_hint) if pixel_dq_hint is not None else 1.0,
+        base_valid_mask=valid_roi,
+        beamstop_exclusion_mask=np.zeros(img_roi.shape, dtype=bool),
+        valid_mask=valid_roi,
+        roi_slices=(slice(0, img_roi.shape[0]), slice(0, img_roi.shape[1])),
+        q_mag_roi=q_roi,
+        qx_roi=qx_roi,
+        qy_roi=qy_roi,
+        chi_deg_roi=chi_roi,
+        valid_roi=valid_roi,
+        q_coordinates_validated=True,
+        q_roi_max=global_q_max,
+        q_unit=q_unit_label,
+        geometry_roi_mask=geom_roi,
+    )
+
+    # Seed reference lobe centers once from the widest window's azimuthal band
+    widest_lo, widest_hi = max(validated_windows, key=lambda w: w[1] - w[0])
+    seed_az_hi = min(float(azimuthal_q_max), widest_hi)
+    seed_az_win = (widest_lo, seed_az_hi) if seed_az_hi > widest_lo else (widest_lo, widest_hi)
+    seed_ang, seed_prof, seed_cnt, _, _, _ = _bin_azimuthal_from_2d(
+        img_roi,
+        qx_roi,
+        qy_roi,
+        geom_roi,
+        None,
+        q_window=seed_az_win,
+        n_bins=int(n_azimuthal_bins),
+        q_mag=q_roi,
+        chi_deg=chi_roi,
+        inclusion=valid_roi,
+    )
+    seed_harm = compute_azimuthal_harmonics_and_order(
+        angle_deg=seed_ang,
+        intensity=seed_prof,
+        counts=seed_cnt,
+        q_unit=q_unit,
+        nominal_draw_axis_deg=nominal_draw_axis_deg,
+        bright_axis_convention=convention,
+    )
+    shared_lobe_centers: list[float] | None = None
+    if (seed_harm.get("a4") or 0.0) >= 0.02 and int(seed_harm.get("n_observed_bins") or 0) >= 12:
+        seed_fit = fit_c2_bridge_four_lobe(
+            seed_ang,
+            seed_prof,
+            counts=seed_cnt,
+            nominal_draw_axis_deg=nominal_draw_axis_deg,
+            initial_chi_sym_deg=seed_harm.get("friedel_bisector_deg"),
+            initial_alpha_deg=seed_harm.get("wing_half_opening_estimate_deg"),
+            max_nfev=1500,
+        )
+        if seed_fit.get("success") and seed_fit.get("lobe_centers_deg"):
+            centers = [float(c) for c in seed_fit["lobe_centers_deg"] if c is not None]
+            if len(centers) == 4:
+                shared_lobe_centers = centers
+
+    window_rows: list[dict[str, Any]] = []
+    all_flags: list[str] = []
+    any_sigma = False
+
+    for idx_w, (w_lo, w_hi) in enumerate(validated_windows):
+        n_bins_w = max(16, int(round(float(n_radial_bins) * (w_hi - w_lo) / max(ref_span, 1.0e-12))))
+        rad = measure_radial_coarsening_observables(
+            img_roi,
+            q_window=(w_lo, w_hi),
+            q_unit=q_unit,
+            n_radial_bins=n_bins_w,
+            lobe_angles_deg=shared_lobe_centers,
+            sector_half_width_deg=sector_half_width_deg,
+            nominal_draw_axis_deg=nominal_draw_axis_deg,
+            geometry_cache=pass_cache,
+            intensity_mode=mode,
+            sigma=sig_roi,
+            systematic_k_uncertainty=systematic_k_uncertainty,
+        )
+        if rad.get("sigma_source") == "supplied_statistical_sigma":
+            any_sigma = True
+
+        az_hi = min(float(azimuthal_q_max), w_hi)
+        az_win = (w_lo, az_hi) if az_hi > w_lo else (w_lo, w_hi)
+        w_ang, w_prof, w_cnt, _, _, _ = _bin_azimuthal_from_2d(
+            img_roi,
+            qx_roi,
+            qy_roi,
+            geom_roi,
+            None,
+            q_window=az_win,
+            n_bins=int(n_azimuthal_bins),
+            q_mag=q_roi,
+            chi_deg=chi_roi,
+            inclusion=valid_roi,
+        )
+        harm = compute_azimuthal_harmonics_and_order(
+            angle_deg=w_ang,
+            intensity=w_prof,
+            counts=w_cnt,
+            q_unit=q_unit,
+            nominal_draw_axis_deg=nominal_draw_axis_deg,
+            bright_axis_convention=convention,
+        )
+        c2_fit = fit_c2_bridge_four_lobe(
+            w_ang,
+            w_prof,
+            counts=w_cnt,
+            nominal_draw_axis_deg=nominal_draw_axis_deg,
+            initial_chi_sym_deg=harm.get("friedel_bisector_deg"),
+            initial_alpha_deg=harm.get("wing_half_opening_estimate_deg"),
+            max_nfev=1500,
+        )
+        fcmp = c2_fit.get("flat_baseline_comparison") or {}
+        all_flags.extend(rad.get("flags") or ())
+        all_flags.extend(harm.get("flags") or ())
+
+        window_rows.append({
+            "window_index": idx_w,
+            "window_label": f"{w_lo:g}_{w_hi:g}",
+            "q_window": [w_lo, w_hi],
+            "azimuthal_q_window": [az_win[0], az_win[1]],
+            "n_radial_bins": n_bins_w,
+            "peak_channel_source": rad.get("peak_channel_source"),
+            "q_star_direct": rad.get("q_star_direct"),
+            "L_star_direct_nm": rad.get("L_star_direct_nm"),
+            "edge_hit_direct": rad.get("edge_hit_direct"),
+            "direct_low_q_edge_hit": rad.get("direct_low_q_edge_hit"),
+            "q_star_kratky": rad.get("q_star_kratky"),
+            "L_star_kratky_nm": rad.get("L_star_kratky_nm"),
+            "edge_hit_kratky": rad.get("edge_hit_kratky"),
+            "kratky_low_q_edge_hit": rad.get("kratky_low_q_edge_hit"),
+            "I_bg_estimate": rad.get("I_bg_estimate"),
+            "q_win_invariant": rad.get("q_win_invariant"),
+            "q_win_bg_subtracted": rad.get("q_win_bg_subtracted"),
+            "q_win_stat_stderr": rad.get("q_win_stat_stderr"),
+            "a2": harm.get("a2"),
+            "a4": harm.get("a4"),
+            "a4_over_a2": harm.get("a4_over_a2"),
+            "friedel_bisector_deg": harm.get("friedel_bisector_deg"),
+            "orthogonal_rotation_detected": bool(harm.get("orthogonal_rotation_detected", False)),
+            "c2_bridge_model": {
+                "success": bool(c2_fit.get("success", False)),
+                "c0": c2_fit.get("c0"),
+                "c2": c2_fit.get("c2"),
+                "chi_sym_deg": c2_fit.get("chi_sym_deg"),
+                "alpha_deg": c2_fit.get("alpha_deg"),
+                "lobe_fwhm_deg": c2_fit.get("lobe_fwhm_deg"),
+                "rmse": c2_fit.get("rmse"),
+                "r_squared": c2_fit.get("r_squared"),
+                "aic": c2_fit.get("aic"),
+                "bic": c2_fit.get("bic"),
+            },
+            "flat_baseline_model": {
+                "success": bool(fcmp.get("success", False)),
+                "c0": fcmp.get("c0"),
+                "chi_sym_deg": fcmp.get("chi_sym_deg"),
+                "alpha_deg": fcmp.get("alpha_deg"),
+                "lobe_fwhm_deg": fcmp.get("lobe_fwhm_deg"),
+                "rmse": fcmp.get("rmse"),
+                "r_squared": fcmp.get("r_squared"),
+                "aic": fcmp.get("aic"),
+                "bic": fcmp.get("bic"),
+            },
+            "model_comparison": {
+                "delta_rmse": fcmp.get("delta_rmse"),
+                "delta_r_squared": fcmp.get("delta_r_squared"),
+                "delta_aic": fcmp.get("delta_aic"),
+                "delta_bic": fcmp.get("delta_bic"),
+                "bridge_f_stat": fcmp.get("bridge_f_stat"),
+                "bridge_improved": bool(fcmp.get("bridge_improved", False)),
+                "lobe_fwhm_bias_deg": fcmp.get("lobe_fwhm_bias_deg"),
+            },
+        })
+
+    def _span(values: list[float | None]) -> list[float] | None:
+        finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+        return [min(finite), max(finite)] if finite else None
+
+    delta_bics = [
+        float(r["model_comparison"]["delta_bic"])
+        for r in window_rows
+        if r["model_comparison"]["delta_bic"] is not None
+    ]
+    caveats = [
+        "Window sensitivity audit evaluates strictly observed valid pixels across each declared q_window "
+        "without fabricating or extrapolating outside the measured reciprocal-space domain.",
+    ]
+    if unit_caveat is not None:
+        caveats.append(unit_caveat)
+    if mode == "raw":
+        caveats.append(
+            "intensity_mode='raw': q_win_invariant and q_win_bg_subtracted are withheld (None) across all windows."
+        )
+
+    sys_k = "unavailable" if systematic_k_uncertainty is None else systematic_k_uncertainty
+    return json_safe({
+        "schema_version": "wingsaxs.window_sensitivity_audit.v1",
+        "status": "estimated" if window_rows else "unavailable",
+        "q_unit": q_unit_label,
+        "intensity_mode": mode,
+        "nominal_draw_axis_deg": float(nominal_draw_axis_deg) % 180.0,
+        "bright_axis_convention": convention,
+        "sigma_source": "supplied_statistical_sigma" if any_sigma else "unavailable",
+        "systematic_k_uncertainty": sys_k,
+        "windows": window_rows,
+        "summary": {
+            "n_windows": len(window_rows),
+            "n_windows_direct_peak": sum(1 for r in window_rows if r["q_star_direct"] is not None),
+            "n_windows_kratky_peak": sum(1 for r in window_rows if r["q_star_kratky"] is not None),
+            "n_windows_bridge_improved": sum(1 for r in window_rows if r["model_comparison"]["bridge_improved"]),
+            "q_star_direct_range": _span([r["q_star_direct"] for r in window_rows]),
+            "L_star_direct_nm_range": _span([r["L_star_direct_nm"] for r in window_rows]),
+            "q_star_kratky_range": _span([r["q_star_kratky"] for r in window_rows]),
+            "L_star_kratky_nm_range": _span([r["L_star_kratky_nm"] for r in window_rows]),
+            "q_win_bg_subtracted_range": _span([r["q_win_bg_subtracted"] for r in window_rows]),
+            "median_delta_bic_c2_vs_flat": _finite(float(np.median(delta_bics))) if delta_bics else None,
+        },
+        "flags": list(dict.fromkeys(all_flags)),
+        "caveats": caveats,
+    })
+
+
 __all__ = [
     "compute_azimuthal_harmonics_and_order",
     "evaluate_c2_bridge_four_lobe",
@@ -3014,5 +4058,6 @@ __all__ = [
     "fit_power_law_coarsening",
     "measure_perpendicular_streak_width",
     "measure_radial_coarsening_observables",
+    "run_window_sensitivity_audit",
     "unwrap_periodic_angles_deg",
 ]

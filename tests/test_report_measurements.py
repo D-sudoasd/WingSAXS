@@ -176,3 +176,19 @@ def test_constant_q_map_gets_finite_bins_and_invalid_domains_raise_actionable_er
         measure_frame(image, qx, qy, radial_bins=0)
     with pytest.raises(ValueError, match="q_edges must be finite and strictly increasing"):
         measure_frame(image, qx, qy, q_edges=[0.0, 1.0, 1.0])
+
+
+def test_large_offset_variance_guard_avoids_catastrophic_cancellation():
+    # Values around 1e9 + {0, 1, 2, 3} would lose all digits in naive E[X^2]-E[X]^2
+    image = 1.0e9 + np.array(
+        [[0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 2.0, 3.0]],
+        dtype=np.float64,
+    )
+    qx = np.full_like(image, 1.0)
+    qy = np.zeros_like(image)
+    result = measure_frame(image, qx, qy, q_edges=[0.0, 2.0], radial_bins=1, angular_bins=4)
+
+    expected_std = float(np.std(image.ravel(), ddof=1))
+    assert result["summary"]["intensity"]["std"] == pytest.approx(expected_std, rel=1e-9)
+    assert result["radial_rows"][0]["std"] == pytest.approx(expected_std, rel=1e-9)
+    assert result["radial_rows"][0]["sem"] == pytest.approx(expected_std / np.sqrt(image.size), rel=1e-9)

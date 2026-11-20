@@ -17,6 +17,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
 from .butterfly_quality import build_quality_remediation
+from .geometry import apply_beamstop_mask
 from .settings import canonical_q_unit
 
 SCHEMA_VERSION = "wingsaxs.auto_advisor.v1"
@@ -125,8 +126,8 @@ def build_beamstop_exclusion_mask(
 
     if radius == 0.0:
         return np.zeros((height, width), dtype=bool)
-    yy, xx = np.indices((height, width), dtype=np.float64)
-    return ((xx - cx) ** 2 + (yy - cy) ** 2) <= (radius ** 2)
+    _, exclusion = apply_beamstop_mask(None, (height, width), (cx, cy), radius)
+    return exclusion
 
 
 def _infer_beam_geometry(
@@ -233,6 +234,9 @@ def _detect_active_outer_q_cutoff(
     q_map: np.ndarray,
     obs_valid: np.ndarray,
     pixel_dq: float,
+    *,
+    q_obs: np.ndarray | None = None,
+    i_obs: np.ndarray | None = None,
 ) -> tuple[float, bool]:
     """Detect and exclude unmasked outer zero-padded dead high-q shells.
 
@@ -242,21 +246,39 @@ def _detect_active_outer_q_cutoff(
     ``frac(|I| <= 1e-12) > 0.90`` prevents zero-fill cliffs from collapsing
     the diffuse background floor to zero.
     """
-    q_vals = q_map[obs_valid]
-    i_vals = intensity[obs_valid]
-    q_min_obs = float(np.min(q_vals))
-    q_max_obs = float(np.max(q_vals))
-    if q_max_obs <= q_min_obs or q_vals.size < 64:
+    if q_obs is not None and i_obs is not None:
+        q_use = q_obs
+        i_use = i_obs
+    elif intensity.shape[0] >= 512 and intensity.shape[1] >= 512:
+        # Uniform 2x2 spatial grid (~620k px on Pilatus 2M) avoids 1D stride aliasing in corners
+        ov_sub = obs_valid[::2, ::2]
+        q_use = q_map[::2, ::2][ov_sub]
+        i_use = intensity[::2, ::2][ov_sub]
+    else:
+        q_use = q_map[obs_valid]
+        i_use = intensity[obs_valid]
+    if q_use.size < 64:
+        return (float(np.max(q_use)) if q_use.size else 0.0), False
+    q_min_obs = float(np.min(q_use))
+    q_max_obs = float(np.max(q_use))
+    if q_max_obs <= q_min_obs:
         return q_max_obs, False
 
     span_px = (q_max_obs - q_min_obs) / max(pixel_dq, 1e-12)
     n_shells = int(np.clip(round(span_px / 3.0), 24, 120))
     edges = np.linspace(q_min_obs, q_max_obs, n_shells + 1, dtype=np.float64)
-    idx = np.clip(np.searchsorted(edges, q_vals, side="right") - 1, 0, n_shells - 1)
+    inv_dq = float(n_shells) / (q_max_obs - q_min_obs)
+    # q_use >= q_min_obs guarantees non-negative scaled coordinates -> astype(intp) == floor
+    idx = ((q_use - q_min_obs) * inv_dq).astype(np.intp)
+    idx[idx >= n_shells] = n_shells - 1
     counts = np.bincount(idx, minlength=n_shells)
-    zero_counts = np.bincount(idx, weights=(np.abs(i_vals) <= 1e-12).astype(np.float64), minlength=n_shells)
+    zero_sel = (i_use >= -1e-12) & (i_use <= 1e-12)
+    zero_counts = np.bincount(idx[zero_sel], minlength=n_shells) if np.any(zero_sel) else np.zeros(n_shells, dtype=np.int64)
 
-    populated = np.flatnonzero(counts >= 5)
+    min_shell_cnt = max(5, int(round(0.00015 * q_use.size))) if q_use.size > 100_000 else 5
+    populated = np.flatnonzero(counts >= min_shell_cnt)
+    if populated.size < 6:
+        populated = np.flatnonzero(counts >= 5)
     if populated.size < 6:
         return q_max_obs, False
 
@@ -276,7 +298,7 @@ def _detect_active_outer_q_cutoff(
         else:
             break
 
-    if dead_shells < 2 and dead_pixels < int(0.05 * q_vals.size):
+    if dead_shells < 2 and dead_pixels < int(0.05 * q_use.size):
         return q_max_obs, False
     if last_active_pos < 3:
         return q_max_obs, False
@@ -292,10 +314,67 @@ def _detect_active_outer_q_cutoff(
 
     active_bin = int(populated[last_active_pos])
     q_active_max = float(edges[active_bin + 1])
-    active_vals = i_vals[q_vals <= q_active_max]
-    if active_vals.size < 16 or float(np.percentile(np.abs(active_vals), 90.0)) <= 1e-12:
+    # Reuse already-binned shell counts & zero counts (exact for q <= edges[active_bin + 1])
+    n_active = int(np.sum(counts[: active_bin + 1]))
+    if n_active < 16:
+        return q_max_obs, False
+    n_zero_active = int(np.sum(zero_counts[: active_bin + 1]))
+    if n_zero_active >= int(math.ceil(0.90 * (n_active - 1))) + 1:
         return q_max_obs, False
     return q_active_max, True
+
+
+def _compute_beamstop_shells(
+    intensity: np.ndarray,
+    obs_valid: np.ndarray,
+    cx: float,
+    cy: float,
+    r_limit: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-integer-radius total/valid counts, medians, and zero-fractions inside ``r <= r_limit``."""
+    height, width = intensity.shape
+    n_shells = r_limit + 1
+    total_cnt = np.zeros(n_shells, dtype=np.int64)
+    valid_cnt = np.zeros(n_shells, dtype=np.int64)
+    shell_med = np.full(n_shells, np.nan, dtype=np.float64)
+    shell_zero_frac = np.full(n_shells, np.nan, dtype=np.float64)
+
+    r_box = r_limit + 1.0
+    y0 = max(0, int(math.floor(cy - r_box)))
+    y1 = min(height, int(math.ceil(cy + r_box)) + 1)
+    x0 = max(0, int(math.floor(cx - r_box)))
+    x1 = min(width, int(math.ceil(cx + r_box)) + 1)
+    if y0 < y1 and x0 < x1:
+        dy2 = (np.arange(y0, y1, dtype=np.float32) - np.float32(cy)) ** 2
+        dx2 = (np.arange(x0, x1, dtype=np.float32) - np.float32(cx)) ** 2
+        r2_box = dy2[:, None] + dx2[None, :]
+        r_lim2 = np.float32((r_limit + 0.5) ** 2)
+        in_search = r2_box <= r_lim2
+        if np.any(in_search):
+            r_in = (np.sqrt(r2_box[in_search]) + np.float32(0.5)).astype(np.intp)
+            r_in[r_in > r_limit] = r_limit
+            total_cnt = np.bincount(r_in, minlength=n_shells).astype(np.int64)
+            v_in = obs_valid[y0:y1, x0:x1][in_search]
+            if np.any(v_in):
+                r_valid = r_in[v_in]
+                i_valid = intensity[y0:y1, x0:x1][in_search][v_in]
+                valid_cnt = np.bincount(r_valid, minlength=n_shells).astype(np.int64)
+                z_sel = i_valid <= 1e-12
+                zero_cnt = (
+                    np.bincount(r_valid[z_sel], minlength=n_shells)
+                    if np.any(z_sel)
+                    else np.zeros(n_shells, dtype=np.int64)
+                )
+                has_v = valid_cnt > 0
+                shell_zero_frac[has_v] = zero_cnt[has_v] / valid_cnt[has_v]
+                # Single-pass O(N) uint16 radix-sort grouping replaces 516x O(N) mask scans
+                order = np.argsort(r_valid.astype(np.uint16), kind="stable")
+                i_sorted = i_valid[order]
+                ends = np.cumsum(valid_cnt)
+                starts = ends - valid_cnt
+                for radius in np.flatnonzero(has_v):
+                    shell_med[radius] = float(np.median(i_sorted[starts[radius] : ends[radius]]))
+    return total_cnt, valid_cnt, shell_med, shell_zero_frac
 
 
 def _detect_beamstop(
@@ -306,54 +385,79 @@ def _detect_beamstop(
     pixel_dq: float,
     *,
     q_active_max: float | None = None,
+    q_obs: np.ndarray | None = None,
+    i_obs: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Detect masked or unmasked central beamstop shadow around beam center."""
     height, width = intensity.shape
     cx, cy = beam_center_xy
-    yy, xx = np.indices((height, width), dtype=np.float64)
-    r_px = np.hypot(xx - cx, yy - cy)
 
-    max_r_in_image = int(math.ceil(float(np.max(r_px))))
-    r_search_max = min(max_r_in_image, max(24, int(round(0.35 * min(height, width)))))
-    r_idx = np.rint(r_px).astype(np.int64)
-
-    n_shells = r_search_max + 1
-    total_cnt = np.zeros(n_shells, dtype=np.int64)
-    valid_cnt = np.zeros(n_shells, dtype=np.int64)
-    shell_med = np.full(n_shells, np.nan, dtype=np.float64)
-    shell_zero_frac = np.full(n_shells, np.nan, dtype=np.float64)
-
-    in_search = r_idx <= r_search_max
-    if np.any(in_search):
-        total_cnt = np.bincount(r_idx[in_search], minlength=n_shells)
-        in_valid = in_search & obs_valid
-        if np.any(in_valid):
-            valid_cnt = np.bincount(r_idx[in_valid], minlength=n_shells)
-            r_valid = r_idx[in_valid]
-            i_valid = intensity[in_valid]
-            for radius in range(n_shells):
-                if valid_cnt[radius] > 0:
-                    vals = i_valid[r_valid == radius]
-                    shell_med[radius] = float(np.median(vals))
-                    shell_zero_frac[radius] = float(np.mean(vals <= 1e-12))
-
-    valid_frac = np.full(n_shells, np.nan, dtype=np.float64)
-    has_total = total_cnt > 0
-    valid_frac[has_total] = valid_cnt[has_total] / total_cnt[has_total]
+    # Exact maximum radius across the 4 image corners (zero 2D index allocation)
+    max_dx = max(abs(cx), abs((width - 1) - cx))
+    max_dy = max(abs(cy), abs((height - 1) - cy))
+    max_r_in_image = int(math.ceil(math.hypot(max_dx, max_dy)))
+    r_full_max = min(max_r_in_image, max(24, int(round(0.35 * min(height, width)))))
 
     # Outer detector floor computed strictly on active (non-zero-padded) high-q pixels
-    active_valid = obs_valid if q_active_max is None else (obs_valid & (q_map <= q_active_max))
-    if not np.any(active_valid):
-        active_valid = obs_valid
-    valid_q = q_map[active_valid]
-    valid_i = intensity[active_valid]
-    q_p80 = float(np.percentile(valid_q, 80.0))
-    outer_vals = valid_i[valid_q >= q_p80]
+    if q_obs is not None and i_obs is not None:
+        if q_active_max is not None:
+            act_sel = q_obs <= q_active_max
+            if np.any(act_sel):
+                valid_q = q_obs[act_sel]
+                valid_i = i_obs[act_sel]
+            else:
+                valid_q = q_obs
+                valid_i = i_obs
+        else:
+            valid_q = q_obs
+            valid_i = i_obs
+    else:
+        active_valid = obs_valid if q_active_max is None else (obs_valid & (q_map <= q_active_max))
+        if not np.any(active_valid):
+            active_valid = obs_valid
+        valid_q = q_map[active_valid]
+        valid_i = intensity[active_valid]
+    if valid_q.size > 120_000:
+        step = max(1, valid_q.size // 100_000)
+        vq_stat = valid_q[::step]
+        vi_stat = valid_i[::step]
+    else:
+        vq_stat = valid_q
+        vi_stat = valid_i
+    q_p80 = float(np.percentile(vq_stat, 80.0))
+    outer_vals = vi_stat[vq_stat >= q_p80]
     if outer_vals.size == 0:
-        outer_vals = valid_i
+        outer_vals = vi_stat
     outer_bg = float(np.median(outer_vals))
     outer_mad = float(1.4826 * np.median(np.abs(outer_vals - outer_bg)))
     outer_pos_frac = float(np.mean(outer_vals > 1e-12))
+
+    # Fast inner probe (r <= 128 px = 257x257 box) handles >99.9% of beamstops in ~3 ms;
+    # automatically expands to r_full_max if core remains masked/unrecovered at r=128.
+    r_probe = min(r_full_max, 128) if r_full_max > 140 else r_full_max
+    total_cnt, valid_cnt, shell_med, shell_zero_frac = _compute_beamstop_shells(
+        intensity, obs_valid, cx, cy, r_probe
+    )
+    valid_frac_probe = np.divide(
+        valid_cnt, total_cnt, out=np.full(total_cnt.shape, np.nan, dtype=np.float64), where=total_cnt > 0
+    )
+    need_expand = r_probe < r_full_max and (
+        not np.any(np.isfinite(valid_frac_probe) & (valid_frac_probe >= 0.5))
+        or int(np.argmax(np.isfinite(valid_frac_probe) & (valid_frac_probe >= 0.5))) > r_probe - 12
+        or (np.isfinite(shell_zero_frac[-1]) and shell_zero_frac[-1] >= 0.5)
+    )
+    if need_expand:
+        r_search_max = r_full_max
+        total_cnt, valid_cnt, shell_med, shell_zero_frac = _compute_beamstop_shells(
+            intensity, obs_valid, cx, cy, r_search_max
+        )
+    else:
+        r_search_max = r_probe
+
+    n_shells = r_search_max + 1
+    valid_frac = np.full(n_shells, np.nan, dtype=np.float64)
+    has_total = total_cnt > 0
+    valid_frac[has_total] = valid_cnt[has_total] / total_cnt[has_total]
 
     # 1. Check already-masked core (valid_frac < 0.35 from r=0 outward)
     r_masked = 0
@@ -525,20 +629,46 @@ def _radial_profile_and_window(
     else:
         clean_valid = obs_valid
 
-    q_vals_all = q_map[clean_valid]
+    # On large 2D frames (>=512x512), coarse 160-bin radial stats use a uniform 2x2
+    # spatial grid (~620k px -> ~3.8k px/bin) with zero mixed-weight boundary artifacts,
+    # while fine peak-finding inside [q_floor, q_max] runs at full 1x1 pixel resolution.
+    use_coarse_2d_stride = intensity.shape[0] >= 512 and intensity.shape[1] >= 512
+    coarse_stride = 2 if use_coarse_2d_stride else 1
+    coarse_scale = coarse_stride * coarse_stride
+
+    if use_coarse_2d_stride:
+        q_sub_2d = q_map[::2, ::2]
+        i_sub_2d = intensity[::2, ::2]
+        cv_sub = clean_valid[::2, ::2]
+        q_vals_all = q_sub_2d[cv_sub]
+        if q_vals_all.size < 64:
+            use_coarse_2d_stride = False
+            coarse_stride = 1
+            coarse_scale = 1
+            q_vals_all = q_map[clean_valid]
+            i_vals_all = intensity[clean_valid]
+        else:
+            i_vals_all = i_sub_2d[cv_sub]
+    else:
+        q_vals_all = q_map[clean_valid]
+        i_vals_all = intensity[clean_valid]
+
     q_valid_min = float(np.min(q_vals_all))
     q_valid_max = float(np.max(q_vals_all))
 
     # Exclude outer zero-padded dead shells from radial profile & diffuse floor estimation
     active_max = q_valid_max if q_active_max is None else min(q_valid_max, float(q_active_max))
-    active_clean = clean_valid & (q_map <= active_max)
-    if np.count_nonzero(active_clean) < 16:
-        active_clean = clean_valid
+    in_act_1d = q_vals_all <= active_max
+    if int(np.count_nonzero(in_act_1d)) < 16:
+        in_act_1d = np.ones(q_vals_all.shape, dtype=bool)
         active_max = q_valid_max
         outer_zero_padded = False
+        active_clean = clean_valid
+    else:
+        active_clean = clean_valid if q_active_max is None else (clean_valid & (q_map <= active_max))
 
-    q_vals = q_map[active_clean]
-    i_vals = intensity[active_clean]
+    q_vals = q_vals_all[in_act_1d]
+    i_vals = i_vals_all[in_act_1d]
 
     # Avoid exact q == 0 bin when no beamstop is present
     q_floor = max(q_valid_min, float(beamstop["safe_q_min"]))
@@ -556,34 +686,53 @@ def _radial_profile_and_window(
         edges = np.linspace(q_floor, active_max, n_rbins + 1, dtype=np.float64)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
-    # Evaluate full candidate counts (including masked pixels) for radial coverage
-    q_all_finite = np.isfinite(q_map)
-    cand_q = q_map[q_all_finite]
-    in_cand = (cand_q >= edges[0]) & (cand_q <= edges[-1])
-    cand_idx = np.clip(np.searchsorted(edges, cand_q[in_cand], side="right") - 1, 0, n_rbins - 1)
-    cand_counts = np.bincount(cand_idx, minlength=n_rbins)
+    # Evaluate candidate and observed radial profiles on the same uniform spatial grid
+    e_lo = float(edges[0])
+    e_hi = float(edges[-1])
+    inv_dq_e = float(n_rbins) / max(e_hi - e_lo, 1e-30)
 
-    in_obs = (q_vals >= edges[0]) & (q_vals <= edges[-1])
+    q_cand_src = q_map[::coarse_stride, ::coarse_stride].ravel()
+    in_cand = (q_cand_src >= e_lo) & (q_cand_src <= e_hi)
+    cand_idx = ((q_cand_src[in_cand] - e_lo) * inv_dq_e).astype(np.intp)
+    cand_idx[cand_idx >= n_rbins] = n_rbins - 1
+    cand_counts_raw = np.bincount(cand_idx, minlength=n_rbins)
+
+    in_obs = (q_vals >= e_lo) & (q_vals <= e_hi)
     obs_q = q_vals[in_obs]
     obs_i = i_vals[in_obs]
-    obs_idx = np.clip(np.searchsorted(edges, obs_q, side="right") - 1, 0, n_rbins - 1)
-    obs_counts = np.bincount(obs_idx, minlength=n_rbins)
+    obs_idx = ((obs_q - e_lo) * inv_dq_e).astype(np.intp)
+    obs_idx[obs_idx >= n_rbins] = n_rbins - 1
+    obs_counts_raw = np.bincount(obs_idx, minlength=n_rbins)
+
+    obs_counts = obs_counts_raw * coarse_scale
 
     radial_mean = np.full(n_rbins, np.nan, dtype=np.float64)
     radial_med = np.full(n_rbins, np.nan, dtype=np.float64)
     radial_p90 = np.full(n_rbins, np.nan, dtype=np.float64)
     radial_p25 = np.full(n_rbins, np.nan, dtype=np.float64)
     radial_cov = np.zeros(n_rbins, dtype=np.float64)
-    has_cand = cand_counts > 0
-    radial_cov[has_cand] = obs_counts[has_cand] / cand_counts[has_cand]
+    has_cand = cand_counts_raw > 0
+    radial_cov[has_cand] = obs_counts_raw[has_cand] / cand_counts_raw[has_cand]
 
-    for b in range(n_rbins):
-        if obs_counts[b] > 0:
-            vals = obs_i[obs_idx == b]
-            radial_mean[b] = float(np.mean(vals))
-            radial_med[b] = float(np.median(vals))
-            radial_p90[b] = float(np.percentile(vals, 90.0))
-            radial_p25[b] = float(np.percentile(vals, 25.0))
+    has_obs_bin = obs_counts_raw > 0
+    if np.any(has_obs_bin):
+        obs_sums = np.bincount(obs_idx, weights=obs_i, minlength=n_rbins)
+        radial_mean[has_obs_bin] = obs_sums[has_obs_bin] / obs_counts_raw[has_obs_bin]
+        # Single-pass O(N) uint8 radix-sort grouping replaces 160x O(N) scans
+        obs_order = np.argsort(obs_idx.astype(np.uint8), kind="stable")
+        i_grouped = obs_i[obs_order]
+        obs_ends = np.cumsum(obs_counts_raw)
+        obs_starts = obs_ends - obs_counts_raw
+        for b in np.flatnonzero(has_obs_bin):
+            seg = i_grouped[obs_starts[b] : obs_ends[b]]
+            p25_v, med_v, p90_v = np.percentile(seg, (25.0, 50.0, 90.0))
+            radial_p25[b] = float(p25_v)
+            radial_med[b] = float(med_v)
+            radial_p90[b] = float(p90_v)
+    else:
+        i_grouped = np.empty(0, dtype=np.float64)
+        obs_starts = np.zeros(n_rbins, dtype=np.int64)
+        obs_ends = np.zeros(n_rbins, dtype=np.int64)
 
     # Estimate active outer diffuse background floor & noise from outermost 20% of active bins
     valid_bins = np.flatnonzero(np.isfinite(radial_med) & (obs_counts >= 3))
@@ -593,8 +742,10 @@ def _radial_profile_and_window(
     tail_count = max(2, int(math.ceil(0.20 * valid_bins.size)))
     tail_bins = valid_bins[-tail_count:] if valid_bins.size else np.array([], dtype=np.int64)
     if tail_bins.size:
-        tail_mask = np.isin(obs_idx, tail_bins)
-        tail_pixels = obs_i[tail_mask]
+        if tail_bins.size == 1 or np.all(np.diff(tail_bins) == 1):
+            tail_pixels = i_grouped[obs_starts[tail_bins[0]] : obs_ends[tail_bins[-1]]]
+        else:
+            tail_pixels = np.concatenate([i_grouped[obs_starts[b] : obs_ends[b]] for b in tail_bins])
         bg_level = float(np.median(tail_pixels))
         bg_mad = float(1.4826 * np.median(np.abs(tail_pixels - bg_level)))
         bg_p90 = float(np.median(radial_p90[tail_bins]))
@@ -602,8 +753,9 @@ def _radial_profile_and_window(
     else:
         bg_level = float(np.median(i_vals))
         bg_mad = float(1.4826 * np.median(np.abs(i_vals - bg_level)))
-        bg_p90 = float(np.percentile(i_vals, 90.0))
-        bg_aniso = float(np.percentile(i_vals, 90.0) - np.percentile(i_vals, 25.0))
+        p25_g, p90_g = np.percentile(i_vals, (25.0, 90.0))
+        bg_p90 = float(p90_g)
+        bg_aniso = float(p90_g - p25_g)
 
     noise_scale = max(bg_mad, 1e-12 * max(abs(float(np.max(obs_i))) if obs_i.size else 1.0, 1.0))
 
@@ -718,15 +870,21 @@ def _radial_profile_and_window(
         n_fine = int(np.clip(round((q_max - q_floor) / max(1.5 * pixel_dq, 1e-12)), 24, 96))
         fine_edges = np.linspace(q_floor, q_max, n_fine + 1, dtype=np.float64)
         fine_centers = 0.5 * (fine_edges[:-1] + fine_edges[1:])
-        fine_idx = np.clip(np.searchsorted(fine_edges, fine_q, side="right") - 1, 0, n_fine - 1)
+        fine_idx = ((fine_q - q_floor) * (float(n_fine) / max(q_max - q_floor, 1e-30))).astype(np.intp)
+        fine_idx[fine_idx >= n_fine] = n_fine - 1
         fine_cnt = np.bincount(fine_idx, minlength=n_fine)
         fine_mean = np.full(n_fine, np.nan, dtype=np.float64)
         fine_p90 = np.full(n_fine, np.nan, dtype=np.float64)
-        for fb in range(n_fine):
-            if fine_cnt[fb] > 0:
-                fvals = fine_i[fine_idx == fb]
-                fine_mean[fb] = float(np.mean(fvals))
-                fine_p90[fb] = float(np.percentile(fvals, 90.0))
+        has_fine = fine_cnt > 0
+        if np.any(has_fine):
+            fine_sums = np.bincount(fine_idx, weights=fine_i, minlength=n_fine)
+            fine_mean[has_fine] = fine_sums[has_fine] / fine_cnt[has_fine]
+            fine_order = np.argsort(fine_idx.astype(np.uint8), kind="stable")
+            fine_grouped = fine_i[fine_order]
+            fine_ends = np.cumsum(fine_cnt)
+            fine_starts = fine_ends - fine_cnt
+            for fb in np.flatnonzero(has_fine):
+                fine_p90[fb] = float(np.percentile(fine_grouped[fine_starts[fb] : fine_ends[fb]], 90.0))
         in_peak_win = fine_cnt >= 3
         if np.count_nonzero(in_peak_win) < 3:
             in_peak_win = fine_cnt > 0
@@ -1669,6 +1827,8 @@ def advise_from_arrays(
     nominal_draw_axis_deg: float = 90.0,
     bright_axis_convention: str = "draw",
     expected_bright_axis_deg: float | None = None,
+    beamstop_radius_px: float | None = None,
+    geometry_cache: Any = None,
 ) -> dict[str, Any]:
     """Recommend beamstop mask, q_window, symmetry axis, and workflow from 2D arrays.
 
@@ -1710,22 +1870,43 @@ def advise_from_arrays(
                 f"valid_mask shape {v_arr.shape!r} does not match intensity shape {i_arr.shape!r}"
             )
 
-    obs_valid = v_arr & np.isfinite(i_arr) & np.isfinite(q_arr) & np.isfinite(c_arr)
-    if not np.any(obs_valid):
-        raise ValueError("analysis domain is empty: no finite observed pixels in valid_mask")
+    if geometry_cache is not None:
+        if beam_center_xy is None and hasattr(geometry_cache, "beam_center_xy"):
+            beam_center_xy = geometry_cache.beam_center_xy
+        if pixel_dq is None and hasattr(geometry_cache, "pixel_dq"):
+            pixel_dq = geometry_cache.pixel_dq
 
-    unit = _normalise_q_unit(q_unit)
     center_xy, dq, center_source = _infer_beam_geometry(
         q_arr,
         c_arr,
         beam_center_xy=beam_center_xy,
         pixel_dq=pixel_dq,
     )
+    if beamstop_radius_px is not None:
+        v_arr, _ = apply_beamstop_mask(v_arr, i_arr.shape, center_xy, beamstop_radius_px)
+
+    obs_valid = v_arr & np.isfinite(i_arr) & np.isfinite(q_arr) & np.isfinite(c_arr)
+    if not np.any(obs_valid):
+        raise ValueError("analysis domain is empty: no finite observed pixels in valid_mask")
+
+    unit = _normalise_q_unit(q_unit)
+    # On large 2D frames (>=512x512), extract uniform 2x2 sub-grid once (~1 ms)
+    # for outer-cutoff & high-q background floor; keep full 1x1 resolution for beamstop & symmetry.
+    if i_arr.shape[0] >= 512 and i_arr.shape[1] >= 512:
+        ov_2d = obs_valid[::2, ::2]
+        q_obs_stat = q_arr[::2, ::2][ov_2d]
+        i_obs_stat = i_arr[::2, ::2][ov_2d]
+        if q_obs_stat.size < 64:
+            q_obs_stat = q_arr[obs_valid]
+            i_obs_stat = i_arr[obs_valid]
+    else:
+        q_obs_stat = q_arr[obs_valid]
+        i_obs_stat = i_arr[obs_valid]
     q_active_max, outer_zero_padded = _detect_active_outer_q_cutoff(
-        i_arr, q_arr, obs_valid, dq
+        i_arr, q_arr, obs_valid, dq, q_obs=q_obs_stat, i_obs=i_obs_stat
     )
     beamstop = _detect_beamstop(
-        i_arr, q_arr, obs_valid, center_xy, dq, q_active_max=q_active_max
+        i_arr, q_arr, obs_valid, center_xy, dq, q_active_max=q_active_max, q_obs=q_obs_stat, i_obs=i_obs_stat
     )
     beamstop["beam_center_source"] = center_source
 
@@ -1790,6 +1971,8 @@ def advise_frame(
     nominal_draw_axis_deg: float = 90.0,
     bright_axis_convention: str = "draw",
     expected_bright_axis_deg: float | None = None,
+    beamstop_radius_px: float | None = None,
+    geometry_cache: Any = None,
 ) -> dict[str, Any]:
     """Load one detector frame from disk and compute smart analysis recommendations."""
     from .io import load_image
@@ -1815,16 +1998,52 @@ def advise_frame(
 
     beam_center_xy: tuple[float, float] | None = None
     pixel_dq: float | None = None
-    if poni_path is not None:
+    if geometry_cache is not None:
+        if geometry_cache.shape != shape:
+            raise ValueError(
+                f"geometry_cache shape {geometry_cache.shape!r} does not match image shape {shape!r}"
+            )
+        geom_obj = geometry_cache.geometry
+        if hasattr(geom_obj, "q_nm_inv"):
+            q_map = geom_obj.q_nm_inv
+            chi_deg = (
+                geom_obj.chi_deg
+                if geom_obj.chi_deg is not None
+                else np.degrees(geom_obj.chi_rad) % 360.0
+            )
+            q_unit = geom_obj.q_unit
+        elif isinstance(geom_obj, Mapping) and "qx" in geom_obj and "qy" in geom_obj:
+            qx = np.asarray(geom_obj["qx"], dtype=np.float64)
+            qy = np.asarray(geom_obj["qy"], dtype=np.float64)
+            q_map = (
+                np.asarray(geom_obj["q"], dtype=np.float64)
+                if "q" in geom_obj
+                else np.hypot(qx, qy)
+            )
+            chi_deg = (
+                np.asarray(geom_obj["chi_deg"], dtype=np.float64)
+                if "chi_deg" in geom_obj
+                else np.degrees(np.arctan2(qy, qx)) % 360.0
+            )
+            q_unit = str(getattr(geometry_cache, "q_unit", "nm^-1") or "nm^-1")
+        else:
+            q_map = geometry_cache.q_mag_roi
+            chi_deg = geometry_cache.chi_deg_roi
+            q_unit = str(getattr(geometry_cache, "q_unit", "nm^-1") or "nm^-1")
+        valid_mask = valid_mask & geometry_cache.valid_mask
+        beam_center_xy = geometry_cache.beam_center_xy
+        pixel_dq = geometry_cache.pixel_dq
+    elif poni_path is not None:
         from .geometry import build_geometry, load_poni
 
-        geom = build_geometry(shape, poni_path, valid_mask=valid_mask)
+        # Load PONI strictly ONCE and reuse the AzimuthalIntegrator for both geometry and Fit2D center
+        ai = load_poni(poni_path)
+        geom = build_geometry(shape, ai, valid_mask=valid_mask)
         q_map = geom.q_nm_inv
         chi_deg = geom.chi_deg if geom.chi_deg is not None else np.degrees(geom.chi_rad) % 360.0
         valid_mask = valid_mask & geom.valid_mask
         q_unit = geom.q_unit
         try:
-            ai = load_poni(poni_path)
             fit2d = ai.getFit2D()
             cx = _finite_float(fit2d.get("centerX"))
             cy = _finite_float(fit2d.get("centerY"))
@@ -1845,11 +2064,10 @@ def advise_frame(
     else:
         height, width = shape
         cx, cy = 0.5 * (width - 1), 0.5 * (height - 1)
-        yy, xx = np.indices(shape, dtype=np.float64)
-        qx = xx - cx
-        qy = yy - cy
-        q_map = np.hypot(qx, qy)
-        chi_deg = np.degrees(np.arctan2(qy, qx)) % 360.0
+        dy = np.arange(height, dtype=np.float64) - cy
+        dx = np.arange(width, dtype=np.float64) - cx
+        q_map = np.sqrt(dy[:, None] ** 2 + dx[None, :] ** 2)
+        chi_deg = np.degrees(np.arctan2(dy[:, None], dx[None, :])) % 360.0
         q_unit = "pixel-q"
         beam_center_xy = (cx, cy)
         pixel_dq = 1.0
@@ -1865,6 +2083,8 @@ def advise_frame(
         nominal_draw_axis_deg=nominal_draw_axis_deg,
         bright_axis_convention=bright_axis_convention,
         expected_bright_axis_deg=expected_bright_axis_deg,
+        beamstop_radius_px=beamstop_radius_px,
+        geometry_cache=geometry_cache,
     )
     result["provenance"] = _sanitize_json(
         {
@@ -1875,6 +2095,7 @@ def advise_frame(
             "image_frame_index": loaded.frame,
             "shape": list(shape),
             "q_unit": _normalise_q_unit(q_unit),
+            "beamstop_radius_px": _finite_float(beamstop_radius_px) if beamstop_radius_px is not None else None,
         }
     )
     return result

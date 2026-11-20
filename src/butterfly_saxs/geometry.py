@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -153,6 +154,362 @@ class GeometryMaps:
 # alias for callers that do not need to distinguish map construction details.
 QMap = GeometryMaps
 GeometryMap = GeometryMaps
+
+
+def _validate_beam_center_xy(beam_center_xy: Any) -> tuple[float, float]:
+    if isinstance(beam_center_xy, (str, bytes)):
+        raise ValueError("beam_center_xy must be a finite (cx, cy) pair")
+    try:
+        center = tuple(beam_center_xy)
+    except TypeError as exc:
+        raise ValueError("beam_center_xy must be a finite (cx, cy) pair") from exc
+    if len(center) != 2 or any(isinstance(v, (bool, np.bool_)) for v in center):
+        raise ValueError(f"beam_center_xy must be a finite (cx, cy) pair, got {beam_center_xy!r}")
+    try:
+        cx, cy = float(center[0]), float(center[1])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"beam_center_xy must contain finite numbers, got {beam_center_xy!r}") from exc
+    if not (math.isfinite(cx) and math.isfinite(cy)):
+        raise ValueError(f"beam_center_xy must contain finite numbers, got {beam_center_xy!r}")
+    return cx, cy
+
+
+def apply_beamstop_mask(
+    valid_mask: np.ndarray | None,
+    shape: tuple[int, int] | Sequence[int],
+    beam_center_xy: tuple[float, float] | Sequence[float],
+    radius_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a circular beamstop exclusion mask via 1D broadcasting and combine with ``valid_mask``.
+
+    Returns ``(combined_valid_mask, beamstop_exclusion_mask)`` where
+    ``beamstop_exclusion_mask == True`` marks pixels inside ``radius_px`` of
+    ``beam_center_xy = (cx, cy)`` as masked out, and ``combined_valid_mask == True``
+    marks retained valid pixels.
+    """
+    height, width = _validate_shape(shape)
+    cx, cy = _validate_beam_center_xy(beam_center_xy)
+
+    if isinstance(radius_px, (bool, np.bool_)):
+        raise ValueError("radius_px must be a finite non-negative number")
+    try:
+        radius = float(radius_px)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"radius_px must be a finite non-negative number, got {radius_px!r}") from exc
+    if not math.isfinite(radius) or radius < 0.0:
+        raise ValueError(f"radius_px must be a finite non-negative number, got {radius_px!r}")
+
+    exclusion = np.zeros((height, width), dtype=bool)
+    if radius > 0.0:
+        y0 = max(0, int(math.floor(cy - radius)))
+        y1 = min(height, int(math.ceil(cy + radius)) + 1)
+        x0 = max(0, int(math.floor(cx - radius)))
+        x1 = min(width, int(math.ceil(cx + radius)) + 1)
+        if y0 < y1 and x0 < x1:
+            dy = np.arange(y0, y1, dtype=np.float64) - cy
+            dx = np.arange(x0, x1, dtype=np.float64) - cx
+            exclusion[y0:y1, x0:x1] = (dy[:, None] ** 2 + dx[None, :] ** 2) <= (radius * radius)
+
+    if valid_mask is None:
+        combined_valid = ~exclusion if radius > 0.0 else np.ones((height, width), dtype=bool)
+    else:
+        base = np.asarray(valid_mask, dtype=bool)
+        if base.shape != (height, width):
+            raise GeometryShapeError(
+                f"valid_mask shape {base.shape!r} does not match shape {(height, width)!r}"
+            )
+        combined_valid = base & ~exclusion if radius > 0.0 else base.copy()
+
+    return combined_valid, exclusion
+
+
+def _infer_center_and_dq_fast(
+    qx: np.ndarray,
+    qy: np.ndarray,
+    q_mag: np.ndarray,
+    *,
+    beam_center_xy: Sequence[float] | None = None,
+    pixel_dq: float | None = None,
+) -> tuple[tuple[float, float], float]:
+    """Infer subpixel beam center ``(cx, cy)`` and reciprocal pixel step ``pixel_dq`` in <1 ms."""
+    height, width = q_mag.shape
+    cx_out: float | None = None
+    cy_out: float | None = None
+    dq_out: float | None = None
+
+    if beam_center_xy is not None:
+        cx_out, cy_out = _validate_beam_center_xy(beam_center_xy)
+    if pixel_dq is not None:
+        if isinstance(pixel_dq, (bool, np.bool_)):
+            raise ValueError("pixel_dq must be a finite positive number")
+        dq_val = float(pixel_dq)
+        if not math.isfinite(dq_val) or dq_val <= 0.0:
+            raise ValueError(f"pixel_dq must be a finite positive number, got {pixel_dq!r}")
+        dq_out = dq_val
+
+    if cx_out is None or dq_out is None:
+        stride_y = max(1, height // 48)
+        stride_x = max(1, width // 48)
+        qx_sub = qx[::stride_y, ::stride_x]
+        qy_sub = qy[::stride_y, ::stride_x]
+        q_sub = q_mag[::stride_y, ::stride_x]
+        sub_finite = np.isfinite(qx_sub) & np.isfinite(qy_sub) & np.isfinite(q_sub)
+        if int(np.count_nonzero(sub_finite)) >= 12:
+            ys = np.arange(0, height, stride_y, dtype=np.float64)
+            xs = np.arange(0, width, stride_x, dtype=np.float64)
+            gx, gy = np.meshgrid(xs, ys)
+            xv = gx[sub_finite]
+            yv = gy[sub_finite]
+            qxv = qx_sub[sub_finite]
+            qyv = qy_sub[sub_finite]
+            design = np.column_stack((np.ones_like(xv), xv, yv))
+            try:
+                coef_x, *_ = np.linalg.lstsq(design, qxv, rcond=None)
+                coef_y, *_ = np.linalg.lstsq(design, qyv, rcond=None)
+                a0, a1, a2 = float(coef_x[0]), float(coef_x[1]), float(coef_x[2])
+                b0, b1, b2 = float(coef_y[0]), float(coef_y[1]), float(coef_y[2])
+                det = a1 * b2 - a2 * b1
+                max_q = float(np.max(q_sub[sub_finite]))
+                pred_x = design @ coef_x
+                pred_y = design @ coef_y
+                rms = float(np.sqrt(np.mean((pred_x - qxv) ** 2 + (pred_y - qyv) ** 2)))
+                if abs(det) > 1.0e-18 and max_q > 0.0 and rms <= 0.15 * max_q:
+                    cx_fit = (-b2 * a0 + a2 * b0) / det
+                    cy_fit = (b1 * a0 - a1 * b0) / det
+                    dq_fit = math.sqrt(0.5 * (a1 * a1 + a2 * a2 + b1 * b1 + b2 * b2))
+                    if cx_out is None and math.isfinite(cx_fit) and math.isfinite(cy_fit):
+                        cx_out, cy_out = cx_fit, cy_fit
+                    if dq_out is None and math.isfinite(dq_fit) and dq_fit > 0.0:
+                        dq_out = dq_fit
+            except np.linalg.LinAlgError:
+                pass
+
+    if cx_out is None or cy_out is None:
+        finite_q = np.isfinite(q_mag)
+        if np.any(finite_q):
+            q_fill = np.where(finite_q, q_mag, np.inf)
+            min_y, min_x = np.unravel_index(int(np.argmin(q_fill)), (height, width))
+            cx_out, cy_out = float(min_x), float(min_y)
+        else:
+            cx_out = 0.5 * (width - 1)
+            cy_out = 0.5 * (height - 1)
+
+    if dq_out is None:
+        stride_y = max(1, height // 64)
+        stride_x = max(1, width // 64)
+        dx_med = (
+            float(np.nanmedian(np.abs(np.diff(qx[::stride_y, :], axis=1))))
+            if width > 1
+            else 0.0
+        )
+        dy_med = (
+            float(np.nanmedian(np.abs(np.diff(qy[:, ::stride_x], axis=0))))
+            if height > 1
+            else 0.0
+        )
+        pos_steps = [v for v in (dx_med, dy_med) if math.isfinite(v) and v > 0.0]
+        dq_out = min(pos_steps) if pos_steps else 1.0
+
+    return (float(cx_out), float(cy_out)), float(dq_out)
+
+
+@dataclass
+class SAXSGeometryCache:
+    """Reusable detector geometry, beamstop mask, and active reciprocal-space ROI cache."""
+
+    geometry: Any
+    shape: tuple[int, int]
+    beam_center_xy: tuple[float, float]
+    pixel_dq: float
+    base_valid_mask: np.ndarray
+    beamstop_exclusion_mask: np.ndarray
+    valid_mask: np.ndarray
+    roi_slices: tuple[slice, slice]
+    q_mag_roi: np.ndarray
+    qx_roi: np.ndarray
+    qy_roi: np.ndarray
+    chi_deg_roi: np.ndarray
+    valid_roi: np.ndarray
+    q_coordinates_validated: bool = True
+    beamstop_radius_px: float | None = None
+    q_roi_max: float | None = None
+    q_unit: str = "nm^-1"
+    geometry_roi_mask: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.geometry_roi_mask is None:
+            self.geometry_roi_mask = np.isfinite(self.q_mag_roi)
+
+    @property
+    def roi_shape(self) -> tuple[int, int]:
+        return tuple(self.q_mag_roi.shape)  # type: ignore[return-value]
+
+    @property
+    def is_full_frame_roi(self) -> bool:
+        return self.roi_shape == self.shape
+
+    def slice_frame(self, arr: Any) -> np.ndarray:
+        """Fast view-slice of a full-frame 2D array into the cached active ROI."""
+        array = np.asarray(arr)
+        if array.ndim != 2:
+            raise GeometryShapeError(f"expected a 2-D array for slice_frame, got ndim={array.ndim}")
+        if array.shape != self.shape:
+            raise GeometryShapeError(
+                f"array shape {array.shape!r} does not match cached geometry shape {self.shape!r}"
+            )
+        return array[self.roi_slices]
+
+
+def build_geometry_cache(
+    geometry: GeometryMaps | Mapping[str, Any],
+    valid_mask: Any | None = None,
+    *,
+    beamstop_radius_px: float | None = None,
+    q_roi_max: float | None = None,
+    beam_center_xy: Sequence[float] | None = None,
+    pixel_dq: float | None = None,
+) -> SAXSGeometryCache:
+    """Build a reusable :class:`SAXSGeometryCache` with beamstop masking and optional q-ROI slicing."""
+    if isinstance(geometry, GeometryMaps):
+        q_mag = geometry.q_nm_inv
+        qx = geometry.qx_nm_inv
+        qy = geometry.qy_nm_inv
+        chi_deg = (
+            geometry.chi_deg
+            if geometry.chi_deg is not None
+            else (np.degrees(geometry.chi_rad) % 360.0)
+        )
+        geom_valid = np.asarray(geometry.valid_mask, dtype=bool)
+        q_unit = geometry.q_unit
+    elif isinstance(geometry, Mapping):
+        if "qx" not in geometry or "qy" not in geometry:
+            raise GeometryError("geometry mapping must contain 'qx' and 'qy' arrays")
+        qx = np.asarray(geometry["qx"], dtype=np.float64)
+        qy = np.asarray(geometry["qy"], dtype=np.float64)
+        if qx.ndim != 2 or qy.shape != qx.shape or qx.size == 0:
+            raise GeometryShapeError("geometry mapping qx/qy must be matching non-empty 2-D arrays")
+        q_mag = (
+            np.asarray(geometry["q"], dtype=np.float64)
+            if "q" in geometry and geometry["q"] is not None
+            else (
+                np.asarray(geometry["q_nm_inv"], dtype=np.float64)
+                if "q_nm_inv" in geometry and geometry["q_nm_inv"] is not None
+                else np.hypot(qx, qy)
+            )
+        )
+        if q_mag.shape != qx.shape:
+            raise GeometryShapeError("geometry mapping q shape must match qx/qy shape")
+        if "chi_deg" in geometry and geometry["chi_deg"] is not None:
+            chi_deg = np.asarray(geometry["chi_deg"], dtype=np.float64)
+        elif "chi_rad" in geometry and geometry["chi_rad"] is not None:
+            chi_deg = np.mod(np.degrees(np.asarray(geometry["chi_rad"], dtype=np.float64)), 360.0)
+        else:
+            chi_deg = np.mod(np.degrees(np.arctan2(qy, qx)), 360.0)
+        if chi_deg.shape != qx.shape:
+            raise GeometryShapeError("geometry mapping chi shape must match qx/qy shape")
+        if "valid_mask" in geometry and geometry["valid_mask"] is not None:
+            geom_valid = np.asarray(geometry["valid_mask"], dtype=bool)
+        elif "mask" in geometry and geometry["mask"] is not None:
+            geom_valid = ~np.asarray(geometry["mask"], dtype=bool)
+        else:
+            geom_valid = np.isfinite(q_mag) & np.isfinite(qx) & np.isfinite(qy)
+        if geom_valid.shape != qx.shape:
+            raise GeometryShapeError("geometry mapping valid_mask shape must match qx/qy shape")
+        q_unit = str(geometry.get("q_unit", "nm^-1") or "nm^-1")
+    else:
+        raise GeometryError("geometry must be a GeometryMaps instance or q-map mapping")
+
+    shape = (int(q_mag.shape[0]), int(q_mag.shape[1]))
+    finite_geom = np.isfinite(q_mag) & np.isfinite(qx) & np.isfinite(qy)
+    if not np.any(finite_geom):
+        raise GeometryError("geometry contains no finite reciprocal-space coordinates")
+
+    if valid_mask is None:
+        base_valid = (geom_valid & finite_geom).copy()
+    else:
+        user_valid = np.asarray(valid_mask, dtype=bool)
+        if user_valid.shape != shape:
+            raise GeometryShapeError(
+                f"valid_mask shape {user_valid.shape!r} does not match geometry shape {shape!r}"
+            )
+        base_valid = geom_valid & finite_geom & user_valid
+
+    center_xy, dq = _infer_center_and_dq_fast(
+        qx,
+        qy,
+        q_mag,
+        beam_center_xy=beam_center_xy,
+        pixel_dq=pixel_dq,
+    )
+
+    bs_radius_val: float | None = None
+    if beamstop_radius_px is not None:
+        combined_valid, bs_exclusion = apply_beamstop_mask(
+            base_valid,
+            shape,
+            center_xy,
+            beamstop_radius_px,
+        )
+        bs_radius_val = float(beamstop_radius_px)
+    else:
+        bs_exclusion = np.zeros(shape, dtype=bool)
+        combined_valid = base_valid
+
+    roi_q_val: float | None = None
+    if q_roi_max is None:
+        roi_slices = (slice(0, shape[0]), slice(0, shape[1]))
+        q_mag_roi = q_mag
+        qx_roi = qx
+        qy_roi = qy
+        chi_deg_roi = chi_deg
+        valid_roi = combined_valid
+        geom_roi_mask = finite_geom
+    else:
+        if isinstance(q_roi_max, (bool, np.bool_)):
+            raise GeometryError("q_roi_max must be a finite positive number")
+        roi_q_val = float(q_roi_max)
+        if not math.isfinite(roi_q_val) or roi_q_val <= 0.0:
+            raise GeometryError(f"q_roi_max must be finite and positive, got {q_roi_max!r}")
+        roi_sel = finite_geom & (q_mag <= roi_q_val)
+        row_any = np.any(roi_sel, axis=1)
+        if not np.any(row_any):
+            min_q = float(np.min(q_mag[finite_geom]))
+            raise GeometryError(
+                f"q_roi_max={roi_q_val:g} excludes all detector pixels (minimum finite q is {min_q:g})"
+            )
+        col_any = np.any(roi_sel, axis=0)
+        y0 = int(np.argmax(row_any))
+        y1 = int(shape[0] - np.argmax(row_any[::-1]))
+        x0 = int(np.argmax(col_any))
+        x1 = int(shape[1] - np.argmax(col_any[::-1]))
+        roi_slices = (slice(y0, y1), slice(x0, x1))
+        q_mag_roi = np.ascontiguousarray(q_mag[roi_slices])
+        qx_roi = np.ascontiguousarray(qx[roi_slices])
+        qy_roi = np.ascontiguousarray(qy[roi_slices])
+        chi_deg_roi = np.ascontiguousarray(chi_deg[roi_slices])
+        valid_roi = np.ascontiguousarray(combined_valid[roi_slices])
+        geom_roi_mask = np.ascontiguousarray(finite_geom[roi_slices])
+
+    return SAXSGeometryCache(
+        geometry=geometry,
+        shape=shape,
+        beam_center_xy=center_xy,
+        pixel_dq=dq,
+        base_valid_mask=base_valid,
+        beamstop_exclusion_mask=bs_exclusion,
+        valid_mask=combined_valid,
+        roi_slices=roi_slices,
+        q_mag_roi=q_mag_roi,
+        qx_roi=qx_roi,
+        qy_roi=qy_roi,
+        chi_deg_roi=chi_deg_roi,
+        valid_roi=valid_roi,
+        q_coordinates_validated=True,
+        beamstop_radius_px=bs_radius_val,
+        q_roi_max=roi_q_val,
+        q_unit=q_unit,
+        geometry_roi_mask=geom_roi_mask,
+    )
 
 
 def load_poni(poni: str | Path | Any) -> Any:
@@ -473,7 +830,10 @@ __all__ = [
     "GeometryMaps",
     "GeometryShapeError",
     "QMap",
+    "SAXSGeometryCache",
+    "apply_beamstop_mask",
     "build_geometry",
+    "build_geometry_cache",
     "build_qmap",
     "build_q_map",
     "compute_qmap",

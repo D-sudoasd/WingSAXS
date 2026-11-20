@@ -7,6 +7,7 @@ three-dimensional structure.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -83,23 +84,46 @@ def _q_edges(q_values: np.ndarray, q_edges: Any, radial_bins: int) -> np.ndarray
     return np.linspace(q_min, q_max, radial_bins + 1, dtype=float)
 
 
-def _bin_indices(values: np.ndarray, edges: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return indices and an in-range mask, with the final edge included."""
+def _bin_indices(
+    values: np.ndarray,
+    edges: np.ndarray,
+    *,
+    uniform: bool = False,
+    all_inside: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Return ``intp`` indices (zero-copy for ``np.bincount``) and an optional in-range mask."""
 
     n_bins = edges.size - 1
-    inside = (values >= edges[0]) & (values <= edges[-1])
-    indices = np.searchsorted(edges, values, side="right") - 1
-    indices[values == edges[-1]] = n_bins - 1
+    e_lo = float(edges[0])
+    e_hi = float(edges[-1])
+    if all_inside and uniform and e_hi > e_lo:
+        inv_step = float(n_bins) / (e_hi - e_lo)
+        scaled = values - e_lo
+        scaled *= inv_step
+        indices = scaled.astype(np.intp)
+        indices[indices >= n_bins] = n_bins - 1
+        return indices, None
+    inside = (values >= e_lo) & (values <= e_hi)
+    if uniform and e_hi > e_lo:
+        inv_step = float(n_bins) / (e_hi - e_lo)
+        scaled = values - e_lo
+        scaled *= inv_step
+        np.floor(scaled, out=scaled)
+        indices = scaled.astype(np.intp)
+        np.clip(indices, 0, n_bins - 1, out=indices)
+    else:
+        indices = np.searchsorted(edges, values, side="right").astype(np.intp) - 1
+        indices[values == e_hi] = n_bins - 1
     return indices, inside
 
 
-def _profile_stats(
+def _profile_stats_with_m2(
     n_bins: int,
     observed_indices: np.ndarray,
     observed_values: np.ndarray,
     candidate_indices: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """Accumulate sample statistics without allocating per-bin pixel lists."""
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Accumulate sample statistics and within-bin M2 without allocating per-bin pixel lists."""
 
     counts = np.bincount(observed_indices, minlength=n_bins).astype(np.int64, copy=False)
     candidate_counts = np.bincount(candidate_indices, minlength=n_bins).astype(np.int64, copy=False)
@@ -109,28 +133,101 @@ def _profile_stats(
 
     stds = np.full(n_bins, np.nan, dtype=float)
     sems = np.full(n_bins, np.nan, dtype=float)
-    repeated_means = means[observed_indices]
-    squared_deviations = np.square(observed_values - repeated_means)
-    sums_squared_deviation = np.bincount(
-        observed_indices,
-        weights=squared_deviations,
-        minlength=n_bins,
-    )
+    if observed_values.size:
+        with np.errstate(invalid="ignore", over="ignore"):
+            sq_vals = observed_values * observed_values
+            sum_sq = np.bincount(observed_indices, weights=sq_vals, minlength=n_bins).astype(float, copy=False)
+            m2 = np.zeros(n_bins, dtype=float)
+            has_cnt = counts > 1
+            mean_sq_term = np.zeros(n_bins, dtype=float)
+            mean_sq_term[has_cnt] = counts[has_cnt] * (means[has_cnt] * means[has_cnt])
+            m2[has_cnt] = sum_sq[has_cnt] - mean_sq_term[has_cnt]
+            # Fall back to exact centered two-pass M2 whenever cancellation or non-finite sum_sq occurs
+            needs_centered = has_cnt & (
+                ~np.isfinite(m2)
+                | (m2 < 0.0)
+                | ((sum_sq > 0.0) & (m2 < 1.0e-10 * sum_sq))
+            )
+            if np.any(needs_centered):
+                sel_c = needs_centered[observed_indices]
+                idx_c = observed_indices[sel_c]
+                dev_c = observed_values[sel_c] - means[idx_c]
+                np.square(dev_c, out=dev_c)
+                m2_c = np.bincount(idx_c, weights=dev_c, minlength=n_bins).astype(float, copy=False)
+                m2[needs_centered] = m2_c[needs_centered]
+    else:
+        m2 = np.zeros(n_bins, dtype=float)
     has_sample_variance = counts > 1
     with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
-        stds[has_sample_variance] = np.sqrt(
-            sums_squared_deviation[has_sample_variance] / (counts[has_sample_variance] - 1)
-        )
+        stds[has_sample_variance] = np.sqrt(m2[has_sample_variance] / (counts[has_sample_variance] - 1))
         sems[has_sample_variance] = stds[has_sample_variance] / np.sqrt(counts[has_sample_variance])
 
     coverage = np.full(n_bins, np.nan, dtype=float)
     np.divide(counts, candidate_counts, out=coverage, where=candidate_counts > 0)
     # Empty bins have no measured sum. Keep them missing internally as well
     # as in the row representation so they cannot be mistaken for zero data.
-    sums[counts == 0] = np.nan
+    sums_out = sums.copy()
+    sums_out[counts == 0] = np.nan
+    return (
+        {
+            "mean": means,
+            "sum": sums_out,
+            "std": stds,
+            "sem": sems,
+            "count": counts,
+            "candidate_count": candidate_counts,
+            "coverage": coverage,
+        },
+        m2,
+    )
+
+
+def _profile_stats(
+    n_bins: int,
+    observed_indices: np.ndarray,
+    observed_values: np.ndarray,
+    candidate_indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Accumulate sample statistics without allocating per-bin pixel lists."""
+    stats, _ = _profile_stats_with_m2(n_bins, observed_indices, observed_values, candidate_indices)
+    return stats
+
+
+def _marginalize_polar_stats(
+    counts_2d: np.ndarray,
+    cand_2d: np.ndarray,
+    sums_2d: np.ndarray,
+    means_2d: np.ndarray,
+    m2_2d: np.ndarray,
+    *,
+    axis: int,
+) -> dict[str, np.ndarray]:
+    """Exact O(n_radial * n_angular) Chan parallel-variance marginalization of polar stats."""
+    counts = np.sum(counts_2d, axis=axis, dtype=np.int64)
+    candidate_counts = np.sum(cand_2d, axis=axis, dtype=np.int64)
+    sums_raw = np.sum(np.where(counts_2d > 0, sums_2d, 0.0), axis=axis, dtype=float)
+    means = np.full(counts.shape, np.nan, dtype=float)
+    np.divide(sums_raw, counts, out=means, where=counts > 0)
+
+    mean_bcast = np.expand_dims(means, axis=axis)
+    has_cell = counts_2d > 0
+    delta = np.where(has_cell, means_2d - mean_bcast, 0.0)
+    m2_total = np.sum(m2_2d + counts_2d * (delta * delta), axis=axis, dtype=float)
+
+    stds = np.full(counts.shape, np.nan, dtype=float)
+    sems = np.full(counts.shape, np.nan, dtype=float)
+    has_var = counts > 1
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        stds[has_var] = np.sqrt(m2_total[has_var] / (counts[has_var] - 1))
+        sems[has_var] = stds[has_var] / np.sqrt(counts[has_var])
+
+    coverage = np.full(counts.shape, np.nan, dtype=float)
+    np.divide(counts, candidate_counts, out=coverage, where=candidate_counts > 0)
+    sums_out = sums_raw.copy()
+    sums_out[counts == 0] = np.nan
     return {
         "mean": means,
-        "sum": sums,
+        "sum": sums_out,
         "std": stds,
         "sem": sems,
         "count": counts,
@@ -233,21 +330,60 @@ def _intensity_summary(values: np.ndarray) -> dict[str, Any]:
         stats.update({f"p{int(percentile):02d}": None for percentile in _PERCENTILES})
         return stats
 
+    n = int(values.size)
     with np.errstate(invalid="ignore", over="ignore"):
-        total = np.sum(values, dtype=float)
-        mean = np.mean(values, dtype=float)
-        median = np.median(values)
-        std = np.std(values, ddof=1) if values.size > 1 else np.nan
-        percentiles = np.percentile(values, _PERCENTILES)
+        total = float(np.sum(values, dtype=float))
+        mean = total / float(n)
+        if n > 1:
+            sum_sq = float(np.dot(values, values))
+            ss_fast = sum_sq - float(n) * (mean * mean)
+            if math.isfinite(sum_sq) and sum_sq > 0.0 and ss_fast > 1.0e-6 * sum_sq:
+                std = float(math.sqrt(ss_fast / float(n - 1)))
+            else:
+                diff = values - mean
+                std = float(math.sqrt(float(np.dot(diff, diff)) / float(n - 1)))
+        else:
+            std = np.nan
+
+        if n >= 32:
+            # Single np.partition computes all 7 exact linear-interpolated percentiles,
+            # plus exact min/max from the 1% tails and exact negative_count via partition bounds.
+            pos_f = [(p / 100.0) * (n - 1) for p in _PERCENTILES]
+            lo_idx = [int(math.floor(x)) for x in pos_f]
+            hi_idx = [int(math.ceil(x)) for x in pos_f]
+            kths = sorted(set(lo_idx + hi_idx))
+            part = np.partition(values, kths)
+            percentiles = [
+                float(part[lo] + (pf - lo) * (part[hi] - part[lo]))
+                for pf, lo, hi in zip(pos_f, lo_idx, hi_idx)
+            ]
+            median = percentiles[3]
+            vmin = float(np.min(part[: lo_idx[0] + 1]))
+            vmax = float(np.max(part[hi_idx[-1] :]))
+            # Use partition order statistics to narrow negative_count scan when possible
+            neg_count: int | None = None
+            for k_idx in kths:
+                if part[k_idx] >= 0.0:
+                    neg_count = int(np.count_nonzero(part[:k_idx] < 0.0))
+                    break
+            if neg_count is None:
+                k_last = kths[-1]
+                neg_count = k_last + 1 + int(np.count_nonzero(part[k_last + 1 :] < 0.0))
+        else:
+            percentiles = [float(v) for v in np.percentile(values, _PERCENTILES)]
+            median = percentiles[3]
+            vmin = float(np.min(values))
+            vmax = float(np.max(values))
+            neg_count = int(np.count_nonzero(values < 0.0))
     stats = {
-        "count": int(values.size),
+        "count": n,
         "sum": _finite_number(total),
         "mean": _finite_number(mean),
         "median": _finite_number(median),
         "std": _finite_number(std),
-        "minimum": _finite_number(np.min(values)),
-        "maximum": _finite_number(np.max(values)),
-        "negative_count": int(np.count_nonzero(values < 0.0)),
+        "minimum": _finite_number(vmin),
+        "maximum": _finite_number(vmax),
+        "negative_count": neg_count,
     }
     stats.update({f"p{int(percentile):02d}": _finite_number(value) for percentile, value in zip(_PERCENTILES, percentiles)})
     return stats
@@ -258,24 +394,56 @@ def _quadrants(
     qy: np.ndarray,
     image: np.ndarray,
     observed: np.ndarray,
-    geometry: np.ndarray,
+    geometry: np.ndarray | None,
+    *,
+    obs_qx: np.ndarray | None = None,
+    obs_qy: np.ndarray | None = None,
+    obs_img: np.ndarray | None = None,
+    all_geom_finite: bool = False,
 ) -> dict[str, dict[str, Any]]:
     # Half-open assignments make quadrant counts disjoint and exhaustive:
     # qx == 0 goes to the right half, qy == 0 to the upper half.
-    memberships = {
-        "QI": (qx >= 0.0) & (qy >= 0.0),
-        "QII": (qx < 0.0) & (qy >= 0.0),
-        "QIII": (qx < 0.0) & (qy < 0.0),
-        "QIV": (qx >= 0.0) & (qy < 0.0),
-    }
+    if all_geom_finite:
+        nx_g = qx < 0.0
+        ny_g = qy < 0.0
+        c2 = int(np.count_nonzero(nx_g & ~ny_g))
+        c3 = int(np.count_nonzero(nx_g & ny_g))
+        c4 = int(np.count_nonzero(~nx_g & ny_g))
+        c1 = int(qx.size) - c2 - c3 - c4
+        cand_map = {"QI": c1, "QII": c2, "QIII": c3, "QIV": c4}
+        nx_o = nx_g[observed]
+        ny_o = ny_g[observed]
+        img_o = image[observed] if obs_img is None else obs_img
+    else:
+        assert geometry is not None
+        qx_g = qx[geometry]
+        qy_g = qy[geometry]
+        nx_g = qx_g < 0.0
+        ny_g = qy_g < 0.0
+        c2 = int(np.count_nonzero(nx_g & ~ny_g))
+        c3 = int(np.count_nonzero(nx_g & ny_g))
+        c4 = int(np.count_nonzero(~nx_g & ny_g))
+        c1 = int(qx_g.size) - c2 - c3 - c4
+        cand_map = {"QI": c1, "QII": c2, "QIII": c3, "QIV": c4}
+        qx_o = qx[observed] if obs_qx is None else obs_qx
+        qy_o = qy[observed] if obs_qy is None else obs_qy
+        nx_o = qx_o < 0.0
+        ny_o = qy_o < 0.0
+        img_o = image[observed] if obs_img is None else obs_img
+
+    pos_x = ~nx_o
+    pos_y = ~ny_o
+    obs_masks = (
+        ("QI", pos_x & pos_y),
+        ("QII", nx_o & pos_y),
+        ("QIII", nx_o & ny_o),
+        ("QIV", pos_x & ny_o),
+    )
     result: dict[str, dict[str, Any]] = {}
-    for name, membership in memberships.items():
-        candidates = geometry & membership
-        measured = observed & membership
-        count = int(np.count_nonzero(measured))
-        candidate_count = int(np.count_nonzero(candidates))
-        selected = image[measured]
-        total = np.sum(selected, dtype=float) if count else np.nan
+    for name, mask in obs_masks:
+        count = int(np.count_nonzero(mask))
+        candidate_count = cand_map[name]
+        total = float(np.sum(img_o, where=mask, dtype=float)) if count else np.nan
         result[name] = {
             "sum": _finite_number(total),
             "count": count,
@@ -285,9 +453,20 @@ def _quadrants(
     return result
 
 
-def _weighted_tensor(qx: np.ndarray, qy: np.ndarray, image: np.ndarray) -> dict[str, Any]:
-    weights = np.maximum(image, 0.0)
-    weight_sum = float(np.sum(weights, dtype=float))
+def _weighted_tensor(
+    qx: np.ndarray,
+    qy: np.ndarray,
+    image: np.ndarray,
+    *,
+    all_nonnegative: bool = False,
+    precomputed_weight_sum: float | None = None,
+) -> dict[str, Any]:
+    if all_nonnegative:
+        weights = image
+        weight_sum = float(precomputed_weight_sum) if precomputed_weight_sum is not None else float(np.sum(image, dtype=float))
+    else:
+        weights = np.maximum(image, 0.0)
+        weight_sum = float(np.sum(weights, dtype=float))
     base = {
         "weighting": "non-negative observed intensity: max(I, 0)",
         "tensor_definition": "intensity-weighted second moment E[q q^T] about the reciprocal-space origin",
@@ -308,7 +487,14 @@ def _weighted_tensor(qx: np.ndarray, qy: np.ndarray, image: np.ndarray) -> dict[
             "anisotropy": None,
         }
 
-    q_scale = float(max(np.max(np.abs(qx)), np.max(np.abs(qy))))
+    q_scale = float(
+        max(
+            abs(float(np.min(qx))),
+            abs(float(np.max(qx))),
+            abs(float(np.min(qy))),
+            abs(float(np.max(qy))),
+        )
+    )
     if not np.isfinite(q_scale) or q_scale <= 0.0:
         return {
             **base,
@@ -321,19 +507,26 @@ def _weighted_tensor(qx: np.ndarray, qy: np.ndarray, image: np.ndarray) -> dict[
             "anisotropy": None,
         }
 
-    # Scale q before products to avoid overflow. The tensor is then the
-    # dimensionless moment E[(q/q_scale)(q/q_scale)^T]; eigenvectors and the
-    # normalized anisotropy are unchanged by this common scale.
-    sx = qx / q_scale
-    sy = qy / q_scale
+    # Scale q before products only if extreme magnitudes risk overflow/underflow;
+    # otherwise compute BLAS dot products directly and apply common scale factor once.
     with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
-        tensor = np.array(
-            [
-                [np.sum(weights * sx * sx) / weight_sum, np.sum(weights * sx * sy) / weight_sum],
-                [np.sum(weights * sx * sy) / weight_sum, np.sum(weights * sy * sy) / weight_sum],
-            ],
-            dtype=float,
-        )
+        if 1.0e-100 <= q_scale <= 1.0e100:
+            inv_denom = 1.0 / (weight_sum * q_scale * q_scale)
+            buf = weights * qx
+            t_xx = float(np.dot(buf, qx)) * inv_denom
+            t_xy = float(np.dot(buf, qy)) * inv_denom
+            np.multiply(weights, qy, out=buf)
+            t_yy = float(np.dot(buf, qy)) * inv_denom
+        else:
+            inv_scale = 1.0 / q_scale
+            sx = qx * inv_scale
+            sy = qy * inv_scale
+            buf = weights * sx
+            t_xx = float(np.dot(buf, sx)) / weight_sum
+            t_xy = float(np.dot(buf, sy)) / weight_sum
+            np.multiply(weights, sy, out=buf)
+            t_yy = float(np.dot(buf, sy)) / weight_sum
+        tensor = np.array([[t_xx, t_xy], [t_xy, t_yy]], dtype=float)
     if not np.all(np.isfinite(tensor)):
         return {
             **base,
@@ -419,7 +612,8 @@ def _saxs_physics_summary(
             counts=ang_count,
             initial_chi_sym_deg=harmonics.get("friedel_bisector_deg"),
             initial_alpha_deg=wing_half_opening,
-            max_nfev=1500,
+            max_nfev=400,
+            include_flat_comparison=False,
         )
         if c2_fit.get("success") and c2_fit.get("alpha_deg") is not None:
             wing_half_opening = c2_fit["alpha_deg"]
@@ -470,6 +664,9 @@ def measure_frame(
     q_edges: Any = None,
     radial_bins: int = 128,
     angular_bins: int = 72,
+    q_mag: Any = None,
+    chi_deg: Any = None,
+    geometry_cache: Any = None,
 ) -> dict[str, Any]:
     """Summarize observed frame intensity and its 2-D reciprocal-space layout.
 
@@ -519,51 +716,146 @@ def measure_frame(
             raise ValueError(f"valid_mask shape {supplied_mask.shape!r} must match image shape {shape!r}")
         inclusion = supplied_mask.astype(bool, copy=False)
 
+    # Pull precomputed q_mag / chi_deg from geometry_cache when shape matches
+    if geometry_cache is not None:
+        if q_mag is None:
+            if getattr(geometry_cache, "shape", None) == shape and hasattr(geometry_cache.geometry, "q_nm_inv"):
+                q_mag = geometry_cache.geometry.q_nm_inv
+            elif getattr(geometry_cache, "roi_shape", None) == shape:
+                q_mag = geometry_cache.q_mag_roi
+        if chi_deg is None:
+            if getattr(geometry_cache, "shape", None) == shape and hasattr(geometry_cache.geometry, "chi_deg"):
+                chi_deg = geometry_cache.geometry.chi_deg
+            elif getattr(geometry_cache, "roi_shape", None) == shape:
+                chi_deg = geometry_cache.chi_deg_roi
+
     image_flat = observed_image.ravel()
     qx_flat = qx_map.ravel()
     qy_flat = qy_map.ravel()
     inclusion_flat = inclusion.ravel()
-    q_magnitude = np.hypot(qx_flat, qy_flat)
-    geometry = np.isfinite(qx_flat) & np.isfinite(qy_flat) & np.isfinite(q_magnitude)
-    if not np.any(geometry):
+
+    if q_mag is not None:
+        q_mag_arr = _array2d(q_mag, "q_mag", shape)
+        q_magnitude = q_mag_arr.ravel()
+        if geometry_cache is not None and getattr(geometry_cache, "q_coordinates_validated", False):
+            all_geom_finite = True
+            geometry = None
+        else:
+            q_lo_f, q_hi_f = float(np.min(q_magnitude)), float(np.max(q_magnitude))
+            qx_lo_f, qx_hi_f = float(np.min(qx_flat)), float(np.max(qx_flat))
+            qy_lo_f, qy_hi_f = float(np.min(qy_flat)), float(np.max(qy_flat))
+            all_geom_finite = (
+                math.isfinite(q_lo_f)
+                and math.isfinite(q_hi_f)
+                and math.isfinite(qx_lo_f)
+                and math.isfinite(qx_hi_f)
+                and math.isfinite(qy_lo_f)
+                and math.isfinite(qy_hi_f)
+            )
+            geometry = None if all_geom_finite else (np.isfinite(qx_flat) & np.isfinite(qy_flat) & np.isfinite(q_magnitude))
+    else:
+        qx_lo_f, qx_hi_f = float(np.min(qx_flat)), float(np.max(qx_flat))
+        qy_lo_f, qy_hi_f = float(np.min(qy_flat)), float(np.max(qy_flat))
+        all_coords_finite = (
+            math.isfinite(qx_lo_f)
+            and math.isfinite(qx_hi_f)
+            and math.isfinite(qy_lo_f)
+            and math.isfinite(qy_hi_f)
+        )
+        if all_coords_finite and max(abs(qx_lo_f), abs(qx_hi_f), abs(qy_lo_f), abs(qy_hi_f)) < 1.0e100:
+            q_magnitude = qx_flat * qx_flat
+            q_magnitude += qy_flat * qy_flat
+            np.sqrt(q_magnitude, out=q_magnitude)
+            all_geom_finite = True
+            geometry = None
+        else:
+            q_magnitude = np.hypot(qx_flat, qy_flat)
+            geometry = np.isfinite(q_magnitude)
+            all_geom_finite = bool(np.all(geometry))
+
+    if not all_geom_finite and not np.any(geometry):
         raise ValueError("qx and qy contain no finite reciprocal-space coordinates")
-    usable = geometry & inclusion_flat & np.isfinite(image_flat)
+    geom_and_incl = inclusion_flat if all_geom_finite else (geometry & inclusion_flat)
+    usable = geom_and_incl & np.isfinite(image_flat)
     q_unit_canonical = canonical_q_unit(q_unit)
     q_unit_label = q_unit_canonical if q_unit_canonical in {"nm⁻¹", "Å⁻¹", "pixel-q"} else str(q_unit or "unknown")
 
-    candidate_q = q_magnitude[geometry]
-    edges = _q_edges(candidate_q, q_edges, n_radial)
+    candidate_q = q_magnitude if all_geom_finite else q_magnitude[geometry]
+    q_cand_min_val = float(np.min(candidate_q))
+    q_cand_max_val = float(np.max(candidate_q))
+    if q_edges is None:
+        if q_cand_min_val == q_cand_max_val:
+            edges = _q_edges(candidate_q, None, n_radial)
+        else:
+            edges = np.linspace(q_cand_min_val, q_cand_max_val, n_radial + 1, dtype=float)
+    else:
+        edges = _q_edges(candidate_q, q_edges, n_radial)
     n_radial = edges.size - 1
     angle_edges = np.linspace(-180.0, 180.0, n_angular + 1, dtype=float)
-    angles = np.degrees(np.arctan2(qy_flat, qx_flat))
 
-    q_index, q_inside = _bin_indices(q_magnitude, edges)
-    angle_index, angle_inside = _bin_indices(angles, angle_edges)
-    candidate_radial_index = q_index[geometry & q_inside]
-    observed_radial = usable & q_inside
-    observed_radial_index = q_index[observed_radial]
+    uniform_q = q_edges is None
+    all_full_domain = all_geom_finite and uniform_q
+    q_index, q_inside = _bin_indices(q_magnitude, edges, uniform=uniform_q, all_inside=all_full_domain)
 
-    candidate_polar = geometry & q_inside & angle_inside
-    observed_polar = usable & q_inside & angle_inside
-    candidate_polar_index = q_index[candidate_polar] * n_angular + angle_index[candidate_polar]
-    observed_polar_index = q_index[observed_polar] * n_angular + angle_index[observed_polar]
-    observed_values = image_flat[observed_polar]
+    def _chi_deg_to_angle_bins(chi_vals: np.ndarray) -> np.ndarray:
+        """Map ``chi_deg`` in ``[0, 360)`` to ``intp`` bins over ``[-180, 180]`` without float copies."""
+        inv_step = float(n_angular) / 360.0
+        if n_angular % 2 == 0:
+            half = n_angular // 2
+            idx = (chi_vals * inv_step).astype(np.intp)
+            idx += half
+            idx[chi_vals > 180.0] -= n_angular
+            idx[idx >= n_angular] = n_angular - 1
+            idx[idx < 0] = 0
+            return idx
+        shifted = np.where(chi_vals > 180.0, chi_vals - 180.0, chi_vals + 180.0)
+        idx = (shifted * inv_step).astype(np.intp)
+        idx[idx >= n_angular] = n_angular - 1
+        idx[idx < 0] = 0
+        return idx
 
-    radial_stats = _profile_stats(
-        n_radial,
-        observed_radial_index,
-        image_flat[observed_radial],
-        candidate_radial_index,
-    )
-    angular_candidate = candidate_polar_index % n_angular
-    angular_observed = observed_polar_index % n_angular
-    angular_stats = _profile_stats(
-        n_angular,
-        angular_observed,
-        observed_values,
-        angular_candidate,
-    )
-    polar_stats = _profile_stats(
+    # Single fused in-place intp polar-index path: zero redundant copies or int casts
+    if all_full_domain:
+        if chi_deg is not None:
+            chi_arr = _array2d(chi_deg, "chi_deg", shape).ravel()
+            cand_angle_idx = _chi_deg_to_angle_bins(chi_arr)
+        else:
+            inv_ang_rad = float(n_angular) / (2.0 * math.pi)
+            ang_buf = np.arctan2(qy_flat, qx_flat)
+            ang_buf += math.pi
+            ang_buf *= inv_ang_rad
+            cand_angle_idx = ang_buf.astype(np.intp)
+            cand_angle_idx[cand_angle_idx >= n_angular] = n_angular - 1
+        q_index *= n_angular
+        q_index += cand_angle_idx
+        candidate_polar_index = q_index
+        observed_polar_index = candidate_polar_index[usable]
+        obs_img = image_flat[usable]
+        observed_values = obs_img
+    else:
+        assert q_inside is not None
+        candidate_polar = q_inside if all_geom_finite else (geometry & q_inside)
+        observed_polar = usable & q_inside
+        obs_in_cand = observed_polar[candidate_polar]
+        if chi_deg is not None:
+            chi_arr = _array2d(chi_deg, "chi_deg", shape).ravel()
+            cand_angle_idx = _chi_deg_to_angle_bins(chi_arr[candidate_polar])
+        else:
+            ang_buf = np.arctan2(qy_flat[candidate_polar], qx_flat[candidate_polar])
+            ang_buf += math.pi
+            ang_buf *= float(n_angular) / (2.0 * math.pi)
+            cand_angle_idx = ang_buf.astype(np.intp)
+            cand_angle_idx[cand_angle_idx >= n_angular] = n_angular - 1
+        cand_q_idx = q_index[candidate_polar]
+        cand_q_idx *= n_angular
+        cand_q_idx += cand_angle_idx
+        candidate_polar_index = cand_q_idx
+        observed_polar_index = candidate_polar_index[obs_in_cand]
+        observed_values = image_flat[observed_polar]
+        obs_img = image_flat[usable]
+
+    # Single full-frame polar pass + exact O(n_radial * n_angular) Chan marginalization
+    polar_stats, polar_m2 = _profile_stats_with_m2(
         n_radial * n_angular,
         observed_polar_index,
         observed_values,
@@ -573,31 +865,55 @@ def measure_frame(
         key: values.reshape(n_radial, n_angular)
         for key, values in polar_stats.items()
     }
+    m2_2d = polar_m2.reshape(n_radial, n_angular)
+    radial_stats = _marginalize_polar_stats(
+        polar["count"], polar["candidate_count"], polar["sum"], polar["mean"], m2_2d, axis=1
+    )
+    angular_stats = _marginalize_polar_stats(
+        polar["count"], polar["candidate_count"], polar["sum"], polar["mean"], m2_2d, axis=0
+    )
     polar["q_edges"] = edges.copy()
     polar["angle_edges"] = angle_edges
 
-    observed_q = q_magnitude[usable]
-    q_candidate_min = _finite_number(np.min(candidate_q))
-    q_candidate_max = _finite_number(np.max(candidate_q))
-    q_observed_min = _finite_number(np.min(observed_q)) if observed_q.size else None
-    q_observed_max = _finite_number(np.max(observed_q)) if observed_q.size else None
-    intensity_stats = _intensity_summary(image_flat[usable])
+    # Extract usable 1D vectors ONCE and avoid copying observed_q array
+    obs_qx = qx_flat[usable]
+    obs_qy = qy_flat[usable]
+    q_candidate_min = _finite_number(q_cand_min_val)
+    q_candidate_max = _finite_number(q_cand_max_val)
+    if obs_img.size:
+        q_observed_min = _finite_number(np.min(q_magnitude, initial=np.inf, where=usable))
+        q_observed_max = _finite_number(np.max(q_magnitude, initial=-np.inf, where=usable))
+    else:
+        q_observed_min = None
+        q_observed_max = None
+    intensity_stats = _intensity_summary(obs_img)
 
-    if np.any(usable):
-        max_flat = int(np.flatnonzero(usable)[np.argmax(image_flat[usable])])
+    if obs_img.size:
+        max_local = int(np.argmax(obs_img))
+        max_val = float(obs_img[max_local])
+        # Deterministic first maximum in row-major order without allocating full flatnonzero(usable)
+        max_flat = int(np.argmax(usable & (image_flat == max_val)))
+        max_qx_val = float(obs_qx[max_local])
+        max_qy_val = float(obs_qy[max_local])
         maxima: dict[str, Any] = {
-            "intensity": _finite_number(image_flat[max_flat]),
+            "intensity": _finite_number(max_val),
             "row": max_flat // shape[1],
             "column": max_flat % shape[1],
-            "qx": _finite_number(qx_flat[max_flat]),
-            "qy": _finite_number(qy_flat[max_flat]),
+            "qx": _finite_number(max_qx_val),
+            "qy": _finite_number(max_qy_val),
             "q": _finite_number(q_magnitude[max_flat]),
-            "angle_deg": _finite_number(angles[max_flat]),
+            "angle_deg": _finite_number(math.degrees(math.atan2(max_qy_val, max_qx_val))),
         }
     else:
         maxima = {key: None for key in ("intensity", "row", "column", "qx", "qy", "q", "angle_deg")}
 
-    tensor = _weighted_tensor(qx_flat[usable], qy_flat[usable], image_flat[usable])
+    tensor = _weighted_tensor(
+        obs_qx,
+        obs_qy,
+        obs_img,
+        all_nonnegative=(intensity_stats["negative_count"] == 0),
+        precomputed_weight_sum=intensity_stats["sum"],
+    )
     saxs_physics_summary = _saxs_physics_summary(
         edges=edges,
         radial_stats=radial_stats,
@@ -605,15 +921,18 @@ def measure_frame(
         angular_stats=angular_stats,
         q_unit=q_unit_canonical,
     )
+    n_geom = int(image_flat.size) if all_geom_finite else int(np.count_nonzero(geometry))
+    n_geom_incl = int(np.count_nonzero(geom_and_incl))
+    n_obs = int(obs_img.size)
     summary = {
         "q_unit": q_unit_label,
         "shape": [int(shape[0]), int(shape[1])],
         "pixel_counts": {
-            "candidate_qmap": int(np.count_nonzero(geometry)),
-            "observed": int(np.count_nonzero(usable)),
-            "valid_mask_excluded": int(np.count_nonzero(geometry & ~inclusion_flat)),
-            "nonfinite_intensity_after_mask": int(np.count_nonzero(geometry & inclusion_flat & ~np.isfinite(image_flat))),
-            "invalid_qmap": int(image_flat.size - np.count_nonzero(geometry)),
+            "candidate_qmap": n_geom,
+            "observed": n_obs,
+            "valid_mask_excluded": n_geom - n_geom_incl,
+            "nonfinite_intensity_after_mask": n_geom_incl - n_obs,
+            "invalid_qmap": int(image_flat.size) - n_geom,
         },
         "intensity": intensity_stats,
         "q_range": {
@@ -623,7 +942,17 @@ def measure_frame(
             "observed_max": q_observed_max,
         },
         "reciprocal_spacing_proxy": _spacing_proxy(q_observed_min, q_observed_max, q_unit_canonical),
-        "quadrants": _quadrants(qx_flat, qy_flat, image_flat, usable, geometry),
+        "quadrants": _quadrants(
+            qx_flat,
+            qy_flat,
+            image_flat,
+            usable,
+            geometry,
+            obs_qx=obs_qx,
+            obs_qy=obs_qy,
+            obs_img=obs_img,
+            all_geom_finite=all_geom_finite,
+        ),
         "maxima": maxima,
         "in_plane_intensity_tensor": tensor,
         "sem_definition": (

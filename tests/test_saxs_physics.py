@@ -15,6 +15,7 @@ from butterfly_saxs.saxs_physics import (
     fit_power_law_coarsening,
     measure_perpendicular_streak_width,
     measure_radial_coarsening_observables,
+    run_window_sensitivity_audit,
     unwrap_periodic_angles_deg,
 )
 
@@ -750,4 +751,144 @@ def test_radial_coarsening_steep_low_q_decay_with_noisy_flat_tail_rejects_ripple
     assert res["q_star_kratky"] == pytest.approx(qc, abs=0.025)
     assert res["L_star_kratky_nm"] == pytest.approx(2.0 * math.pi / res["q_star_kratky"], rel=1e-6)
     assert res["kratky_low_q_edge_hit"] is False
+
+
+# ---------------------------------------------------------------------------
+# 8. Raw-vs-Calibrated Isolation, Statistical SE Propagation & Sensitivity Audit
+# ---------------------------------------------------------------------------
+
+
+def test_radial_raw_intensity_mode_withholds_q_win_and_propagates_sigma_when_calibrated():
+    img, qx, qy = _make_butterfly_2d(
+        n_grid=201, q_extent=1.0, q_star=0.38, sigma_q=0.06, chi_sym_deg=0.0, alpha_deg=36.0, c0=10.0, c2=5.0
+    )
+    valid = np.hypot(qx, qy) >= 0.09
+    sigma_const = 0.4
+    sigma = np.full_like(img, sigma_const)
+
+    cal = measure_radial_coarsening_observables(
+        img,
+        qx,
+        qy,
+        valid_mask=valid,
+        q_window=(0.11, 0.90),
+        q_unit="nm^-1",
+        n_radial_bins=64,
+        intensity_mode="calibrated",
+        sigma=sigma,
+    )
+    _assert_strict_json(cal)
+    assert cal["intensity_mode"] == "calibrated"
+    assert cal["q_win_invariant"] is not None and cal["q_win_invariant"] > 0.0
+    assert cal["q_win_bg_subtracted"] is not None and cal["q_win_bg_subtracted"] > 0.0
+    assert cal["sigma_source"] == "supplied_statistical_sigma"
+    assert cal["systematic_k_uncertainty"] == "unavailable"
+    assert cal["q_win_stat_stderr"] is not None and cal["q_win_stat_stderr"] > 0.0
+    assert cal["sigma_radial"] is not None and len(cal["sigma_radial"]) == 64
+
+    # Check exact analytical propagation sigma_bin = sigma_const / sqrt(count)
+    full_ch = cal["full_azimuth"]
+    counts = full_ch["counts"]
+    se_list = full_ch["sigma_radial"]
+    q_centers = np.asarray(full_ch["q_centers"], dtype=float)
+    q_edges = np.asarray(full_ch["q_edges"], dtype=float)
+    dq = np.diff(q_edges)
+    expected_var = 0.0
+    for c, se_val, qc, dqb in zip(counts, se_list, q_centers, dq):
+        if c > 0:
+            assert se_val == pytest.approx(sigma_const / math.sqrt(c), rel=1e-10)
+            expected_var += ((qc ** 2) * dqb * se_val) ** 2
+    assert cal["q_win_stat_stderr"] == pytest.approx(math.sqrt(expected_var), rel=1e-10)
+
+    # Raw intensity mode MUST withhold Q_win and Q_win_bg_sub (and Q_win SE) while retaining q*/L*
+    raw = measure_radial_coarsening_observables(
+        img,
+        qx,
+        qy,
+        valid_mask=valid,
+        q_window=(0.11, 0.90),
+        q_unit="nm^-1",
+        n_radial_bins=64,
+        intensity_mode="raw",
+        sigma=sigma,
+    )
+    _assert_strict_json(raw)
+    assert raw["intensity_mode"] == "raw"
+    assert raw["q_win_invariant"] is None
+    assert raw["q_win_bg_subtracted"] is None
+    assert raw["q_win_stat_stderr"] is None
+    assert raw["full_azimuth"]["q_win_invariant"] is None
+    assert raw["full_azimuth"]["q_win_bg_subtracted"] is None
+    assert raw["lobe_sectored"]["q_win_invariant"] is None
+    assert "raw_intensity_mode_q_win_withheld" in raw["flags"]
+    assert any("raw" in note.lower() for note in raw["caveats"])
+    assert raw["q_star_direct"] == pytest.approx(cal["q_star_direct"], abs=1e-10)
+    assert raw["L_star_direct_nm"] == pytest.approx(cal["L_star_direct_nm"], abs=1e-10)
+
+    # Invalid intensity_mode and negative sigma raise actionable ValueError
+    with pytest.raises(ValueError, match="intensity_mode"):
+        measure_radial_coarsening_observables(img, qx, qy, q_window=(0.11, 0.90), intensity_mode="bogus")
+    bad_sigma = sigma.copy()
+    bad_sigma[100, 120] = -0.5
+    with pytest.raises(ValueError, match="sigma must be non-negative"):
+        measure_radial_coarsening_observables(img, qx, qy, valid_mask=valid, q_window=(0.11, 0.90), sigma=bad_sigma)
+
+
+def test_run_window_sensitivity_audit_compares_windows_models_and_raw_isolation():
+    img, qx, qy = _make_butterfly_2d(
+        n_grid=221, q_extent=1.45, q_star=0.20, sigma_q=0.045, chi_sym_deg=1.5, alpha_deg=37.0, c0=12.0, c2=6.0
+    )
+    valid = np.hypot(qx, qy) >= 0.09
+    sigma = np.full_like(img, 0.2)
+
+    audit = run_window_sensitivity_audit(
+        img,
+        qx,
+        qy,
+        valid,
+        q_unit="nm^-1",
+        q_windows=((0.25, 1.35), (0.11, 1.35), (0.12, 1.20), (0.15, 1.00)),
+        nominal_draw_axis_deg=90.0,
+        bright_axis_convention="reference",
+        intensity_mode="calibrated",
+        sigma=sigma,
+    )
+    _assert_strict_json(audit)
+    assert audit["status"] == "estimated"
+    assert audit["intensity_mode"] == "calibrated"
+    assert audit["sigma_source"] == "supplied_statistical_sigma"
+    assert audit["systematic_k_uncertainty"] == "unavailable"
+    assert len(audit["windows"]) == 4
+
+    # Window 0 ([0.25, 1.35]) misses the q*=0.20 peak (low_q edge hit), while [0.11, 1.35] recovers it cleanly!
+    w_v1 = audit["windows"][0]
+    w_v2 = audit["windows"][1]
+    assert w_v1["direct_low_q_edge_hit"] is True
+    assert w_v2["direct_low_q_edge_hit"] is False
+    assert w_v2["q_star_direct"] == pytest.approx(0.20, abs=0.02)
+    assert w_v2["q_win_invariant"] is not None and w_v2["q_win_invariant"] > 0.0
+    assert w_v2["q_win_stat_stderr"] is not None and w_v2["q_win_stat_stderr"] > 0.0
+    assert w_v2["c2_bridge_model"]["success"] is True
+    assert w_v2["flat_baseline_model"]["success"] is True
+    assert w_v2["model_comparison"]["bridge_improved"] is True
+    assert w_v2["model_comparison"]["delta_bic"] > 10.0
+
+    # Raw mode must strictly withhold Q_win across all windows
+    audit_raw = run_window_sensitivity_audit(
+        img,
+        qx,
+        qy,
+        valid,
+        q_unit="nm^-1",
+        q_windows=((0.11, 1.35), (0.15, 1.00)),
+        intensity_mode="raw",
+        sigma=sigma,
+    )
+    _assert_strict_json(audit_raw)
+    assert audit_raw["intensity_mode"] == "raw"
+    assert audit_raw["summary"]["q_win_bg_subtracted_range"] is None
+    for row in audit_raw["windows"]:
+        assert row["q_win_invariant"] is None
+        assert row["q_win_bg_subtracted"] is None
+        assert row["q_win_stat_stderr"] is None
 
