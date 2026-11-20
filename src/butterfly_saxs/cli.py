@@ -52,6 +52,7 @@ run_campaign = None
 
 _WORKFLOW_PRESETS = ("annular", "curvature", "sector", "butterfly_pub")
 _JOURNAL_STYLES = ("default", "nature", "nature_comm", "science", "macromolecules")
+_BRIGHT_AXIS_CONVENTIONS = ("draw", "reference")
 
 
 def _advisor_callable() -> Any:
@@ -797,6 +798,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=90.0,
         help="名义拉伸轴方向（度，默认 90.0）",
+    )
+    advise_parser.add_argument(
+        "--bright-axis-convention",
+        choices=_BRIGHT_AXIS_CONVENTIONS,
+        default="draw",
+        help="预期亮桥/对称轴约定：draw（默认，与拉伸轴一致）或 reference（垂直拉伸轴，适用于赤道翼）",
     )
     advise_parser.add_argument("-o", "--output", help="可选 JSON 输出路径")
     advise_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
@@ -1854,16 +1861,17 @@ def _handle_advise(args: argparse.Namespace) -> int:
     if not image:
         raise PipelineError("advise 需要输入图像路径（--image）")
     advisor_fn = _advisor_callable()
-    advice = advisor_fn(
-        image,
-        poni_path=args.poni,
-        mask_path=args.mask,
-        image_dataset=args.image_dataset,
-        image_frame_index=args.image_frame_index,
-        mask_dataset=args.mask_dataset,
-        mask_frame_index=args.mask_frame_index,
-        nominal_draw_axis_deg=float(args.nominal_draw_axis_deg),
-    )
+    advise_kwargs: dict[str, Any] = {
+        "poni_path": args.poni,
+        "mask_path": args.mask,
+        "image_dataset": args.image_dataset,
+        "image_frame_index": args.image_frame_index,
+        "mask_dataset": args.mask_dataset,
+        "mask_frame_index": args.mask_frame_index,
+        "nominal_draw_axis_deg": float(args.nominal_draw_axis_deg),
+        "bright_axis_convention": str(getattr(args, "bright_axis_convention", "draw")),
+    }
+    advice = advisor_fn(image, **advise_kwargs)
     report = annotate_report(advice, command="advise", exit_code=0)
     if args.output:
         destination = Path(args.output).expanduser()

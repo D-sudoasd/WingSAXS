@@ -400,6 +400,7 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
                     "image_dataset": "Optional HDF5/NPZ image dataset selector.",
                     "image_frame_index": "Optional zero-based frame index.",
                     "nominal_draw_axis_deg": "Nominal specimen draw axis in degrees (default 90.0).",
+                    "bright_axis_convention": "Expected bright bridge axis convention: 'draw' (default) or 'reference' (perpendicular to draw axis).",
                 },
                 "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
             },

@@ -315,12 +315,31 @@ def test_cli_advise_command_forwards_contract_and_handles_missing_module(
             "mask_dataset": None,
             "mask_frame_index": None,
             "nominal_draw_axis_deg": 88.5,
+            "bright_axis_convention": "draw",
         },
     )]
     assert payload["schema_version"] == "wingsaxs.advise.v1"
     assert payload["agent"]["scientific_acceptance"] is False
     assert out_json.is_file()
     json.dumps(payload, allow_nan=False, ensure_ascii=True)
+
+    # Explicit --bright-axis-convention reference forwards cleanly and is documented in describe.
+    assert main([
+        "advise",
+        "--image", "sample.h5",
+        "--nominal-draw-axis-deg", "90",
+        "--bright-axis-convention", "reference",
+        "--json",
+    ]) == 0
+    capsys.readouterr()
+    assert calls[-1][1]["bright_axis_convention"] == "reference"
+    assert calls[-1][1]["nominal_draw_axis_deg"] == 90.0
+    assert "bright_axis_convention" in agent_manifest("advise")["commands"][0]["options"]
+
+    # Invalid --bright-axis-convention fails with usage error (exit 2).
+    assert main(["advise", "--image", "sample.h5", "--bright-axis-convention", "invalid"]) == 2
+    bad = json.loads(capsys.readouterr().out)
+    assert bad["error"]["code"] == "usage_error"
 
     # Existing output refuses overwrite without --force.
     assert main(["advise", "--image", "sample.h5", "--output", str(out_json)]) == 2
