@@ -182,3 +182,52 @@ def test_export_bundle_contains_profile_residuals_units_and_peak_parameters(tmp_
     assert len(peak_rows) == 2
     assert peak_rows[0]["fit_success"] == "1"
     assert {"center_deg", "amplitude", "fwhm_deg", "baseline", "rmse"} <= set(peak_rows[0])
+
+
+def test_c2_bridge_four_lobe_model_in_azimuthal_analysis_and_csv_bundle(tmp_path):
+    axis = np.linspace(-1.0, 1.0, 301)
+    qx, qy = np.meshgrid(axis, axis)
+    angle = np.mod(np.degrees(np.arctan2(qy, qx)), 360.0)
+    peaks = (
+        AzimuthalPeak(center_deg=54.0, amplitude=18.0, fwhm_deg=22.0),
+        AzimuthalPeak(center_deg=126.0, amplitude=17.5, fwhm_deg=22.0),
+        AzimuthalPeak(center_deg=234.0, amplitude=18.0, fwhm_deg=22.0),
+        AzimuthalPeak(center_deg=306.0, amplitude=17.5, fwhm_deg=22.0),
+    )
+    image = evaluate_azimuthal_model(
+        angle,
+        baseline=10.0,
+        peaks=peaks,
+        model="c2_bridge_four_lobe",
+        c2=-4.5,
+        chi_sym_deg=90.0,
+    )
+    valid = np.ones(image.shape, dtype=bool)
+    valid &= ~((angle >= 170.0) & (angle <= 190.0))
+
+    profile = measure_azimuthal_profile(
+        image, qx=qx, qy=qy, q_window=(0.35, 0.65), valid_mask=valid, q_unit="nm^-1", n_bins=360
+    )
+    fit = fit_azimuthal_peaks(profile, model="c2_bridge_four_lobe")
+    assert fit.success, fit.message
+    assert fit.model_name == "c2_bridge_four_lobe"
+    assert len(fit.peaks) == 4
+    assert fit.rmse < 0.05
+    assert fit.r_squared > 0.999
+    assert "incomplete_pixel_coverage" in fit.flags
+    masked_bins = (profile.angle_deg >= 170.0) & (profile.angle_deg <= 190.0)
+    assert np.all(np.isnan(fit.residual[masked_bins]))
+    assert np.all(np.isfinite(fit.residual[np.isfinite(profile.intensity)]))
+
+    c2_meta = fit.settings["c2_bridge"]
+    assert c2_meta["c2"] == pytest.approx(-4.5, abs=0.2)
+    assert c2_meta["chi_sym_deg"] == pytest.approx(90.0, abs=0.5)
+    assert c2_meta["alpha_deg"] == pytest.approx(36.0, abs=0.5)
+    assert c2_meta["flat_baseline_comparison"]["bridge_improved"] is True
+
+    profile_path, peaks_path = export_azimuthal_csv_bundle(profile, fit, tmp_path / "butterfly_c2.csv")
+    with peaks_path.open(encoding="utf-8-sig", newline="") as stream:
+        peak_rows = list(csv.DictReader(stream))
+    assert len(peak_rows) == 4
+    assert all(row["fit_model"] == "c2_bridge_four_lobe" for row in peak_rows)
+    assert profile_path.exists()

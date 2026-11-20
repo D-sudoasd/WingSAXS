@@ -32,6 +32,10 @@ _MODEL_ALIASES = {
     "vonmises": "von_mises",
     "von-mises": "von_mises",
     "von_mises": "von_mises",
+    "c2_bridge_four_lobe": "c2_bridge_four_lobe",
+    "c2-bridge-four-lobe": "c2_bridge_four_lobe",
+    "c2_bridge": "c2_bridge_four_lobe",
+    "butterfly_c2": "c2_bridge_four_lobe",
 }
 
 
@@ -215,7 +219,9 @@ def _normalise_model(model: Any) -> str:
     name = str(model or "pseudo_voigt").strip().lower().replace(" ", "_")
     normalized = _MODEL_ALIASES.get(name)
     if normalized is None:
-        raise ValueError("model must be gaussian, lorentzian, pseudo_voigt, or von_mises")
+        raise ValueError(
+            "model must be gaussian, lorentzian, pseudo_voigt, von_mises, or c2_bridge_four_lobe"
+        )
     return normalized
 
 
@@ -264,6 +270,8 @@ def evaluate_azimuthal_model(
     peaks: tuple[AzimuthalPeak, ...] | list[AzimuthalPeak],
     model: str,
     eta: float = 0.5,
+    c2: float = 0.0,
+    chi_sym_deg: float = 0.0,
 ) -> np.ndarray:
     """Evaluate a periodic background-plus-peaks model at arbitrary angles."""
 
@@ -273,9 +281,18 @@ def evaluate_azimuthal_model(
     if not np.isfinite(eta_value) or not 0.0 <= eta_value <= 1.0:
         raise ValueError("eta must be finite and between 0 and 1")
     result = np.full(angles.shape, float(baseline), dtype=float)
+    if normalized == "c2_bridge_four_lobe":
+        c2_val = float(c2)
+        chi_sym_val = float(chi_sym_deg)
+        if not (np.isfinite(c2_val) and np.isfinite(chi_sym_val)):
+            raise ValueError("c2 and chi_sym_deg must be finite numbers")
+        result = result + c2_val * np.cos(2.0 * np.deg2rad(angles - chi_sym_val))
+        peak_model = "gaussian"
+    else:
+        peak_model = normalized
     for peak in peaks:
         result += peak.amplitude * _peak_shape(
-            angles, peak.center_deg, peak.fwhm_deg, normalized,
+            angles, peak.center_deg, peak.fwhm_deg, peak_model,
             peak.eta if peak.eta is not None else eta_value,
         )
     return result
@@ -419,6 +436,84 @@ def fit_azimuthal_peaks(
             "No measured angular bins are available in this q annulus.",
             float("nan"), float("nan"), tuple((*coverage_flags, "no_measured_angular_bins")), (), settings,
         )
+
+    if model_name == "c2_bridge_four_lobe":
+        from .saxs_physics import fit_c2_bridge_four_lobe
+
+        c2_result = fit_c2_bridge_four_lobe(
+            x,
+            y,
+            counts=counts,
+            initial_fwhm_deg=initial_fwhm_deg,
+            fwhm_bounds_deg=(width_min, width_max),
+            max_nfev=max_nfev,
+        )
+        c2_flags = list(coverage_flags)
+        c2_flags.extend(c2_result.get("flags") or ())
+        c2_settings = {
+            **settings,
+            "loss": "linear",
+            "c2_bridge": {
+                "c0": c2_result.get("c0"),
+                "c2": c2_result.get("c2"),
+                "chi_sym_deg": c2_result.get("chi_sym_deg"),
+                "alpha_deg": c2_result.get("alpha_deg"),
+                "lobe_fwhm_deg": c2_result.get("lobe_fwhm_deg"),
+                "lobe_supported": c2_result.get("lobe_supported"),
+                "aic": c2_result.get("aic"),
+                "bic": c2_result.get("bic"),
+                "flat_baseline_comparison": c2_result.get("flat_baseline_comparison"),
+            },
+        }
+        if not c2_result.get("lobe_centers_deg"):
+            return AzimuthalFitResult(
+                model_name, (), baseline_seed, empty_model, empty_residual, False,
+                str(c2_result.get("message") or "C2-bridge + 4-lobe fit unavailable."),
+                float("nan"), float("nan"), tuple(dict.fromkeys(c2_flags)), (), c2_settings,
+            )
+        model_values = np.asarray(
+            [np.nan if value is None else float(value) for value in c2_result["model"]],
+            dtype=float,
+        )
+        residual = np.full(x.shape, np.nan, dtype=float)
+        residual[observed] = y[observed] - model_values[observed]
+        c2_peaks = tuple(
+            AzimuthalPeak(
+                center_deg=float(center),
+                amplitude=max(0.0, float(amplitude)),
+                fwhm_deg=float(width),
+                eta=None,
+                kappa=None,
+            )
+            for center, amplitude, width in zip(
+                c2_result["lobe_centers_deg"],
+                c2_result["lobe_amplitudes"],
+                c2_result["lobe_fwhms_deg"],
+            )
+        )
+        init_centres = tuple(
+            float(value)
+            for value in (c2_result.get("initial_centres_deg") or ())
+            if value is not None
+        )
+        rmse_val = float(c2_result["rmse"]) if c2_result.get("rmse") is not None else float("nan")
+        r2_val = float(c2_result["r_squared"]) if c2_result.get("r_squared") is not None else float("nan")
+        baseline_val = float(c2_result["c0"]) if c2_result.get("c0") is not None else baseline_seed
+        return AzimuthalFitResult(
+            model_name=model_name,
+            peaks=c2_peaks,
+            baseline=baseline_val,
+            model=model_values,
+            residual=residual,
+            success=bool(c2_result.get("success")),
+            message=str(c2_result.get("message") or ""),
+            rmse=rmse_val,
+            r_squared=r2_val,
+            flags=tuple(dict.fromkeys(c2_flags)),
+            initial_centres_deg=init_centres,
+            settings=c2_settings,
+        )
+
     if not seeds:
         return AzimuthalFitResult(
             model_name, (), baseline_seed, empty_model, empty_residual, False,

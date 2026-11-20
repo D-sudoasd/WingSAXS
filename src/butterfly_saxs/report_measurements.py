@@ -12,6 +12,11 @@ from typing import Any
 import numpy as np
 
 from .local_measurement import spacing_from_q
+from .saxs_physics import (
+    _radial_metrics_from_1d_profile,
+    compute_azimuthal_harmonics_and_order,
+    fit_c2_bridge_four_lobe,
+)
 from .settings import canonical_q_unit
 
 
@@ -377,6 +382,84 @@ def _weighted_tensor(qx: np.ndarray, qy: np.ndarray, image: np.ndarray) -> dict[
     }
 
 
+def _saxs_physics_summary(
+    *,
+    edges: np.ndarray,
+    radial_stats: dict[str, np.ndarray],
+    angle_edges: np.ndarray,
+    angular_stats: dict[str, np.ndarray],
+    q_unit: str,
+) -> dict[str, Any]:
+    """Compute additive strict-JSON-safe saxs_physics metrics from observed profiles."""
+    angle_centers = 0.5 * (angle_edges[:-1] + angle_edges[1:])
+    ang_mean = angular_stats["mean"]
+    ang_count = angular_stats["count"]
+
+    harmonics = compute_azimuthal_harmonics_and_order(
+        angle_deg=angle_centers,
+        intensity=ang_mean,
+        counts=ang_count,
+        q_unit=q_unit,
+    )
+    radial = _radial_metrics_from_1d_profile(
+        edges,
+        radial_stats["mean"],
+        radial_stats["count"],
+        radial_stats["candidate_count"],
+        q_unit=q_unit,
+    )
+
+    wing_half_opening = harmonics.get("wing_half_opening_estimate_deg")
+    n_obs_ang = int(harmonics.get("n_observed_bins") or 0)
+    a4_val = harmonics.get("a4")
+    if n_obs_ang >= 12 and a4_val is not None and a4_val >= 0.02:
+        c2_fit = fit_c2_bridge_four_lobe(
+            angle_centers,
+            ang_mean,
+            counts=ang_count,
+            initial_chi_sym_deg=harmonics.get("friedel_bisector_deg"),
+            initial_alpha_deg=wing_half_opening,
+            max_nfev=1500,
+        )
+        if c2_fit.get("success") and c2_fit.get("alpha_deg") is not None:
+            wing_half_opening = c2_fit["alpha_deg"]
+
+    caveats: list[str] = [
+        "q_win_invariant is a window-bounded scattering invariant proxy over observed q bins only; "
+        "it does not estimate delta_rho or volume fraction.",
+    ]
+    if q_unit not in {"nm⁻¹", "Å⁻¹"}:
+        caveats.append(
+            f"L_star_direct_nm and L_star_kratky_nm are None because q_unit={q_unit!r} is not a calibrated physical unit."
+        )
+
+    return {
+        "status": harmonics.get("status", "unavailable"),
+        "a2": harmonics.get("a2"),
+        "a4": harmonics.get("a4"),
+        "a4_over_a2": harmonics.get("a4_over_a2"),
+        "f2_hermans": harmonics.get("f2"),
+        "f4_order": harmonics.get("f4"),
+        "f2_nominal": harmonics.get("f2_nominal"),
+        "f4_nominal": harmonics.get("f4_nominal"),
+        "phi2_deg": harmonics.get("phi2_deg"),
+        "phi4_deg": harmonics.get("phi4_deg"),
+        "friedel_bisector_deg": harmonics.get("friedel_bisector_deg"),
+        "wing_half_opening_deg": _finite_number(wing_half_opening),
+        "q_win_invariant": radial["q_win_invariant"],
+        "q_star_direct": radial["q_star_direct"],
+        "L_star_direct_nm": radial["L_star_direct_nm"],
+        "edge_hit_direct": radial["edge_hit_direct"],
+        "q_star_kratky": radial["q_star_kratky"],
+        "L_star_kratky_nm": radial["L_star_kratky_nm"],
+        "edge_hit_kratky": radial["edge_hit_kratky"],
+        "friedel_q1_q3_ratio": harmonics.get("q1_over_q3"),
+        "friedel_q2_q4_ratio": harmonics.get("q2_over_q4"),
+        "flags": list(harmonics.get("flags") or ()),
+        "caveats": caveats,
+    }
+
+
 def measure_frame(
     image: Any,
     qx: Any,
@@ -515,6 +598,13 @@ def measure_frame(
         maxima = {key: None for key in ("intensity", "row", "column", "qx", "qy", "q", "angle_deg")}
 
     tensor = _weighted_tensor(qx_flat[usable], qy_flat[usable], image_flat[usable])
+    saxs_physics_summary = _saxs_physics_summary(
+        edges=edges,
+        radial_stats=radial_stats,
+        angle_edges=angle_edges,
+        angular_stats=angular_stats,
+        q_unit=q_unit_canonical,
+    )
     summary = {
         "q_unit": q_unit_label,
         "shape": [int(shape[0]), int(shape[1])],
@@ -541,6 +631,21 @@ def measure_frame(
             "descriptive pixel-sampling statistic, not fit uncertainty"
         ),
         "quadrant_axis_assignment": "qx=0 is assigned to the right half and qy=0 to the upper half",
+        "a2": saxs_physics_summary["a2"],
+        "a4": saxs_physics_summary["a4"],
+        "a4_over_a2": saxs_physics_summary["a4_over_a2"],
+        "f2_hermans": saxs_physics_summary["f2_hermans"],
+        "f4_order": saxs_physics_summary["f4_order"],
+        "friedel_bisector_deg": saxs_physics_summary["friedel_bisector_deg"],
+        "wing_half_opening_deg": saxs_physics_summary["wing_half_opening_deg"],
+        "q_win_invariant": saxs_physics_summary["q_win_invariant"],
+        "q_star_direct": saxs_physics_summary["q_star_direct"],
+        "L_star_direct_nm": saxs_physics_summary["L_star_direct_nm"],
+        "q_star_kratky": saxs_physics_summary["q_star_kratky"],
+        "L_star_kratky_nm": saxs_physics_summary["L_star_kratky_nm"],
+        "friedel_q1_q3_ratio": saxs_physics_summary["friedel_q1_q3_ratio"],
+        "friedel_q2_q4_ratio": saxs_physics_summary["friedel_q2_q4_ratio"],
+        "saxs_physics": saxs_physics_summary,
     }
 
     return {
