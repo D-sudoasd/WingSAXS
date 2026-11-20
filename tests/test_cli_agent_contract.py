@@ -196,14 +196,18 @@ def test_lazy_import_invariant_for_help_describe_and_doctor() -> None:
     repo_src = str(Path(__file__).resolve().parents[1] / "src")
     env = dict(os.environ)
     env["PYTHONPATH"] = repo_src
-    heavy = ("numpy", "scipy", "matplotlib", "pyFAI", "PySide6", "h5py")
+    heavy = ("numpy", "scipy", "matplotlib", "pyFAI", "PySide6", "h5py", "fabio")
 
     for cli_args in (
         ["--help"],
         ["describe"],
+        ["describe", "inspect"],
+        ["describe", "analyze"],
+        ["describe", "batch"],
         ["describe", "advise"],
         ["describe", "campaign"],
         ["describe", "init-manifest"],
+        ["doctor", "--help"],
     ):
         probe = (
             "import json, sys\n"
@@ -477,7 +481,6 @@ def test_cli_report_journal_style_forwards_non_default_and_preserves_default(
 ) -> None:
     import sys
     from types import ModuleType
-    import butterfly_saxs.cli as cli_module
 
     calls = []
     fake_report_mod = ModuleType("butterfly_saxs.report")
@@ -498,4 +501,224 @@ def test_cli_report_journal_style_forwards_non_default_and_preserves_default(
     assert main(["report", str(tmp_path), "--journal-style", "nature"]) == 0
     capsys.readouterr()
     assert calls[-1][1]["journal_style"] == "nature"
+
+
+def test_describe_exposes_v21_cli_options() -> None:
+    inspect_opts = agent_manifest("inspect")["commands"][0]["options"]
+    assert "beamstop_radius_px" in inspect_opts
+
+    analyze_opts = agent_manifest("analyze")["commands"][0]["options"]
+    assert {
+        "beamstop_radius_px",
+        "uncertainty_dataset",
+        "include_physics",
+        "intensity_mode",
+    } <= set(analyze_opts)
+    assert analyze_opts["intensity_mode"] == ["calibrated", "raw"]
+
+    batch_opts = agent_manifest("batch")["commands"][0]["options"]
+    assert {"beamstop_radius_px", "deduplicate_frames", "workers"} <= set(batch_opts)
+
+    campaign_opts = agent_manifest("campaign")["commands"][0]["options"]
+    assert {"beamstop_radius_px", "deduplicate_frames", "workers"} <= set(campaign_opts)
+
+
+def test_cli_inspect_and_analyze_v21_options_forward_and_validate(monkeypatch, capsys) -> None:
+    import butterfly_saxs.cli as cli_module
+
+    # 1. inspect forwards --beamstop-radius-px (both 'auto' and numeric float).
+    inspect_calls: list[dict] = []
+
+    def native_inspect(source, *, beamstop_radius_px=None, **kwargs):
+        inspect_calls.append({"source": source, "beamstop_radius_px": beamstop_radius_px})
+        return {"shape": [8, 8], "q_unit": "pixel-q"}
+
+    monkeypatch.setattr(cli_module, "inspect_frame", native_inspect)
+    assert main(["inspect", "frame.npy", "--beamstop-radius-px", "auto"]) == 0
+    capsys.readouterr()
+    assert inspect_calls[-1]["beamstop_radius_px"] == "auto"
+
+    assert main(["inspect", "frame.npy", "--beamstop-radius-px", "18.5"]) == 0
+    capsys.readouterr()
+    assert inspect_calls[-1]["beamstop_radius_px"] == 18.5
+
+    # Legacy inspect_frame without beamstop_radius_px degrades gracefully with stderr warning.
+    def legacy_inspect(source, *, poni=None, config=None, frame=None, dataset=None,
+                       mask=None, mask_frame=None, mask_dataset=None, valid_mask=None):
+        del poni, config, frame, dataset, mask, mask_frame, mask_dataset, valid_mask
+        return {"shape": [8, 8], "q_unit": "pixel-q"}
+
+    monkeypatch.setattr(cli_module, "inspect_frame", legacy_inspect)
+    assert main(["inspect", "frame.npy", "--beamstop-radius-px", "12"]) == 0
+    captured = capsys.readouterr()
+    assert "beamstop_radius_px" in captured.err
+    assert json.loads(captured.out)["shape"] == [8, 8]
+
+    # 2. analyze forwards v2.1 options when supported and omits them when unset.
+    analyze_calls: list[dict] = []
+
+    class DummyResult:
+        def to_mapping(self):
+            return {"ellipse_fit": {"status": "ok", "success": True}}
+
+    def native_analyze(source, **kwargs):
+        analyze_calls.append({"source": source, **kwargs})
+        return DummyResult()
+
+    monkeypatch.setattr(cli_module, "analyze_frame", native_analyze)
+    assert main(["analyze", "frame.npy"]) == 0
+    capsys.readouterr()
+    for omitted in ("beamstop_radius_px", "uncertainty_dataset", "include_physics", "intensity_mode"):
+        assert omitted not in analyze_calls[-1]
+
+    assert main([
+        "analyze",
+        "frame.npy",
+        "--beamstop-radius-px", "16",
+        "--uncertainty-dataset", "auto",
+        "--include-physics",
+        "--intensity-mode", "raw",
+    ]) == 0
+    capsys.readouterr()
+    last = analyze_calls[-1]
+    assert last["beamstop_radius_px"] == 16.0
+    assert last["uncertainty_dataset"] == "auto"
+    assert last["include_physics"] is True
+    assert last["intensity_mode"] == "raw"
+
+    # Legacy analyze_frame without new kwargs skips unsupported ones gracefully.
+    def legacy_analyze(source, *, poni=None, config=None, full2d=False, frame=None,
+                       dataset=None, mask=None, mask_frame=None, mask_dataset=None,
+                       valid_mask=None, output=None, force=False):
+        del source, poni, config, full2d, frame, dataset, mask, mask_frame, mask_dataset, valid_mask, output, force
+        return DummyResult()
+
+    monkeypatch.setattr(cli_module, "analyze_frame", legacy_analyze)
+    assert main(["analyze", "frame.npy", "--beamstop-radius-px", "auto", "--include-physics"]) == 0
+    captured = capsys.readouterr()
+    assert "beamstop_radius_px" in captured.err
+    assert "include_physics" in captured.err
+
+    # 3. Invalid CLI values produce strict JSON usage errors (exit 2).
+    for bad_argv in (
+        ["inspect", "frame.npy", "--beamstop-radius-px", "-3"],
+        ["analyze", "frame.npy", "--beamstop-radius-px", "nan"],
+        ["analyze", "frame.npy", "--beamstop-radius-px", "invalid"],
+        ["analyze", "frame.npy", "--intensity-mode", "uncalibrated"],
+        ["batch", "frame.npy", "--workers", "0"],
+        ["campaign", "camp.toml", "--workers", "-2"],
+    ):
+        assert main(bad_argv) == 2
+        err = json.loads(capsys.readouterr().out)
+        assert err["schema_version"] == CLI_ERROR_SCHEMA
+        assert err["error"]["code"] == "usage_error"
+
+
+def test_cli_batch_and_campaign_v21_options_forward_and_pickle(monkeypatch, tmp_path, capsys) -> None:
+    import pickle
+    import numpy as np
+    import butterfly_saxs.batch as batch_module
+    import butterfly_saxs.cli as cli_module
+
+    # Picklability check for Windows spawn pools.
+    adapter = cli_module._BatchFrameAnalyzer(poni="g.poni", beamstop_radius_px="auto")
+    adapter._geometry_cache["k"] = object()
+    restored = pickle.loads(pickle.dumps(adapter))
+    assert restored.poni == "g.poni"
+    assert restored.beamstop_radius_px == "auto"
+    assert restored._geometry_cache == {}
+
+    # Batch forwarding: inspect kwargs passed to run_batch and analyze_frame.
+    src = tmp_path / "f1.npy"
+    np.save(src, np.ones((8, 8), dtype=float))
+    analyze_seen: list[dict] = []
+    run_batch_seen: list[dict] = []
+    real_run_batch = batch_module.run_batch
+
+    def spy_run_batch(frames, analyzer, **kwargs):
+        run_batch_seen.append(dict(kwargs))
+        # Strip v2.1 kwargs if current run_batch doesn't yet define them.
+        accepted, _ = cli_module._filter_supported_kwargs(real_run_batch, kwargs)
+        return real_run_batch(frames, analyzer, **accepted)
+
+    def spy_analyze(path, **kwargs):
+        analyze_seen.append({"path": str(path), **kwargs})
+        return {"parameters": {"axis_ratio": 0.42}, "image": np.ones((8, 8))}
+
+    monkeypatch.setattr(batch_module, "run_batch", spy_run_batch)
+    monkeypatch.setattr(cli_module, "analyze_frame", spy_analyze)
+
+    assert main([
+        "batch",
+        str(src),
+        "-o", str(tmp_path / "batch_out"),
+        "--beamstop-radius-px", "20",
+        "--deduplicate-frames",
+        "--workers", "4",
+    ]) == 0
+    capsys.readouterr()
+    assert run_batch_seen[-1]["deduplicate_identical_frames"] is True
+    assert run_batch_seen[-1]["max_workers"] == 4
+    assert run_batch_seen[-1]["beamstop_radius_px"] == 20.0
+    assert analyze_seen[-1]["beamstop_radius_px"] == 20.0
+    assert analyze_seen[-1]["config"].analysis["beamstop_radius_px"] == 20.0
+
+    # Campaign forwarding with **kwargs runner and legacy runner.
+    campaign_calls: list[dict] = []
+
+    def native_campaign(config_path, output_root, **kwargs):
+        campaign_calls.append({"config_path": config_path, "output_root": output_root, **kwargs})
+        return {
+            "schema_version": "wingsaxs.campaign_run.v1",
+            "status": "ok",
+            "exit_code": 0,
+            "n_samples": 1,
+            "n_success": 1,
+            "n_warning": 0,
+            "n_failed": 0,
+            "n_skipped": 0,
+            "samples": [],
+        }
+
+    monkeypatch.setattr(cli_module, "run_campaign", native_campaign)
+    assert main([
+        "campaign",
+        "--config", str(tmp_path / "camp.toml"),
+        "--output", str(tmp_path / "camp_out"),
+        "--beamstop-radius-px", "auto",
+        "--deduplicate-frames",
+        "--workers", "3",
+    ]) == 0
+    capsys.readouterr()
+    assert campaign_calls[-1]["beamstop_radius_px"] == "auto"
+    assert campaign_calls[-1]["deduplicate_identical_frames"] is True
+    assert campaign_calls[-1]["max_workers"] == 3
+
+    def legacy_campaign(config_path, output_root, *, force=False, continue_on_error=True,
+                        report=None, journal_style=None, progress=None):
+        del config_path, output_root, force, continue_on_error, report, journal_style, progress
+        return {
+            "schema_version": "wingsaxs.campaign_run.v1",
+            "status": "ok",
+            "exit_code": 0,
+            "n_samples": 0,
+            "n_success": 0,
+            "n_warning": 0,
+            "n_failed": 0,
+            "n_skipped": 0,
+            "samples": [],
+        }
+
+    monkeypatch.setattr(cli_module, "run_campaign", legacy_campaign)
+    assert main([
+        "campaign",
+        "--config", str(tmp_path / "camp.toml"),
+        "--output", str(tmp_path / "camp_out2"),
+        "--beamstop-radius-px", "14",
+        "--deduplicate-frames",
+        "--workers", "2",
+    ]) == 0
+    captured = capsys.readouterr()
+    assert "max_workers" in captured.err
+    assert json.loads(captured.out)["status"] == "ok"
 

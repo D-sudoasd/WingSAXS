@@ -161,7 +161,10 @@ def test_symlink_escape_is_not_added(tmp_path: Path):
     outside = tmp_path / 'outside.npz'
     outside.write_bytes(b'private unrelated bytes')
     (root / 'results.npz').unlink()
-    (root / 'results.npz').symlink_to(outside)
+    try:
+        (root / 'results.npz').symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
     with pytest.raises(ValueError, match='regular file inside'):
         package_batch(root)
     assert not (root / 'delivery.zip').exists()

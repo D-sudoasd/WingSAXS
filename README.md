@@ -75,6 +75,10 @@ Synthetic demonstration (pixel-q): the empirical double ellipse is overlaid on a
 - **Measurement and fit figures**: export fixed-size SVG/PDF and high-resolution TIFF/PNG with source arrays, curve/profile CSVs, and checksums. Inspect measured data, candidate ellipses, overlays, and actual `full2d` predictions without promoting a candidate to a scientifically accepted result. See the [figure export guide](docs/butterfly_figures_zh.md).
 - **Figure delivery**: choose column width and resolution in one export window, then browse the complete figure bundle offline through `index.html`. Annular/radial source CSV and technical figure checks accompany the images; formatting checks do not imply scientific acceptance.
 - **Peak diagnostics**: locate the raw brightest pixel separately from supported lobe peaks; inspect measured/model peak positions, local zooms, angular/radial profiles, and clean overlays from each fit source. Peak coordinates and support flags also travel through batch exports.
+- **Pre-fit advisor, manifest discovery & sequence diagnostics**: `bsaxs advise` (and `bsaxs inspect --recommend`) runs read-only `auto_advisor` diagnostics for beamstop radius, active `q_window`, Friedel symmetry (`--bright-axis-convention {draw,reference}`), and workflow preset suggestions; `bsaxs init-manifest` discovers naturally sorted frame folders or HDF5 stacks without fabricating missing timestamps; `sequence_diagnostics` audits pixel-content SHA-256 duplicates, timestamp gaps, axis-ratio collapses, q-edge hits, and orientation jumps without interpolating distinct or failed frames.
+- **Extended 2D SAXS physics & kinetics**: pass `--include-physics` on `bsaxs analyze` (or use `butterfly_saxs.saxs_physics`) for azimuthal Fourier harmonics (`A_2`, `A_4`, `P_2`) and `C2-bridge + 4-lobe` fits, separately reported direct `I(q)` and Kratky `q^2 I(q)` coarsening peaks, window-bounded `Q_win` (strictly gated on `--intensity-mode calibrated`; `null` under `raw`), companion HDF5 statistical uncertainty propagation (`--uncertainty-dataset <path|auto>`), Grubb/Williamson-Hall apparent transverse streak width `W`, power-law coarsening / Arrhenius rate fits, and window-sensitivity audits.
+- **Multi-sample campaigns & throughput**: `bsaxs campaign` orchestrates multi-sample TOML runs with per-sample failure isolation; workflow presets (`--preset {annular,curvature,sector,butterfly_pub}`), `SAXSGeometryCache`, in-memory `--beamstop-radius-px <float|auto>` (leaving raw mask files untouched), exact pixel-SHA-256 `--deduplicate-frames`, and `--workers <int>` parallelism accelerate large Pilatus/HDF5 series without altering scientific semantics.
+- **Journal-styled composite figures & cross-sample comparisons**: `--journal-style {default,nature,nature_comm,science,macromolecules}` produces Qt-free, publication-ready multi-panel Nature composite figures (including a 6-panel single-sample physics dashboard) with collision-free colorbars, wrapped lobe rays, Source Data CSVs, SHA-256 manifests, and matched time-anchor / kinetics synthesis in `comparison_report`.
 - **Preflight and P3/P4 gates**: read-only package checks and evidence reports. They do not freeze science or replace named human review.
 
 ## Install
@@ -148,6 +152,21 @@ For an unattended package run, use `bsaxs batch "data/package/images/*.edf" --un
 
 Finish existing batch exports without fitting or drawing again: `bsaxs package results/all_samples` creates a browsable sample/data/figure index and ZIP. Use `--resume` to finish an interrupted delivery or reuse an unchanged archive, `--no-archive` for navigation only, or add `--package` to a new `bsaxs batch` run to continue through delivery automatically. Original warnings and missing outputs stay visible. [Batch delivery guide](docs/batch_delivery_zh.md)
 
+Pre-fit advisor, manifest discovery, extended 2D physics, parallel batches, campaigns, and journal-styled reports:
+
+```bash
+bsaxs advise --image data/frame_0001.h5 --poni geometry/detector.poni --mask masks/detector.npy \
+  --bright-axis-convention reference
+bsaxs init-manifest --input data/series/ --output data/manifest.csv --sha256
+bsaxs analyze data/frame_0001.h5 --poni geometry/detector.poni --mask masks/detector.npy \
+  --preset annular --beamstop-radius-px auto --uncertainty-dataset auto \
+  --include-physics --intensity-mode calibrated -o results/frame_0001
+bsaxs batch --manifest data/manifest.csv --poni geometry/detector.poni --mask masks/detector.npy \
+  --preset annular --beamstop-radius-px 18 --deduplicate-frames --workers 4 \
+  --mode independent --stream -o results/batch
+bsaxs campaign --config campaign.toml -o results/campaign --workers 4 --deduplicate-frames --report --journal-style nature
+bsaxs report results/campaign --journal-style nature
+```
 
 `bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_WingSAXS.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
 
@@ -217,6 +236,8 @@ annular 点的 `q_annulus` 是预设 q 环的采样坐标，不是径向反射�
 
 评估后可在「叠加图层」分别检查实测谱、观测轨迹、几何候选和全像素模型椭圆；峰位表区分原始最亮点 G 与受支持峰 P，选中行即可定位。导出同时包含干净叠加图、峰位图、局部放大、剖面及 CSV/NPZ 源数据。匹配差或参数不稳定时会保留明确提示，不能仅凭曲线看起来像蝴蝶判定拟合正确。详见[测量图与峰位导出](docs/butterfly_figures_zh.md)。
 
+此外，当前版本内置了只读预检建议（`bsaxs advise` / `inspect --recommend`，由 `auto_advisor` 提供光束阻挡器半径、`q_window` 与 Friedel 对称性建议）、自然排序清单发现（`bsaxs init-manifest`，缺失时间戳留空）、序列异常审计（`sequence_diagnostics`）、`SAXSGeometryCache` 几何缓存、内存叠加 `--beamstop-radius-px <float|auto>`、精确像素 SHA-256 去重（`--deduplicate-frames`）与独立模式/多样品并行（`--workers`）。在单帧 `analyze` 中可通过 `--include-physics`、`--uncertainty-dataset <path|auto>` 与 `--intensity-mode {calibrated,raw}` 附加扩展二维物理量（方位谐波与 `C2-bridge + 4-lobe`、分列的直接 `I(q)` 峰与 Kratky 峰、仅标定强度下计算的窗口受限 `Q_win`、Grubb/Williamson-Hall 表观横向宽度 `W`）；多样品 `bsaxs campaign` 与 `--journal-style` 支持生成无 Qt 的 Nature 复合图、Source Data CSV 与匹配时间锚点动力学对比报告。
+
 ### 常用命令
 
 以下是按任务选择的入口，不是每次都要执行的前置链。未知命令用
@@ -226,18 +247,21 @@ annular 点的 `q_annulus` 是预设 q 环的采样坐标，不是径向反射�
 ```bash
 bsaxs describe
 bsaxs doctor --json
-bsaxs inspect data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy
+bsaxs advise --image data/frame_0001.h5 --poni geometry/detector.poni --mask masks/detector.npy --bright-axis-convention reference
+bsaxs init-manifest --input data/series/ --output data/manifest.csv --sha256
+bsaxs inspect data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy --recommend --beamstop-radius-px auto
 bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
-  --ridge-method butterfly_curvature --ellipse-preset standard \
-  --butterfly-stage evaluate --butterfly-resamples 0 -o results/frame_0001
+  --preset annular --beamstop-radius-px 18 --uncertainty-dataset auto \
+  --include-physics --intensity-mode calibrated -o results/frame_0001
 bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
   --butterfly-stage evaluate --butterfly-trace-method annular_peak \
   --annular-rings 40 --annular-angles 72 --butterfly-resamples 0 \
   -o results/frame_0001_annular
 bsaxs batch "data/frame_*.edf" --poni geometry/detector.poni --mask masks/detector.npy \
-  --ridge-method butterfly_curvature --ellipse-preset standard \
-  --butterfly-stage evaluate --mode independent -o results/batch
-bsaxs report results/batch
+  --preset annular --beamstop-radius-px 18 --deduplicate-frames --workers 4 \
+  --mode independent -o results/batch
+bsaxs campaign --config campaign.toml -o results/campaign --workers 4 --deduplicate-frames --report --journal-style nature
+bsaxs report results/batch --journal-style nature
 bsaxs-gui data/frame_0001.edf --poni geometry/detector.poni
 ```
 

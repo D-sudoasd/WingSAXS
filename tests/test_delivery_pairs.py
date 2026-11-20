@@ -196,12 +196,15 @@ def test_symlink_member_or_ancestor_is_never_opened(sample: Path, directory: boo
     outside = sample.parent / "private"
     outside.mkdir()
     _write(outside, "table.csv", b"private")
-    if directory:
-        (sample / "linked").symlink_to(outside, target_is_directory=True)
-        target = "linked/table.csv"
-    else:
-        (sample / "table.csv").symlink_to(outside / "table.csv")
-        target = "table.csv"
+    try:
+        if directory:
+            (sample / "linked").symlink_to(outside, target_is_directory=True)
+            target = "linked/table.csv"
+        else:
+            (sample / "table.csv").symlink_to(outside / "table.csv")
+            target = "table.csv"
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
     _write(sample, "index.html", f'<a href="{target}">table</a>')
     records = _inventory(sample, "index.html") + [{"path": target, "size_bytes": 7, "sha256": "0" * 64}]
     data = _zip(sample.parent / "DATA.zip", {})

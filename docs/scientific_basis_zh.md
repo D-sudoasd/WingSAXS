@@ -173,7 +173,40 @@ Grubb 2021 在不同几何操作/定义下写出 `L_N = L_z cosϕ`（图 2 的�
 
 的残差诊断。默认 robust residual、未必经过实验方差归一化的 q/强度残差，以及可能的像素抽样，使它**不是统计意义的 reduced χ²**，不能据此给 p 值、接受概率或“模型正确”的结论。只有在用户明确提供有物理含义的 `sigma`/weights、并确认残差与误差模型匹配时，才能把加权诊断与该误差模型一起解释；软件仍不会自动产生正式统计检验。
 
-## 8. 与本地论文的对应关系
+## 8. 扩展二维物理观测量、动力学与对比边界（`saxs_physics` / `auto_advisor` / `comparison_report`）
+
+在核心蝴蝶轨迹与表观双椭圆之外，`saxs_physics.py`、`auto_advisor.py`、`sequence_diagnostics.py` 与 `comparison_report.py` 提供一组独立可审计的二维散射诊断与统计观测量。这些量与环尺度 `q*`/`L`、椭圆候选 `Ln`/`Lz` 和经验 `full2d` 分别存放、互不替代，且均受以下边界约束：
+
+### 8.1 方位角谐波与 `C2-bridge + 4-lobe` 角向模型
+
+在选定 `q_window` 内，角向剖面 `I(χ)` 可按周期谐波展开得到低阶幅值 `A_2`、`A_4` 与表观二阶取向序参量 `P_2`，并检验 Friedel 对称性（`χ` 与 `χ + 180°`）。`bright_axis_convention` 用于显式声明预期亮桥轴约定：`"draw"` 表示主亮桥沿名义拉伸轴（默认），`"reference"` 表示赤道翼垂直于拉伸轴；避免跨体系将 90° 约定差异误判为正交翻转。
+
+`C2-bridge + 4-lobe` 模型在平坦基线之上引入对称二阶桥接项 `c_2 cos(2(χ − χ_sym))` 与四瓣高斯包络，并以残差及模型对比区分“纯平坦基线四瓣”与“带 C2 桥接的四瓣”。该拟合属于选定 q 窗内的**二维角向强度经验参数化**，不构成唯一的三维取向分布函数（ODF）反演；缺失方位象限保持掩膜缺失，不通过对称镜像补造观测点。
+
+### 8.2 直接峰、Kratky 峰与窗口受限不变量 `Q_win`
+
+`measure_radial_coarsening_observables` 在有效像素域内同时提取两套严格分列的径向尺度：
+
+- **直接强度径向峰**：由 `I(q)` 得到的 `q*_dir` 与（仅在标定物理 q 下）`L*_dir = 2π / q*_dir`；
+- **Kratky 加权径向峰**：由 `q^2 I(q)` 得到的 `q*_krat` 与（仅在标定物理 q 下）`L*_krat = 2π / q*_krat`。
+
+由于 `q^2` 权重系统性把峰位推向更高 `q`，`L*_dir` 与 `L*_krat` 不可互换，也不可直接复制进椭圆派生列 `Ln` / `Lz`。未标定的 `pixel-q` 仍禁止换算 `nm`。
+
+窗口受限散射不变量 `Q_win`（含背景扣除版本 `Q_win_bg_subtracted`）定义为**有限观测窗口 `[q_min, q_max]` 内的积分**，而非外推至 `q → 0` 与 `q → ∞` 的完整 Porod 不变量；其数值依赖所选 q 窗口（可用 `run_window_sensitivity_audit` 量化不同窗口及平坦基线/`C2-bridge` 模型的敏感性）。为避免量纲混淆，`Q_win` 严格受 `intensity_mode` 门控：仅在 `intensity_mode="calibrated"`（已标定绝对强度或同一标定刻度，如 `cm^-1`）下报告；在 `intensity_mode="raw"`（原始探测器计数）下强制返回 `null` 并附明确说明，绝不将标定强度与原始计数混入同一动力学拟合。提供伴随统计不确定度 `sigma`（如 HDF5 `/entry/data/uncertainty/statistical`）时，软件传播逐箱径向统计标准误 `sigma_radial` 与 `q_win_stat_stderr`；标定因子等系统不确定度 `systematic_k_uncertainty` 在未由用户显式提供时固定记为 `"unavailable"`。
+
+### 8.3 垂直条纹展宽与 Grubb / Williamson-Hall 表观横向相干宽度 `W`
+
+`measure_perpendicular_streak_width` 沿翼/条纹方向按多个 `q` 切片测量垂直方向的横向半高宽 `Δq_⊥(q)`，并通过线性（Williamson-Hall 类）与正交平方和（quadrature）分解提取零 `q` 截距对应的**表观横向相干宽度 `W`** 与随 `q` 增长的取向展宽斜率。
+
+表观宽度 `W` 仅在具有标定物理 `q`、可靠翼区隔离且切片拟合满足最小像素数与 `R^2` 门槛时才具参考意义；它同时受仪器 q 分辨率、切片窗口、重叠分支以及线性/正交展宽假设影响，属于**条件性表观尺寸**，不得脱离假设直接等同于无缺陷单晶片的真实横向尺寸。
+
+### 8.4 粗化幂律、Arrhenius 活化能、预检建议与去重边界
+
+- **动力学拟合与时间锚定**：`fit_power_law_coarsening` 对直接峰与 Kratky 峰渠道分别独立拟合，不混用渠道；`fit_arrhenius_rate` 报告表观活化能 `Ea_kJ_mol`、`Ea_eV`、95% 置信区间与 `R^2`。`comparison_report` 的匹配时间锚点（`target_time_h`）用于在总时长不同的保温序列间做同时间点对照，严格保留每条记录的源帧身份，不插值不存在的帧。
+- **预检建议、序列诊断与精确去重**：`auto_advisor`（`bsaxs advise` / `inspect --recommend`）与 `sequence_diagnostics` 仅输出拟合前与序列级诊断（光束阻挡器掩膜半径、有效 `q_window`、Friedel 对称性、重复帧/跳变告警），不更改原始文件，也不构成科学验收。`--deduplicate-frames` 仅对**解码像素 SHA-256 完全一致**的重复帧复用已算结果，完整保留每帧原始位置、来源身份与 `duplicate_of_frame_id` 溯源，绝不跨不同帧插值或用前一帧覆盖失败帧。
+- **出版复合图与 Source Data**：`journal_style` 与 `composite_figures`（含 6 面板单样品物理总览）随图导出 CSV Source Data 与 SHA-256 清单，确保图表与数值可审计，但图表格式或样式达标不代表科学结论获接受。
+
+## 9. 与本地论文的对应关系
 
 - [Grubb, Murthy & Francescangeli (2016), DOI 10.1002/polb.23930](https://doi.org/10.1002/polb.23930)：完整二维 3D 取向/展宽模型、能量分布、pseudo-Voigt、背景与权重。
 - [Grubb et al. (2021), DOI 10.1016/j.polymer.2021.123566](https://doi.org/10.1016/j.polymer.2021.123566)：`ϕ/α/ψ` 几何、曲率 ridge、镜像双椭圆、Table 3 像素半轴及单图样反问题非唯一性。

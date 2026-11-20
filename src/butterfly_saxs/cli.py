@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 from collections.abc import Mapping
 from pathlib import Path
 import os
@@ -53,6 +54,7 @@ run_campaign = None
 _WORKFLOW_PRESETS = ("annular", "curvature", "sector", "butterfly_pub")
 _JOURNAL_STYLES = ("default", "nature", "nature_comm", "science", "macromolecules")
 _BRIGHT_AXIS_CONVENTIONS = ("draw", "reference")
+_INTENSITY_MODES = ("calibrated", "raw")
 
 
 def _advisor_callable() -> Any:
@@ -105,6 +107,136 @@ def _integer_at_least(minimum: int, label: str):
         return result
 
     return parse
+
+
+def _beamstop_radius(value: str) -> float | str:
+    """Parse ``--beamstop-radius-px`` as a non-negative finite float or ``'auto'``."""
+
+    text = str(value).strip()
+    if text.lower() == "auto":
+        return "auto"
+    try:
+        parsed = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "beamstop-radius-px 必须是非负有限数值（像素）或 auto"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise argparse.ArgumentTypeError(
+            "beamstop-radius-px 必须是非负有限数值（像素）或 auto"
+        )
+    return parsed
+
+
+def _filter_supported_kwargs(
+    func: Any,
+    optional_kwargs: Mapping[str, Any],
+    *,
+    aliases: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Filter optional kwargs against ``func``'s signature without heavy imports."""
+
+    if not optional_kwargs:
+        return {}, []
+    import inspect as _inspect
+
+    try:
+        sig = _inspect.signature(func)
+        params = sig.parameters
+        accepts_var_kw = any(
+            p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):
+        return dict(optional_kwargs), []
+    if accepts_var_kw:
+        return dict(optional_kwargs), []
+    accepted: dict[str, Any] = {}
+    unsupported: list[str] = []
+    alias_map = aliases or {}
+    for key, value in optional_kwargs.items():
+        if key in params:
+            accepted[key] = value
+            continue
+        matched = next((alt for alt in alias_map.get(key, ()) if alt in params), None)
+        if matched is not None:
+            accepted[matched] = value
+        else:
+            unsupported.append(key)
+    return accepted, unsupported
+
+
+class _BatchFrameAnalyzer:
+    """Picklable per-frame adapter for ``batch`` (safe for Windows spawn pools)."""
+
+    def __init__(
+        self,
+        *,
+        poni: Any = None,
+        full2d: bool = False,
+        frame: int | None = None,
+        dataset: str | None = None,
+        mask: Any = None,
+        mask_frame: int | None = None,
+        mask_dataset: str | None = None,
+        valid_mask: Any = None,
+        beamstop_radius_px: float | str | None = None,
+    ) -> None:
+        self.poni = poni
+        self.full2d = full2d
+        self.frame = frame
+        self.dataset = dataset
+        self.mask = mask
+        self.mask_frame = mask_frame
+        self.mask_dataset = mask_dataset
+        self.valid_mask = valid_mask
+        self.beamstop_radius_px = beamstop_radius_px
+        self._geometry_cache: dict[Any, Any] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_geometry_cache"] = {}
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        if "_geometry_cache" not in self.__dict__:
+            self._geometry_cache = {}
+
+    def __call__(
+        self,
+        frame_ref: Any,
+        initial_parameters: Any = None,
+        config: Any = None,
+    ) -> Any:
+        source = getattr(frame_ref, "path", frame_ref)
+        selected_frame = self.frame
+        if selected_frame is None:
+            selected_frame = getattr(frame_ref, "frame_selector", None)
+        selected_dataset = self.dataset
+        if selected_dataset is None:
+            selected_dataset = getattr(frame_ref, "dataset", None)
+            if selected_dataset is None:
+                selected_dataset = getattr(frame_ref, "dataset_id", None) or None
+        analyze_fn = _pipeline_symbol("analyze_frame")
+        call_kwargs: dict[str, Any] = {
+            "poni": self.poni,
+            "config": config,
+            "full2d": self.full2d,
+            "initial_parameters": initial_parameters,
+            "frame": selected_frame,
+            "dataset": selected_dataset,
+            "mask": self.mask,
+            "mask_frame": self.mask_frame,
+            "mask_dataset": self.mask_dataset,
+            "valid_mask": self.valid_mask,
+            "geometry_cache": self._geometry_cache,
+        }
+        if self.beamstop_radius_px is not None:
+            accepted, _ = _filter_supported_kwargs(
+                analyze_fn, {"beamstop_radius_px": self.beamstop_radius_px}
+            )
+            call_kwargs.update(accepted)
+        return analyze_fn(source, **call_kwargs)
 
 
 _REPORT_FORMATS = ("png", "svg", "pdf", "tiff")
@@ -513,6 +645,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="配合 --recommend 使用的名义拉伸轴角度（度，默认 90.0）",
     )
+    inspect_parser.add_argument(
+        "--beamstop-radius-px",
+        type=_beamstop_radius,
+        default=None,
+        metavar="RADIUS|auto",
+        help="可选光束阻挡器排除半径（非负像素数值或 auto；仅在内存中叠加，不修改原始 mask）",
+    )
     inspect_parser.add_argument("-o", "--output", help="可选 JSON 输出路径")
     inspect_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
 
@@ -527,6 +666,31 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     analyze_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
     analyze_parser.add_argument("--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）")
+    analyze_parser.add_argument(
+        "--beamstop-radius-px",
+        type=_beamstop_radius,
+        default=None,
+        metavar="RADIUS|auto",
+        help="可选光束阻挡器排除半径（非负像素数值或 auto；仅在内存中叠加，不修改原始 mask）",
+    )
+    analyze_parser.add_argument(
+        "--uncertainty-dataset",
+        default=None,
+        metavar="PATH|auto",
+        help="HDF5 伴随统计不确定度数据集路径，或 auto 自动探测（例如 /entry/data/uncertainty/statistical）",
+    )
+    analyze_parser.add_argument(
+        "--include-physics",
+        action="store_true",
+        default=False,
+        help="附加扩展 2D SAXS 物理观测量汇总（方位谐波/C2-bridge+4-lobe、径向粗化、Q_win 与条纹展宽）",
+    )
+    analyze_parser.add_argument(
+        "--intensity-mode",
+        choices=_INTENSITY_MODES,
+        default=None,
+        help="强度标定模式（calibrated 或 raw；raw 模式下不报告无物理尺度的 Q_win）",
+    )
     analyze_parser.add_argument("-o", "--output", help="JSON/NPZ 文件或输出目录")
     analyze_parser.add_argument("--full2d", action="store_true", help="调用可选的 full2d 精修模块")
     analyze_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
@@ -623,6 +787,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--range",
         dest="frame_range",
         help="序列范围 START:STOP[:STEP]，STOP 包含在内",
+    )
+    batch_parser.add_argument(
+        "--beamstop-radius-px",
+        type=_beamstop_radius,
+        default=None,
+        metavar="RADIUS|auto",
+        help="可选光束阻挡器排除半径（非负像素数值或 auto；仅在内存中叠加，不修改原始 mask）",
+    )
+    batch_parser.add_argument(
+        "--deduplicate-frames",
+        action="store_true",
+        default=False,
+        help="对像素内容 SHA-256 完全相同的重复帧复用计算结果，保留每帧原始位置与来源身份",
+    )
+    batch_parser.add_argument(
+        "--workers",
+        type=_integer_at_least(1, "workers"),
+        default=None,
+        metavar="N",
+        help="独立拟合模式并行 worker 数（映射到 max_workers；默认 1，warm_start 自动顺序执行）",
     )
     _add_refinement_options(batch_parser)
 
@@ -842,6 +1026,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="汇总报告期刊风格预设",
     )
     campaign_parser.add_argument(
+        "--beamstop-radius-px",
+        type=_beamstop_radius,
+        default=None,
+        metavar="RADIUS|auto",
+        help="可选光束阻挡器排除半径（非负像素数值或 auto；仅在内存中叠加，不修改原始 mask）",
+    )
+    campaign_parser.add_argument(
+        "--deduplicate-frames",
+        action="store_true",
+        default=False,
+        help="对像素内容 SHA-256 完全相同的重复帧复用计算结果，保留每帧原始位置与来源身份",
+    )
+    campaign_parser.add_argument(
+        "--workers",
+        type=_integer_at_least(1, "workers"),
+        default=None,
+        metavar="N",
+        help="多样品并行 worker 数（映射到 max_workers；默认 1 顺序执行）",
+    )
+    campaign_parser.add_argument(
         "--json",
         action="store_true",
         help="以严格 JSON 输出汇总（stdout 默认即为严格 JSON）",
@@ -873,6 +1077,17 @@ def _handle_inspect(args: argparse.Namespace) -> int:
         "mask_dataset": args.mask_dataset,
         "valid_mask": args.valid_mask,
     }
+    beamstop_radius = getattr(args, "beamstop_radius_px", None)
+    if beamstop_radius is not None:
+        accepted_bs, unsupported_bs = _filter_supported_kwargs(
+            inspect_fn, {"beamstop_radius_px": beamstop_radius}
+        )
+        inspect_kwargs.update(accepted_bs)
+        if unsupported_bs:
+            print(
+                f"警告：当前 inspect_frame 尚不支持参数 ({', '.join(unsupported_bs)})，已跳过。",
+                file=sys.stderr,
+            )
     recommend = bool(getattr(args, "recommend", False))
     nominal_axis = getattr(args, "nominal_draw_axis_deg", None)
     used_native_recommend = False
@@ -906,16 +1121,21 @@ def _handle_inspect(args: argparse.Namespace) -> int:
                 "reason": str(exc),
             }
         else:
-            report["advisor"] = advisor_fn(
-                source,
-                poni_path=poni,
-                mask_path=args.mask,
-                image_dataset=args.dataset,
-                image_frame_index=args.frame,
-                mask_dataset=args.mask_dataset,
-                mask_frame_index=args.mask_frame,
-                nominal_draw_axis_deg=90.0 if nominal_axis is None else float(nominal_axis),
-            )
+            advisor_kwargs: dict[str, Any] = {
+                "poni_path": poni,
+                "mask_path": args.mask,
+                "image_dataset": args.dataset,
+                "image_frame_index": args.frame,
+                "mask_dataset": args.mask_dataset,
+                "mask_frame_index": args.mask_frame,
+                "nominal_draw_axis_deg": 90.0 if nominal_axis is None else float(nominal_axis),
+            }
+            if isinstance(beamstop_radius, (int, float)):
+                accepted_adv, _ = _filter_supported_kwargs(
+                    advisor_fn, {"beamstop_radius_px": float(beamstop_radius)}
+                )
+                advisor_kwargs.update(accepted_adv)
+            report["advisor"] = advisor_fn(source, **advisor_kwargs)
     report = annotate_report(report, command="inspect", exit_code=0)
     if args.output:
         destination = Path(args.output)
@@ -949,20 +1169,37 @@ def _handle_analyze(args: argparse.Namespace) -> int:
         overrides["ridge_method"] = "butterfly_curvature"
     config = _with_analysis(config, overrides)
     source = _pick_input(args, config)
-    result = _pipeline_symbol("analyze_frame")(
-        source,
-        poni=args.poni or (config.poni_path if config else None),
-        config=config,
-        full2d=args.full2d or (config.full2d if config else False),
-        frame=args.frame,
-        dataset=args.dataset,
-        mask=args.mask,
-        mask_frame=args.mask_frame,
-        mask_dataset=args.mask_dataset,
-        valid_mask=args.valid_mask,
-        output=None if figure_output else args.output,
-        force=args.force,
-    )
+    analyze_fn = _pipeline_symbol("analyze_frame")
+    analyze_kwargs: dict[str, Any] = {
+        "poni": args.poni or (config.poni_path if config else None),
+        "config": config,
+        "full2d": args.full2d or (config.full2d if config else False),
+        "frame": args.frame,
+        "dataset": args.dataset,
+        "mask": args.mask,
+        "mask_frame": args.mask_frame,
+        "mask_dataset": args.mask_dataset,
+        "valid_mask": args.valid_mask,
+        "output": None if figure_output else args.output,
+        "force": args.force,
+    }
+    optional_analyze_kwargs: dict[str, Any] = {}
+    if getattr(args, "beamstop_radius_px", None) is not None:
+        optional_analyze_kwargs["beamstop_radius_px"] = args.beamstop_radius_px
+    if getattr(args, "uncertainty_dataset", None) is not None:
+        optional_analyze_kwargs["uncertainty_dataset"] = args.uncertainty_dataset
+    if getattr(args, "include_physics", False):
+        optional_analyze_kwargs["include_physics"] = True
+    if getattr(args, "intensity_mode", None) is not None:
+        optional_analyze_kwargs["intensity_mode"] = args.intensity_mode
+    accepted_opt, unsupported_opt = _filter_supported_kwargs(analyze_fn, optional_analyze_kwargs)
+    analyze_kwargs.update(accepted_opt)
+    if unsupported_opt:
+        print(
+            f"警告：当前 analyze_frame 尚不支持参数 ({', '.join(unsupported_opt)})，已跳过。",
+            file=sys.stderr,
+        )
+    result = analyze_fn(source, **analyze_kwargs)
     if figure_output:
         from .butterfly_figure import export_butterfly_figure
         from .pipeline import _coerce_qmap, _result_output_paths
@@ -1211,6 +1448,7 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
         ("valid_mask", args.valid_mask),
         ("mask_frame", args.mask_frame),
         ("mask_dataset", args.mask_dataset),
+        ("beamstop_radius_px", getattr(args, "beamstop_radius_px", None)),
     ):
         if value is not None:
             path_analysis[name] = value
@@ -1416,32 +1654,42 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
             _print_json(blocked)
             return 2
 
-    geometry_cache: dict[Any, Any] = {}
+    effective_beamstop = (
+        getattr(args, "beamstop_radius_px", None)
+        if getattr(args, "beamstop_radius_px", None) is not None
+        else path_analysis.get("beamstop_radius_px")
+    )
+    analyze_for_batch = _BatchFrameAnalyzer(
+        poni=poni,
+        full2d=full2d,
+        frame=args.frame,
+        dataset=args.dataset,
+        mask=path_analysis.get("mask") if unattended else args.mask,
+        mask_frame=path_analysis.get("mask_frame") if unattended else args.mask_frame,
+        mask_dataset=path_analysis.get("mask_dataset") if unattended else args.mask_dataset,
+        valid_mask=path_analysis.get("valid_mask") if unattended else args.valid_mask,
+        beamstop_radius_px=effective_beamstop,
+    )
 
-    def analyze_for_batch(frame_ref: Any, initial_parameters: Any = None, config: Any = None) -> Any:
-        source = getattr(frame_ref, "path", frame_ref)
-        selected_frame = args.frame
-        if selected_frame is None:
-            selected_frame = getattr(frame_ref, "frame_selector", None)
-        selected_dataset = args.dataset
-        if selected_dataset is None:
-            selected_dataset = getattr(frame_ref, "dataset", None)
-            if selected_dataset is None:
-                selected_dataset = getattr(frame_ref, "dataset_id", None) or None
-        return _pipeline_symbol("analyze_frame")(
-            source,
-            poni=poni,
-            config=config,
-            full2d=full2d,
-            initial_parameters=initial_parameters,
-            frame=selected_frame,
-            dataset=selected_dataset,
-            mask=path_analysis.get("mask") if unattended else args.mask,
-            mask_frame=path_analysis.get("mask_frame") if unattended else args.mask_frame,
-            mask_dataset=path_analysis.get("mask_dataset") if unattended else args.mask_dataset,
-            valid_mask=path_analysis.get("valid_mask") if unattended else args.valid_mask,
-            geometry_cache=geometry_cache,
-        )
+    optional_batch_kwargs: dict[str, Any] = {}
+    if getattr(args, "deduplicate_frames", False):
+        optional_batch_kwargs["deduplicate_identical_frames"] = True
+    if getattr(args, "workers", None) is not None:
+        optional_batch_kwargs["max_workers"] = int(args.workers)
+    if effective_beamstop is not None:
+        optional_batch_kwargs["beamstop_radius_px"] = effective_beamstop
+    accepted_batch_kwargs, unsupported_batch_kwargs = _filter_supported_kwargs(
+        batch_module.run_batch,
+        optional_batch_kwargs,
+        aliases={"deduplicate_identical_frames": ("deduplicate_frames",)},
+    )
+    if unsupported_batch_kwargs:
+        warn_names = [name for name in unsupported_batch_kwargs if name != "beamstop_radius_px"]
+        if warn_names:
+            print(
+                f"警告：当前 run_batch 尚不支持参数 ({', '.join(warn_names)})，已回退默认执行。",
+                file=sys.stderr,
+            )
 
     stream_writer = None
     if stream:
@@ -1475,6 +1723,7 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
             retain_results=stream_writer is None,
             analyzer_identity="butterfly_saxs.pipeline.analyze_frame",
             restore_frame=None if stream_writer is None else stream_writer.can_restore,
+            **accepted_batch_kwargs,
         )
         exports = (
             stream_writer.finalize(run)
@@ -1509,7 +1758,7 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
                     for key in (
                         "metadata", "flags", "parameters", "ridges", "ridge_points",
                         "ellipse_fit", "butterfly", "lobe_radial_profiles", "lobe_radial_peaks",
-                        "full2d", "analysis", "analysis_domain", "valid_mask",
+                        "saxs_physics", "full2d", "analysis", "analysis_domain", "valid_mask",
                     )
                     if key in result_mapping
                 }
@@ -1520,7 +1769,7 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
                 for key in (
                     "metadata", "flags", "parameters", "ridges", "ridge_points",
                     "ellipse_fit", "butterfly", "lobe_radial_profiles", "lobe_radial_peaks",
-                    "full2d", "analysis", "analysis_domain",
+                    "saxs_physics", "full2d", "analysis", "analysis_domain",
                 )
                 if key in item.result
             }
@@ -1909,21 +2158,33 @@ def _handle_campaign(args: argparse.Namespace) -> int:
     if args.journal_style and args.journal_style != "default":
         kwargs["journal_style"] = str(args.journal_style)
 
-    import inspect as _inspect
+    optional_campaign_kwargs: dict[str, Any] = {}
+    if getattr(args, "beamstop_radius_px", None) is not None:
+        optional_campaign_kwargs["beamstop_radius_px"] = args.beamstop_radius_px
+    if getattr(args, "deduplicate_frames", False):
+        optional_campaign_kwargs["deduplicate_identical_frames"] = True
+    if getattr(args, "workers", None) is not None:
+        optional_campaign_kwargs["max_workers"] = int(args.workers)
 
-    try:
-        sig = _inspect.signature(runner)
-        params = sig.parameters
-        if not any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            kwargs = {k: v for k, v in kwargs.items() if k in params}
-        if "progress" in params or any(
-            p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
-        ):
-            kwargs["progress"] = lambda message: print(message, file=sys.stderr, flush=True)
-    except (TypeError, ValueError):
-        pass
+    base_accepted, _ = _filter_supported_kwargs(runner, kwargs)
+    opt_accepted, opt_unsupported = _filter_supported_kwargs(
+        runner,
+        optional_campaign_kwargs,
+        aliases={"deduplicate_identical_frames": ("deduplicate_frames",)},
+    )
+    if opt_unsupported:
+        print(
+            f"警告：当前 run_campaign 尚不支持参数 ({', '.join(opt_unsupported)})，已回退默认执行。",
+            file=sys.stderr,
+        )
+    call_kwargs = {**base_accepted, **opt_accepted}
+    progress_accepted, _ = _filter_supported_kwargs(
+        runner,
+        {"progress": lambda message: print(message, file=sys.stderr, flush=True)},
+    )
+    call_kwargs.update(progress_accepted)
 
-    result = runner(config_path, output_root, **kwargs)
+    result = runner(config_path, output_root, **call_kwargs)
     exit_code = int(
         result.get(
             "exit_code",

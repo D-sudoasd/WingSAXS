@@ -439,3 +439,83 @@ $projectRoot = (Get-Location).Path
 需要同时运行 R0 固定 8 帧时，再提供 `--r0-package`、`--r0-manifest`、`--poni` 和 `--mask`。输出目录必须是新目录，主要文件为 `p4_engineering_report.json` 和 `p4_summary.csv`；`0` 表示当前工程合同为 GO，`1` 表示工程 No-Go，`2` 表示输入、路径或参数错误。T1 的 detector-pixel 误差按合成线性 q 网格的 `(dq_y, dq_x)` 分轴换算；该口径不能直接冒充一般 PONI 曲线 q-map 的完整仪器分辨率。`results/validation/` 是本地证据目录，不应上传 GitHub。
 
 即使 P4 工程主链可以执行，缺少真实人工 consensus、人工重复性、仪器 q 分辨率和冻结阈值时，P3 科学门禁仍为 No-Go。工程继续实施与正式科学验收是两件事。
+
+## 11. 智能预检建议、扩展 2D 物理量、多样品活动与期刊出版图
+
+在核心单帧与批处理之外，当前版本提供面向大探测器（如 Pilatus 2M HDF5）与多样品原位实验的一组可选 CLI 能力，均保持原始图像、PONI 与 mask 文件只读，并遵循严格 JSON stdout 与退出码 `0/1/2` 约定。
+
+### 11.1 `bsaxs advise`、`inspect --recommend` 与内存叠加 `--beamstop-radius-px`
+
+在批量拟合前，可用只读诊断评估光束阻挡器阴影半径、有效外层 `q` 截断、推荐 `q_window`、Friedel 对称性及推荐工作流预设（不运行拟合，也不代表科学验收）：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe advise --image data\frame_0001.h5 `
+  --poni geometry\detector.poni --mask masks\detector.npy `
+  --image-dataset /entry/data/I_abs_2d --nominal-draw-axis-deg 90 `
+  --bright-axis-convention reference -o results\advice.json
+
+# 也可在 inspect 上直接附加建议并试用内存 beamstop 掩膜：
+.\.venv-project\Scripts\bsaxs.exe inspect data\frame_0001.h5 `
+  --poni geometry\detector.poni --mask masks\detector.npy `
+  --recommend --beamstop-radius-px auto
+```
+
+- `--bright-axis-convention` 支持 `draw`（默认，主亮桥沿名义拉伸轴）或 `reference`（垂直于拉伸轴的赤道翼）。
+- `--beamstop-radius-px <float|auto>` 可用于 `inspect`、`analyze`、`batch` 与 `campaign`，在内存中通过一维广播将圆形光束阻挡器排除区与外部 `mask` 合并，绝不改写磁盘上的原始 `mask.npy`，并在结果 provenance 与 batch 配置指纹中记录所用半径。
+
+### 11.2 工作流预设、HDF5 伴随不确定度与 `--include-physics`
+
+`analyze` 与 `batch` 支持可选工作流预设 `--preset {annular,curvature,sector,butterfly_pub}`（省略时完全保留原有默认行为，显式参数可覆盖预设）。在单帧 `analyze` 中，还可启用伴随不确定度加载与扩展 2D SAXS 物理观测量汇总：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe analyze data\frame_0001.h5 `
+  --poni geometry\detector.poni --mask masks\detector.npy `
+  --dataset /entry/data/I_abs_2d --uncertainty-dataset auto `
+  --preset annular --beamstop-radius-px 18 `
+  --include-physics --intensity-mode calibrated -o results\frame_0001
+```
+
+- `--uncertainty-dataset <path|auto>`：读取 HDF5 伴随统计不确定度数组（`auto` 自动探测 `/entry/data/uncertainty/statistical` 等标准路径），用于传播逐箱径向统计标准误与 `q_win_stat_stderr`。
+- `--include-physics`：在结果中附加 `saxs_physics` 汇总块（方位角谐波 `A_2`/`A_4`/`P_2`、`C2-bridge + 4-lobe` 拟合、分列的直接 `I(q)` 峰与 Kratky `q^2 I(q)` 峰、窗口受限不变量 `Q_win` 及垂直条纹 Grubb/Williamson-Hall 表观横向宽度 `W`）。
+- `--intensity-mode {calibrated,raw}`：显式声明强度标定状态。仅在 `calibrated` 下报告 `Q_win`；选择 `raw` 时 `Q_win` 强制返回 `null`，避免原始计数被误当作绝对散射不变量。
+
+### 11.3 `bsaxs init-manifest`、精确像素去重、并行 worker 与序列诊断
+
+从目录或 HDF5 帧栈生成自然排序的 `manifest.csv`（缺失时间戳留空不捏造）：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe init-manifest --input data\series `
+  --output data\manifest.csv --pattern "*.h5" --dataset /entry/data/I_abs_2d --sha256
+```
+
+在 `batch` 与 `campaign` 中可开启精确去重与多进程并行，配合 `SAXSGeometryCache` 消除重复全图坐标计算：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe batch --manifest data\manifest.csv `
+  --poni geometry\detector.poni --mask masks\detector.npy `
+  --preset annular --beamstop-radius-px 18 --mode independent `
+  --deduplicate-frames --workers 4 --stream -o results\batch
+```
+
+- `--deduplicate-frames`：按解码像素数组 SHA-256 精确识别完全相同的重复/冻结帧，复用首次计算结果并记录 `is_duplicate_frame`、`duplicate_of_frame_id` 与 `pixel_sha256`；每帧原始位置与身份全部保留，绝不对不同帧插值或用前一帧替代失败帧。
+- `--workers <N>`（映射到 `max_workers`）：`batch` 在 `mode=independent` 下并行处理独立帧（`warm_start` 自动回退顺序执行），`campaign` 并行执行多个独立样品，输出顺序保持确定性。
+- Python API `butterfly_saxs.sequence_diagnostics.diagnose_sequence` 可对整条序列进行只读异常审计（重复帧、时间步长突变、轴比塌缩、q 边界命中、正交翻转与覆盖率跌落）。
+
+### 11.4 多样品活动 `bsaxs campaign`、期刊复合图与跨样品对比
+
+用一份活动 TOML 统一编排多样品分析（默认隔离单样品失败，加 `--fail-fast` 在首个失败样品后停止），并可选自动生成期刊风格汇总报告：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe campaign --config campaign.toml `
+  -o results\campaign --workers 4 --deduplicate-frames `
+  --beamstop-radius-px auto --report --journal-style nature
+```
+
+对已有单样品或多样品父目录，可直接不重跑拟合生成期刊风格报告与对比表：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe report results\campaign --journal-style nature
+```
+
+- `--journal-style` 支持 `default`、`nature`、`nature_comm`、`science`、`macromolecules`。
+- 绘图与对比层（`journal_style`、`composite_figures`、`comparison_report`）严格无 Qt 且不依赖 `matplotlib.pyplot`，自动处理防重叠 `asinh`/`log` 色条刻度与跨 `0°/360°` 环绕射线角，支持 6 面板 183 mm Nature 单样品物理总览图（导出 PDF/SVG/600 dpi PNG + Source Data CSV + SHA-256 清单），以及按匹配时间锚点（`target_time_h`）进行的跨温度/跨重复动力学与 Arrhenius 汇总（标定强度与原始计数严格隔离，direct 与 Kratky 渠道分列）。

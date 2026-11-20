@@ -299,6 +299,7 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
             "recommended_butterfly_stage": "evaluate",
             "workflow_presets": ["annular", "curvature", "sector", "butterfly_pub"],
             "journal_styles": ["default", "nature", "nature_comm", "science", "macromolecules"],
+            "intensity_modes": ["calibrated", "raw"],
             "overwrite": False,
         },
         "recommended_agent_workflow": [
@@ -382,10 +383,11 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
             },
             {
                 "name": "inspect",
-                "purpose": "Read-only frame/q-space diagnostics. Pass --recommend to attach smart parameter/beamstop/symmetry advisor guidance. No ellipse publication.",
+                "purpose": "Read-only frame/q-space diagnostics. Pass --recommend for advisor guidance and optional --beamstop-radius-px for an in-memory beamstop mask. No ellipse publication.",
                 "stdout": INSPECT_SCHEMA,
                 "options": {
                     "recommend": "Attach advisor diagnostics when butterfly_saxs.auto_advisor is available.",
+                    "beamstop_radius_px": "Optional in-memory beamstop exclusion radius in pixels (non-negative float) or 'auto'; raw mask files stay unchanged.",
                 },
                 "exit_codes": {"0": EXIT_CODES["0"], "2": EXIT_CODES["2"]},
             },
@@ -420,7 +422,7 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
             },
             {
                 "name": "campaign",
-                "purpose": "Orchestrate multi-sample batch analysis from a campaign TOML with per-sample failure isolation and strict JSON summary.",
+                "purpose": "Orchestrate multi-sample batch analysis from a campaign TOML with per-sample failure isolation, optional --beamstop-radius-px, --deduplicate-frames, --workers (max_workers), and strict JSON summary.",
                 "stdout": CAMPAIGN_RUN_SCHEMA,
                 "options": {
                     "config": "Campaign TOML path (--config or positional).",
@@ -428,25 +430,35 @@ def agent_manifest(command: str | None = None) -> dict[str, Any]:
                     "force": "Allow overwriting existing campaign outputs.",
                     "continue_on_error": "Isolate per-sample failures by default; pass --fail-fast to stop after first failed sample.",
                     "journal_style": ["default", "nature", "nature_comm", "science", "macromolecules"],
+                    "beamstop_radius_px": "Optional in-memory beamstop exclusion radius in pixels (non-negative float) or 'auto'; raw mask files stay unchanged.",
+                    "deduplicate_frames": "Reuse computed results for exact SHA-256 pixel-identical frames while preserving source-frame identity and sequence order.",
+                    "workers": "Optional parallel sample worker count (mapped to max_workers >= 1) with deterministic summary order.",
                 },
                 "presets": ["annular", "curvature", "sector", "butterfly_pub"],
                 "exit_codes": EXIT_CODES,
             },
             {
                 "name": "analyze",
-                "purpose": "Single-frame geometry measurement; supports optional --preset {annular,curvature,sector,butterfly_pub}; --full2d is optional and separate.",
+                "purpose": "Single-frame geometry measurement; supports optional --preset {annular,curvature,sector,butterfly_pub}, --beamstop-radius-px, --uncertainty-dataset, --include-physics, and --intensity-mode {calibrated,raw}; --full2d is optional and separate.",
                 "stdout": ANALYSIS_SUMMARY_SCHEMA,
                 "options": {
                     "preset": ["annular", "curvature", "sector", "butterfly_pub"],
+                    "beamstop_radius_px": "Optional in-memory beamstop exclusion radius in pixels (non-negative float) or 'auto'; raw mask files stay unchanged.",
+                    "uncertainty_dataset": "Optional HDF5 companion statistical uncertainty dataset path or 'auto' (e.g. /entry/data/uncertainty/statistical).",
+                    "include_physics": "Attach additive 2D SAXS physics summary (azimuthal harmonics/C2-bridge + 4-lobe, radial coarsening, streak width, window-bounded Q_win).",
+                    "intensity_mode": ["calibrated", "raw"],
                 },
                 "exit_codes": EXIT_CODES,
             },
             {
                 "name": "batch",
-                "purpose": "Independent or quality-gated warm-start series; supports optional --preset {annular,curvature,sector,butterfly_pub}; --stream writes longitudinal exports, --report analyzes exports and generates parameterized lamellar geometry using observed direction evidence, and --package builds delivery navigation and ZIP.",
+                "purpose": "Independent or quality-gated warm-start series; supports optional --preset, --beamstop-radius-px, --deduplicate-frames, and --workers (max_workers); --stream writes longitudinal exports, --report analyzes exports, and --package builds delivery ZIP.",
                 "stdout": BATCH_RUN_SCHEMA,
                 "options": {
                     "preset": ["annular", "curvature", "sector", "butterfly_pub"],
+                    "beamstop_radius_px": "Optional in-memory beamstop exclusion radius in pixels (non-negative float) or 'auto'; raw mask files stay unchanged.",
+                    "deduplicate_frames": "Reuse computed results for exact SHA-256 pixel-identical frames while preserving source-frame identity and sequence positions.",
+                    "workers": "Optional parallel worker count (mapped to max_workers >= 1) for mode=independent; warm_start remains sequential.",
                 },
                 "exit_codes": EXIT_CODES,
             },

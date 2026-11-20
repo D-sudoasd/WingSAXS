@@ -144,15 +144,21 @@ def test_symlink_and_symlink_ancestor_are_rejected(tmp_path):
     (outside / "file").write_text("protected")
     root = tmp_path / "root"
     root.mkdir()
-    for target, name in [(outside / "file", "linked_file"), (outside, "linked_dir")]:
-        (root / name).symlink_to(target, target_is_directory=target.is_dir())
+    try:
+        for target, name in [(outside / "file", "linked_file"), (outside, "linked_dir")]:
+            (root / name).symlink_to(target, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
     for name in ["linked_file", "linked_dir/file"]:
         receipt = root / "receipt.json"
         receipt.write_text(json.dumps({"bindings": [{"path": name, "sha256": "0" * 64}]}))
         with pytest.raises(ValueError, match="symlink_path"):
             verify_delivery_bindings(receipt)
     link = root / "receipt_link.json"
-    link.symlink_to(receipt)
+    try:
+        link.symlink_to(receipt)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
     with pytest.raises(ValueError, match="symlink"):
         verify_delivery_bindings(link)
 
