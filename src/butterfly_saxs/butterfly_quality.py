@@ -901,4 +901,3 @@ def build_quality_remediation(
             }
         )
     return items
-

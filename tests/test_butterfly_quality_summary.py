@@ -470,5 +470,3 @@ def test_build_quality_remediation_bilingual_and_strict_json() -> None:
     )
     for item in clamped:
         assert item["suggested_parameters"]["q_max"] <= 5.85
-
-

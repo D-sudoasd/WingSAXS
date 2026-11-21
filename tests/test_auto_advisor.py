@@ -570,4 +570,3 @@ def test_advise_frame_loads_poni_once_and_supports_beamstop_and_geometry_cache(
     assert load_calls == 2  # zero additional PONI loads
     assert res_cached["beamstop"]["unmasked_beamstop"] is False
     assert res_cached["symmetry"]["morphology_class"] == "four_lobe_butterfly"
-

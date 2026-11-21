@@ -721,4 +721,3 @@ def test_cli_batch_and_campaign_v21_options_forward_and_pickle(monkeypatch, tmp_
     captured = capsys.readouterr()
     assert "max_workers" in captured.err
     assert json.loads(captured.out)["status"] == "ok"
-

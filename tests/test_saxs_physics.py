@@ -891,4 +891,3 @@ def test_run_window_sensitivity_audit_compares_windows_models_and_raw_isolation(
         assert row["q_win_invariant"] is None
         assert row["q_win_bg_subtracted"] is None
         assert row["q_win_stat_stderr"] is None
-

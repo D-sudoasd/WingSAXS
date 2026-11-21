@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -23,7 +22,7 @@ from butterfly_saxs.campaign import (
     workflow_preset_analysis,
     write_manifest_csv,
 )
-from butterfly_saxs.project import ProjectConfig, ProjectConfigError, apply_workflow_preset
+from butterfly_saxs.project import ProjectConfig, apply_workflow_preset
 
 
 def test_workflow_presets_are_valid_analysis_settings() -> None:
