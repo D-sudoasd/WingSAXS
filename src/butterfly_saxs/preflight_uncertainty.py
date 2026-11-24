@@ -231,6 +231,8 @@ def uncertainty_provenance(
             record["datasets"] = rows
             if status != "reference_schema_read":
                 record["reason"] = status
+        except error_type:
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             # read_file_record has already raised for a read-time hash
             # change.  Other HDF5 failures remain explicit and the file

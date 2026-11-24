@@ -204,7 +204,11 @@ def _hashable(value: Any) -> Any:
 
 def _hash_inline(value: Any) -> str:
     encoded = json.dumps(
-        _hashable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        _hashable(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return _sha256_bytes(encoded)
 
@@ -701,26 +705,29 @@ def _write_csv(path: Path, columns: Sequence[str], rows: Sequence[Mapping[str, A
 
 
 def _write_blind_png(path: Path, array: np.ndarray, vmin: float, vmax: float) -> None:
-    import matplotlib
+    import matplotlib as mpl
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
 
-    matplotlib.use("Agg", force=True)
-    import matplotlib.pyplot as plt
-
-    cmap = plt.get_cmap("magma").with_extremes(bad="black")
-    figure, axis = plt.subplots(figsize=(4.0, 4.0), dpi=150)
-    axis.imshow(
-        np.ma.masked_invalid(np.asarray(array, dtype=float)),
-        origin="lower",
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-        interpolation="nearest",
-        aspect="equal",
-    )
-    axis.axis("off")
-    figure.subplots_adjust(0, 0, 1, 1)
-    figure.savefig(path, format="png", dpi=150, pad_inches=0)
-    plt.close(figure)
+    cmap = mpl.colormaps.get_cmap("magma").with_extremes(bad="black")
+    figure = Figure(figsize=(4.0, 4.0), dpi=150)
+    FigureCanvasAgg(figure)
+    try:
+        axis = figure.add_subplot(1, 1, 1)
+        axis.imshow(
+            np.ma.masked_invalid(np.asarray(array, dtype=float)),
+            origin="lower",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+            aspect="equal",
+        )
+        axis.axis("off")
+        figure.subplots_adjust(0, 0, 1, 1)
+        figure.savefig(path, format="png", dpi=150, pad_inches=0)
+    finally:
+        figure.clear()
 
 
 def _global_display_scale(candidates: Sequence[_Candidate]) -> tuple[float, float]:

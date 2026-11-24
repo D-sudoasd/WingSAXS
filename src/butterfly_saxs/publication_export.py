@@ -38,11 +38,15 @@ def _get(value: Any, name: str, default: Any = None) -> Any:
 def _check_cancel(event: Any) -> None:
     if event is None:
         return
-    try:
-        method = getattr(event, "is_set", None)
-        active = bool(method()) if callable(method) else bool(event() if callable(event) else event)
-    except Exception:
-        active = False
+    method = getattr(event, "is_set", None)
+    if callable(method):
+        active = bool(method())
+    elif callable(event):
+        active = bool(event())
+    elif isinstance(event, bool):
+        active = event
+    else:
+        raise TypeError("cancel_event must be an Event-like object, callable, or bool")
     if active:
         raise PublicationExportCancelled("publication export cancelled")
 
@@ -80,7 +84,13 @@ def _write_parameter_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             output = {}
             for name in ordered:
                 value = row.get(name, "")
-                output[name] = json.dumps(_jsonable(value), ensure_ascii=False, separators=(",", ":")) if isinstance(value, (Mapping, list, tuple, np.ndarray)) else "" if value is None else str(_jsonable(value))
+                output[name] = (
+                    json.dumps(_jsonable(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                    if isinstance(value, (Mapping, list, tuple, np.ndarray))
+                    else ""
+                    if value is None
+                    else str(_jsonable(value))
+                )
             writer.writerow(output)
 
 
@@ -230,18 +240,30 @@ def _caption(scene: Any, spec: PublicationFigureSpec) -> str:
     boundary = str(_scene_field(scene, "scientific_boundary", "") or "")
     settings = _scene_field(scene, "settings", {})
     unit = "nm" if _scene_field(scene, "length_unit") == "nm" else "relative units"
-    periods = "; ".join(f"{chr(65 + int(p['branch_id']))}: {float(p['period']):.4g} {unit}"
-                        for p in _scene_field(scene, "populations", ()) if p.get("period") is not None)
-    source = settings.get("period_source", "radial")
-    mapping = {"radial": "Apparent periods follow L_app = 2π/q* from the recorded radial peaks.",
-               "ellipse": "Periods use the existing ellipse-derived values and their recorded applicability checks.",
-               "manual": "Periods are explicit manual schematic settings."}[source]
+    periods = "; ".join(
+        f"{chr(65 + int(p['branch_id'])) if 0 <= int(p['branch_id']) < 26 else str(p['branch_id'])}: {float(p['period']):.4g} {unit}"
+        for p in _scene_field(scene, "populations", ())
+        if p.get("period") is not None
+    )
+    source = str(settings.get("period_source", "radial") or "radial") if isinstance(settings, Mapping) else "radial"
+    mapping = {
+        "radial": "Apparent periods follow L_app = 2π/q* from the recorded radial peaks.",
+        "ellipse": "Periods use the existing ellipse-derived values and their recorded applicability checks.",
+        "manual": "Periods are explicit manual schematic settings.",
+    }.get(source, f"Periods use the recorded '{source}' period source.")
     identity = _source_identity(scene)
     frame = identity.get("id", identity.get("frame", "unspecified")) if isinstance(identity, Mapping) else "unspecified"
+    stack_ids = np.asarray(_get(scene, "stack_ids", ()))
+    vertices = _get(scene, "vertices", ())
+    n_stacks = int(len(np.unique(stack_ids))) if stack_ids.size else 0
+    n_lamellae = len(vertices) if vertices is not None else 0
+    thickness_ratio = settings.get("thickness_ratio", 0.25) if isinstance(settings, Mapping) else 0.25
+    width_ratio = settings.get("width_ratio", 4) if isinstance(settings, Mapping) else 4
+    depth_ratio = settings.get("depth_ratio", 4) if isinstance(settings, Mapping) else 4
     body = (f"Source frame: {frame}. {mapping} {periods}. "
-            f"The drawing contains {len(np.unique(scene.stack_ids))} stacks and {len(scene.vertices)} planar lamellae. "
-            f"Thickness/period = {settings.get('thickness_ratio', .25):g}; width/period = {settings.get('width_ratio', 4):g}; "
-            f"depth/period = {settings.get('depth_ratio', 4):g}. These dimensions, stack counts, positions and any morphological spread are drawing assumptions. "
+            f"The drawing contains {n_stacks} stacks and {n_lamellae} planar lamellae. "
+            f"Thickness/period = {thickness_ratio:g}; width/period = {width_ratio:g}; "
+            f"depth/period = {depth_ratio:g}. These dimensions, stack counts, positions and any morphological spread are drawing assumptions. "
             "Normals follow the scattering-peak directions by assumption. The reference arrow follows the recorded reference direction; identifying it with physical loading requires source documentation. ")
     if spec.show_inset:
         body += "The local detail shows up to three existing lamellae from one stack; all lamellae are retained in the main scene. "
@@ -416,7 +438,7 @@ def export_publication_figure(
         _publish(stage, target)
         output = _output_paths(target)
         return output
-    except Exception:
+    except BaseException:
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
         raise

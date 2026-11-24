@@ -277,7 +277,7 @@ def _profile_rows(base: Mapping[str, Any], archive: Any, keys: Mapping[str, str]
                 handle.seek(0)
                 value = np.load(handle, allow_pickle=False)
                 shape, dtype = value.shape, value.dtype
-        array_table.write([{**base, "role": role, "array_key": key, "shape": json.dumps(shape), "dtype": str(dtype)}])
+        array_table.write([{**base, "role": role, "array_key": key, "shape": json.dumps(list(shape), allow_nan=False), "dtype": str(dtype)}])
         if len(shape) != 1 or not any(word in role for word in ("profile", "angular", "residual", "assignment", "covariance")):
             continue
         array = np.asarray(archive[key])
@@ -813,7 +813,7 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
             os.replace(target, backup)
         try:
             os.replace(stage, target)
-        except OSError:
+        except BaseException:
             if backup.exists():
                 os.replace(backup, target)
             raise
@@ -882,12 +882,56 @@ def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "
         return _build_reports(root, prefix=prefix, force=force, resume=resume, settings=settings, progress=progress)
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
                    settings: Mapping[str, Any], progress: Callable[[str], Any] | None) -> dict[str, Any]:
-    summaries = sorted(path for path in root.rglob(f"{prefix}*frame_summary.csv")
-                       if not any(part.startswith(".") or part == "figures" for part in path.relative_to(root).parts))
+    if prefix:
+        allowed_names = {f"{prefix}frame_summary.csv"}
+        if not prefix.endswith(("_", "-")):
+            allowed_names.add(f"{prefix}_frame_summary.csv")
+        summaries = sorted(
+            path
+            for path in root.rglob("*frame_summary.csv")
+            if path.name in allowed_names
+            and not any(part.startswith(".") or part == "figures" for part in path.relative_to(root).parts)
+        )
+    else:
+        summaries = sorted(
+            path
+            for path in root.rglob("*frame_summary.csv")
+            if not any(part.startswith(".") or part == "figures" for part in path.relative_to(root).parts)
+        )
     if not summaries:
         raise FileNotFoundError(f"No frame_summary.csv batch exports found under {root}")
+    if len(summaries) > 1 and not (force or resume):
+        collection_targets = [
+            root / "analysis_reports.html",
+            root / "analysis_report_summary.json",
+            root / "collection_parameters.csv",
+            root / "collection_measurements.csv",
+            root / "collection_lamellar_parameters.csv",
+        ]
+        if settings.get("journal_style") is not None:
+            collection_targets.append(root / "comparison_report")
+        existing = [path for path in collection_targets if path.exists()]
+        if existing:
+            names = ", ".join(str(path) for path in existing)
+            raise FileExistsError(f"Collection report output(s) already exist; pass force=True or resume=True: {names}")
     producer = producer_identity(presentation=True)
     reports = [_build_sample(path, force=force, resume=resume, settings=settings, progress=progress, producer=producer) for path in summaries]
     if len(reports) == 1:
@@ -938,6 +982,7 @@ def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
             journal_style=str(settings["journal_style"]),
             formats=settings["formats"],
             dpi=settings["dpi"],
+            force=bool(force or resume),
         )
         comp_html_rel = os.path.relpath(comparison_summary["outputs"]["html"], root).replace(os.sep, "/")
         comp_ep_rel = os.path.relpath(comparison_summary["outputs"]["endpoint_summary_csv"], root).replace(os.sep, "/")
@@ -959,7 +1004,7 @@ def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
     table_links = " · ".join(_link(path, label.replace("_", " ")) for label, path in collection_tables.items())
     document = _page("WingSAXS sample reports", f'<section><h2>All samples</h2><p>{table_links}</p></section>' + comparison_section + body)
     if not collection.exists() or collection.read_text(encoding="utf-8") != document:
-        collection.write_text(document, encoding="utf-8")
+        _write_text_atomic(collection, document)
     combined_outputs = {
         "index": str(collection),
         "summary": str(root / "analysis_report_summary.json"),
@@ -980,7 +1025,7 @@ def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
     summary = root / "analysis_report_summary.json"
     text = json.dumps(combined, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     if not summary.exists() or summary.read_text(encoding="utf-8") != text:
-        summary.write_text(text, encoding="utf-8")
+        _write_text_atomic(summary, text)
     return combined
 
 

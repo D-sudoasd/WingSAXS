@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from collections.abc import Iterator
+import errno
 import os
 from pathlib import Path
 import stat
@@ -41,6 +42,20 @@ def _release_file_lock(handle) -> None:
         import fcntl
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _is_lock_contention(exc: OSError, *, from_open: bool = False) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror in {32, 33}:  # ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+        return True
+    if from_open:
+        return False
+    return exc.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+        errno.EDEADLK,
+    }
 
 
 def _locked_error(root: Path, cause: OSError | None = None) -> OSError:
@@ -99,11 +114,17 @@ def output_lock(
             raise _locked_error(resolved)
         try:
             handle = lock_path.open("a+b")
+        except OSError as exc:
+            if _is_lock_contention(exc, from_open=True):
+                raise _locked_error(resolved, exc) from exc
+            raise
+        try:
             _acquire_file_lock(handle)
         except OSError as exc:
-            if handle is not None:
-                handle.close()
-            raise _locked_error(resolved, exc) from exc
+            handle.close()
+            if _is_lock_contention(exc, from_open=False):
+                raise _locked_error(resolved, exc) from exc
+            raise
         _ACTIVE[key] = owner
         state: list[object] = [handle, 1]
         held[key] = state

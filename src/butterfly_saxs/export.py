@@ -141,7 +141,7 @@ def _publish_staged_bundle(
         },
     }
     marker_stage.write_text(
-        json.dumps(marker_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(marker_payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     normalized["commit_marker"] = marker_target
@@ -162,7 +162,7 @@ def _publish_staged_bundle(
                 continue
             os.replace(stage / target.name, target)
             published.append(target)
-    except Exception:
+    except BaseException:
         for key, target in normalized.items():
             if key in preserved:
                 continue
@@ -809,8 +809,13 @@ def _frame_summary_rows(results: Sequence[FrameFitResult]) -> list[dict[str, Any
                 "b",
                 "axis_ratio",
                 "theta_deg",
+                "center_qx",
+                "center_qy",
                 "ellipticity",
                 "eccentricity",
+                "Ln_from_minor_axis_nm",
+                "Lz_from_draw_axis_nm",
+                "L_from_major_axis_nm",
             ):
                 if name in geometry:
                     row[name] = _scalar(geometry[name])
@@ -1519,10 +1524,8 @@ def _write_npz(path: Path, results: Sequence[FrameFitResult]) -> Path:
 
 
 def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
-    import matplotlib
-
-    matplotlib.use("Agg", force=True)
-    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
     from .visualization import _parameter_evolution_label, plot_parameter_evolution
 
     # One quantity/unit per panel avoids assigning generic length/intensity
@@ -1535,11 +1538,15 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
     ))
     path.parent.mkdir(parents=True, exist_ok=True)
     if not keys:
-        fig, axis = plt.subplots(figsize=(9, 5), constrained_layout=True)
-        axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
-        axis.set_axis_off()
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
+        fig = Figure(figsize=(9, 5), layout="constrained")
+        FigureCanvasAgg(fig)
+        try:
+            axis = fig.add_subplot(1, 1, 1)
+            axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
+            axis.set_axis_off()
+            fig.savefig(path, dpi=160)
+        finally:
+            fig.clear()
         return path
     aliases = {key: f"quantity_{index}" for index, key in enumerate(keys)}
     labels, units = {}, {}
@@ -1566,12 +1573,83 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
             row[f"{alias}_status"] = state
         rows.append(row)
     # FrameRef.time has no declared universal time unit; never assume seconds.
+    # Avoid matplotlib.use("Agg", force=True), which destroys an active QtAgg
+    # GUI backend in-process; close only if registered with pyplot.
     fig = plot_parameter_evolution(
         rows, parameters=list(aliases.values()), x_key="time" if has_time else "frame_index",
         parameter_labels=labels, parameter_units=units, output=path, dpi=160,
     )
-    plt.close(fig)
+    try:
+        fig.clear()
+        import matplotlib.pyplot as plt
+
+        plt.close(fig)
+    except Exception:
+        pass
     return path
+
+
+_CANONICAL_FRAME_SUMMARY_COLUMNS = [
+    "frame_index",
+    "frame_id",
+    "path",
+    "frame_selector",
+    "dataset",
+    "time",
+    "status",
+    "quality_status",
+    "confidence",
+    "confidence_reason",
+    "quality_diagnostic",
+    "arc_sides",
+    "q_star_from_arcs",
+    "L_from_observed_radius_nm",
+    "q_star_source",
+    "observed_arc_q_median",
+    "radial_hint_q",
+    "radial_arc_comparison_q_unit",
+    "radial_hint_selection_status",
+    "radial_hint_reason",
+    "observed_arc_q_source",
+    "radial_arc_comparison_status",
+    "radial_hint_to_observed_arc_ratio",
+    "radial_arc_comparison_signed_relative_difference",
+    "ellipse_kind",
+    "a",
+    "b",
+    "axis_ratio",
+    "theta_deg",
+    "center_qx",
+    "center_qy",
+    "ellipticity",
+    "eccentricity",
+    "Ln_from_minor_axis_nm",
+    "Lz_from_draw_axis_nm",
+    "L_from_major_axis_nm",
+    "Ln_candidate_from_minor_axis_nm",
+    "Lz_candidate_from_draw_axis_nm",
+    "L_candidate_from_major_axis_nm",
+    "fit_status",
+    "fit_success",
+    "full2d_status",
+    "full2d_success",
+    "rmse",
+    "weighted_rmse",
+    "ndata",
+    "sampled_n",
+    "sample_rmse",
+    "nfev",
+    "condition_number",
+    "error",
+    "diagnostic",
+    "warm_start_from",
+    "elapsed_s",
+    "resumed",
+    "flags",
+    "scientific_flags",
+    "parameters_json",
+    "frame_metadata_json",
+]
 
 
 class StreamingBatchExporter:
@@ -1582,16 +1660,7 @@ class StreamingBatchExporter:
     to a temporary NPZ zip member before the in-memory result is released.
     """
 
-    _FRAME_COLUMNS = [
-        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error", "diagnostic",
-        "quality_status", "confidence", "confidence_reason", "quality_diagnostic",
-        "observed_arc_q_median", "radial_hint_q", "radial_arc_comparison_q_unit",
-        "radial_hint_selection_status", "radial_hint_reason", "observed_arc_q_source",
-        "radial_arc_comparison_status", "radial_hint_to_observed_arc_ratio",
-        "radial_arc_comparison_signed_relative_difference",
-        "warm_start_from", "elapsed_s", "resumed", "flags", "scientific_flags",
-        "parameters_json",
-    ]
+    _FRAME_COLUMNS = list(_CANONICAL_FRAME_SUMMARY_COLUMNS)
     _PARAMETER_COLUMNS = [
         "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "parameter",
         "value", "stderr", "uncertainty", "fixed", "unit", "flags",
@@ -1775,7 +1844,7 @@ class StreamingBatchExporter:
                     self._old_binding_verified = True
                     self._old_details_handle = self._targets["frame_details"].open(encoding="utf-8")
                 self._old_npz_metadata = dict(parsed)
-            except Exception:
+            except BaseException:
                 if self._old_npz is not None:
                     self._old_npz.close()
                     self._old_npz = None
@@ -1803,7 +1872,7 @@ class StreamingBatchExporter:
             # Lossless low-search DEFLATE is faster for detector/q arrays;
             # every dtype, bit and NPZ member remains present.
             self._npz = zipfile.ZipFile(npz_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1)
-        except Exception:
+        except BaseException:
             self.abort()
             raise
 
@@ -2044,24 +2113,6 @@ class StreamingBatchExporter:
                 self.abort()
                 self._stage = None
                 return {**self._targets, "commit_marker": self.output / ".bundle.commit.json"}
-            if self.resume and not self._compact_results and isinstance(batch, BatchRunResult) and batch.cancelled:
-                # A cancellation before the next frame starts has no new
-                # evidence to publish.  Keep the previous verified tables and
-                # arrays intact instead of replacing them with an empty
-                # bundle; the checkpoint remains the resume source of truth.
-                self._npz.close()
-                for handle in self._handles.values():
-                    handle.close()
-                if self._details_handle is not None:
-                    self._details_handle.close()
-                    self._details_handle = None
-                shutil.rmtree(self._stage, ignore_errors=True)
-                if self._old_npz is not None:
-                    self._old_npz.close()
-                    self._old_npz = None
-                self._stage = None
-                self._release_output_lock()
-                return dict(self._targets)
             metadata = {
                 "arrays": list(self._array_names),
                 "frame_count": len(self._compact_results),
@@ -2435,40 +2486,7 @@ def _export_batch_locked(
     _write_csv(
         frame_summary,
         _frame_summary_rows(results),
-        columns=[
-            "frame_index",
-            "frame_id",
-            "path",
-            "frame_selector",
-            "dataset",
-            "time",
-            "status",
-            "quality_status",
-            "confidence",
-            "confidence_reason",
-            "quality_diagnostic",
-            "arc_sides",
-            "q_star_from_arcs",
-            "L_from_observed_radius_nm",
-            "q_star_source",
-            "observed_arc_q_median",
-            "radial_hint_q",
-            "radial_arc_comparison_q_unit",
-            "radial_hint_selection_status",
-            "radial_hint_reason",
-            "observed_arc_q_source",
-            "radial_arc_comparison_status",
-            "radial_hint_to_observed_arc_ratio",
-            "radial_arc_comparison_signed_relative_difference",
-            "error",
-            "diagnostic",
-            "warm_start_from",
-            "elapsed_s",
-            "resumed",
-            "flags",
-            "scientific_flags",
-            "parameters_json",
-        ],
+        columns=list(_CANONICAL_FRAME_SUMMARY_COLUMNS),
     )
 
     parameter_rows: list[dict[str, Any]] = []

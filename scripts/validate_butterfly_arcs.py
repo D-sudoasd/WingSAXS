@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import hashlib
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 import json
 from pathlib import Path
 import sys
@@ -42,6 +42,13 @@ def mask_digest(value):
         return digest(value)
     return hashlib.sha256(json.dumps(_jsonable(value, array_summary=False),
                                      sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
 
 
 def code_hashes():
@@ -118,7 +125,7 @@ def main(argv=None):
                "options": options, "multistart": args.multistart, "split": args.split,
                "ellipse_preset_override": args.ellipse_preset,
                "calibrated_confidence": False,
-               "versions": {name: version(name) for name in ("numpy", "scipy", "pyFAI", "fabio", "tifffile")},
+               "versions": {name: _package_version(name) for name in ("numpy", "scipy", "pyFAI", "fabio", "tifffile")},
                "python": sys.version}
     jobs = []
     if args.benchmark:
@@ -136,11 +143,13 @@ def main(argv=None):
         config = project.analysis
         context["project_analysis"] = config
         context.update(kind="real_frames", project_sha256=digest(args.project),
-                       poni_sha256=digest(project.poni_path),
+                       poni_sha256=None if project.poni_path is None else digest(project.poni_path),
                        mask_sha256=mask_digest(config.get("mask")),
                        valid_mask_sha256=mask_digest(config.get("valid_mask")),
                        reference_axis_deg=float(config.get("draw_axis_deg", 90.)) - 90.,
                        q_window=list(config.get("q_window", [.1, .5])))
+        if not project.input_paths:
+            raise ValueError("project configuration lists no input files")
         sample_path = Path(project.input_paths[0])
         context["dataset_directory"] = str(sample_path.parent.resolve())
         if args.all_project_inputs:
@@ -184,7 +193,10 @@ def main(argv=None):
     if args.freeze:
         if args.split != "development":
             raise ValueError("freeze only a development recipe")
-        (output / "frozen_recipe.json").write_text(json.dumps(context, indent=2), encoding="utf-8")
+        (output / "frozen_recipe.json").write_text(
+            json.dumps(_jsonable(context, array_summary=False), indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
     summaries = []
     qmap = mask = None
     for name, source, seed in jobs:
@@ -206,9 +218,14 @@ def main(argv=None):
                 data = loaded.data
                 mask = None if loaded.valid_mask is None else ~loaded.valid_mask
                 if qmap is None:
-                    qmap = build_geometry(data.shape, project.poni_path)
-                if data.shape != qmap.q.shape:
-                    raise ValueError("frame/geometry shape changed")
+                    if project.poni_path is not None:
+                        qmap = build_geometry(data.shape, project.poni_path)
+                    elif loaded.qmap is not None:
+                        qmap = loaded.qmap
+                if qmap is not None:
+                    q_arr = qmap["q"] if isinstance(qmap, dict) else qmap.q
+                    if data.shape != q_arr.shape:
+                        raise ValueError("frame/geometry shape changed")
                 window, reference = context["q_window"], context["reference_axis_deg"]
                 local_options = options
             fit_analysis = {} if args.benchmark else dict(config)
@@ -255,10 +272,20 @@ def main(argv=None):
         summaries.append(summary)
         with (output / "progress.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(_jsonable(summary, array_summary=False), ensure_ascii=False, allow_nan=False) + "\n")
-        print(json.dumps({key: summary.get(key) for key in ("id", "elapsed_s", "execution_status", "solver_success", "measurement_status", "relative_errors")}), flush=True)
+        print(
+            json.dumps(
+                _jsonable(
+                    {key: summary.get(key) for key in ("id", "elapsed_s", "execution_status", "solver_success", "measurement_status", "relative_errors")},
+                    array_summary=False,
+                ),
+                allow_nan=False,
+            ),
+            flush=True,
+        )
     context["code_unchanged"] = code_hashes() == hashes
     if not args.benchmark:
-        context["calibration_unchanged"] = (digest(project.poni_path) == context["poni_sha256"]
+        poni_after = None if project.poni_path is None else digest(project.poni_path)
+        context["calibration_unchanged"] = (poni_after == context["poni_sha256"]
                                              and mask_digest(config.get("mask")) == context["mask_sha256"]
                                              and mask_digest(config.get("valid_mask")) == context["valid_mask_sha256"])
     report.write_text(json.dumps(_jsonable({"context": context, "frames": summaries}, array_summary=False),

@@ -134,20 +134,93 @@ def _declared_specifiers(root: Path, *, require_ui: bool) -> dict[str, str]:
             installed_requirements = importlib.metadata.requires("butterfly-saxs") or []
         except importlib.metadata.PackageNotFoundError:
             installed_requirements = []
+        extra_pattern = re.compile(r"""\bextra\s*==\s*['"]([^'"]+)['"]""")
         for raw in installed_requirements:
             if not isinstance(raw, str):
                 continue
-            match = requirement_pattern.match(raw)
+            base, _sep, marker = raw.partition(";")
+            extra_match = extra_pattern.search(marker) if marker else None
+            if extra_match is not None:
+                # Ignore optional extras unless the caller explicitly requested
+                # that extra (currently only ``ui``).
+                if not (require_ui and extra_match.group(1).casefold() == "ui"):
+                    continue
+            match = requirement_pattern.match(base)
             if match is None:
                 continue
             name, specifier = match.groups()
-            # Ignore optional extras when the caller did not request that
-            # extra; the core declaration is still checked below.
-            specs[name.casefold().replace("_", "-")] = specifier.strip()
+            key = name.casefold().replace("_", "-")
+            if extra_match is None or key not in specs:
+                specs[key] = specifier.strip()
     return specs
 
 
+_PEP440_RE = re.compile(
+    r"^\s*(?:(?P<epoch>\d+)!)?"
+    r"(?P<release>\d+(?:\.\d+)*)"
+    r"(?:[-_.]?(?P<pre_l>a|alpha|b|beta|rc|c|pre|preview)[-_.]?(?P<pre_n>\d*))?"
+    r"(?:[-_.]?(?:post|rev|r)[-_.]?(?P<post_n>\d*))?"
+    r"(?:[-_.]?dev[-_.]?(?P<dev_n>\d*))?"
+    r"(?:\+[^\s]+)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_fallback_version(
+    value: str,
+) -> tuple[int, tuple[int, ...], int, int, int, int] | None:
+    """Parse a PEP 440 version into a comparable tuple with pre/post/dev ordering."""
+
+    match = _PEP440_RE.match(str(value))
+    if match is None:
+        return None
+    epoch = int(match.group("epoch") or 0)
+    release = tuple(int(part) for part in match.group("release").split("."))
+    pre_label = (match.group("pre_l") or "").lower()
+    post_raw = match.group("post_n")
+    dev_raw = match.group("dev_n")
+    has_post = re.search(r"(?:post|rev|r)\d*", str(value), re.IGNORECASE) is not None and post_raw is not None
+    has_dev = re.search(r"dev\d*", str(value), re.IGNORECASE) is not None and dev_raw is not None
+    pre_num = int(match.group("pre_n") or 0) if pre_label else 0
+    post_num = int(post_raw or 0) if has_post else -1
+    dev_num = int(dev_raw or 0) if has_dev else -1
+    if pre_label in {"a", "alpha"}:
+        stage = -3
+    elif pre_label in {"b", "beta"}:
+        stage = -2
+    elif pre_label in {"rc", "c", "pre", "preview"}:
+        stage = -1
+    elif has_dev and not has_post:
+        stage = -4
+    elif has_post:
+        stage = 1
+    else:
+        stage = 0
+    return epoch, release, stage, pre_num, post_num, dev_num
+
+
+def _compare_fallback_versions(
+    left: tuple[int, tuple[int, ...], int, int, int, int],
+    right: tuple[int, tuple[int, ...], int, int, int, int],
+) -> int:
+    if left[0] != right[0]:
+        return -1 if left[0] < right[0] else 1
+    width = max(len(left[1]), len(right[1]))
+    l_rel = left[1] + (0,) * (width - len(left[1]))
+    r_rel = right[1] + (0,) * (width - len(right[1]))
+    if l_rel != r_rel:
+        return -1 if l_rel < r_rel else 1
+    l_tail = left[2:]
+    r_tail = right[2:]
+    if l_tail != r_tail:
+        return -1 if l_tail < r_tail else 1
+    return 0
+
+
 def _version_key(value: str) -> tuple[int, ...] | None:
+    parsed = _parse_fallback_version(value)
+    if parsed is not None:
+        return parsed[1]
     parts = re.findall(r"\d+", str(value))
     if not parts:
         return None
@@ -157,7 +230,25 @@ def _version_key(value: str) -> tuple[int, ...] | None:
 def _version_satisfies(version: str, specifier: str) -> bool:
     if not specifier:
         return True
-    actual = _version_key(version)
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        SpecifierSet = None  # type: ignore[assignment]
+        Version = None  # type: ignore[assignment]
+        InvalidSpecifier = ValueError  # type: ignore[assignment]
+        InvalidVersion = ValueError  # type: ignore[assignment]
+
+    if SpecifierSet is not None and Version is not None:
+        try:
+            parsed_version = Version(str(version))
+            spec_set = SpecifierSet(str(specifier))
+        except (InvalidVersion, InvalidSpecifier):
+            pass
+        else:
+            return bool(spec_set.contains(parsed_version, prereleases=None))
+
+    actual = _parse_fallback_version(version)
     if actual is None:
         return False
     for raw_clause in specifier.split(","):
@@ -168,23 +259,27 @@ def _version_satisfies(version: str, specifier: str) -> bool:
         if match is None:
             return False
         operator, target_text = match.groups()
-        target = _version_key(target_text)
+        target = _parse_fallback_version(target_text)
         if target is None:
             return False
-        if operator == "==" and actual != target:
+        cmp = _compare_fallback_versions(actual, target)
+        if operator == "==" and cmp != 0:
             return False
-        if operator == "!=" and actual == target:
+        if operator == "!=" and cmp == 0:
             return False
-        if operator == ">=" and actual < target:
+        if operator == ">=" and cmp < 0:
             return False
-        if operator == "<=" and actual > target:
+        if operator == "<=" and cmp > 0:
             return False
-        if operator == ">" and actual <= target:
+        if operator == ">" and cmp <= 0:
             return False
-        if operator == "<" and actual >= target:
+        if operator == "<" and cmp >= 0:
             return False
-        if operator == "~=" and (actual < target or actual[:1] != target[:1]):
-            return False
+        if operator == "~=":
+            prefix_len = max(1, len(target[1]) - 1)
+            padded_actual = actual[1] + (0,) * max(0, prefix_len - len(actual[1]))
+            if cmp < 0 or actual[0] != target[0] or padded_actual[:prefix_len] != target[1][:prefix_len]:
+                return False
     return True
 
 

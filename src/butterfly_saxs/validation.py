@@ -14,6 +14,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .settings import canonical_q_unit as _settings_canonical_q_unit
+
 
 ANALYSIS_DOMAIN_SCHEMA_VERSION = "lamellarsaxs2d.analysis_domain.v1"
 RESULT_SCHEMA_VERSION = "lamellarsaxs2d.result.v1"
@@ -47,23 +49,33 @@ RESULT_TOP_LEVEL_FIELDS = frozenset(
 
 _NM_INVERSE_UNITS = {
     "nm^-1",
+    "nm^−1",
+    "nm−1",
     "nm-1",
     "1/nm",
     "nm⁻¹",
+    "nm_inv",
+    "q_nm_inv",
 }
 _ANGSTROM_INVERSE_UNITS = {
     "å^-1",
+    "å^−1",
+    "å−1",
     "å-1",
     "å⁻¹",
     "a^-1",
+    "a^−1",
+    "a−1",
     "a-1",
+    "a_inv",
     "1/å",
     "1/a",
     "angstrom^-1",
     "angstrom-1",
+    "angstrom_inv",
     "1/angstrom",
 }
-_PIXEL_Q_UNITS = {"pixel-q", "pixel_q"}
+_PIXEL_Q_UNITS = {"pixel-q", "pixel_q", "pixelq", "pixel", "px"}
 
 
 class AnalysisDomainError(ValueError):
@@ -92,14 +104,14 @@ def normalise_q_arrays(
     qy_array = np.asarray(qy, dtype=float)
     q_array = np.asarray(q, dtype=float)
     source = str(q_unit or "unknown").strip()
-    token = source.casefold().replace(" ", "")
-    if token in _ANGSTROM_INVERSE_UNITS:
+    resolved = _settings_canonical_q_unit(source)
+    if resolved == "Å⁻¹":
         canonical = "nm^-1"
         factor: float | None = 10.0
-    elif token in _NM_INVERSE_UNITS:
+    elif resolved == "nm⁻¹":
         canonical = "nm^-1"
         factor = 1.0
-    elif token in _PIXEL_Q_UNITS:
+    elif resolved == "pixel-q":
         canonical = "pixel-q"
         factor = None
     else:
@@ -235,7 +247,8 @@ def validate_result_schema(result: Mapping[str, Any]) -> None:
         raise ResultSchemaError("status.solver_status is invalid")
     if status.get("numerical_status") not in {"PASS", "WARN", "FAIL", "NOT_TESTED"}:
         raise ResultSchemaError("status.numerical_status is invalid")
-    if status.get("exit_code") not in {0, 1, 2}:
+    exit_code = status.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code not in {0, 1, 2}:
         raise ResultSchemaError("status.exit_code must be 0, 1, or 2")
     for name in ("flags", "failure_reasons"):
         entries = status.get(name)

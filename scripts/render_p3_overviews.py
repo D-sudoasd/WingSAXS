@@ -57,78 +57,96 @@ def render_overviews(
 
     t1 = _json(t1_manifest)
     t1_cases = t1["cases"]
-    fig, axes = plt.subplots(3, 5, figsize=(13.5, 8.2), constrained_layout=True)
+    if not t1_cases:
+        raise ValueError("T1 manifest contains no cases")
+    t1_cols = min(5, len(t1_cases))
+    t1_rows = (len(t1_cases) + t1_cols - 1) // t1_cols
+    fig, axes = plt.subplots(
+        t1_rows, t1_cols, figsize=(2.7 * t1_cols, 2.75 * t1_rows), constrained_layout=True, squeeze=False
+    )
     t1_q_ok = True
     t1_finite = True
-    for ax, record in zip(axes.flat, t1_cases, strict=True):
-        with np.load(t1_manifest.parent / record["npz"], allow_pickle=False) as archive:
-            intensity = np.asarray(archive["intensity"])
-            mask = np.asarray(archive["mask"])
-            qx = np.asarray(archive["qx"])
-            qy = np.asarray(archive["qy"])
-            q = np.asarray(archive["q"])
-        t1_finite &= bool(np.isfinite(intensity).all())
-        t1_q_ok &= bool(np.allclose(q, np.hypot(qx, qy), rtol=1e-12, atol=1e-12))
-        ax.imshow(_display(intensity, mask), cmap=cmap, origin="lower")
-        ax.set_title(str(record["name"]), fontsize=8)
-        ax.set_xticks([])
-        ax.set_yticks([])
-    fig.suptitle("P3 / T1 same-model synthetic matrix (log display; masks black)", fontsize=13)
     t1_output = output / "t1_overview.png"
-    fig.savefig(t1_output, dpi=200)
-    plt.close(fig)
+    try:
+        for ax, record in zip(axes.flat, t1_cases):
+            with np.load(t1_manifest.parent / record["npz"], allow_pickle=False) as archive:
+                intensity = np.asarray(archive["intensity"])
+                mask = np.asarray(archive["mask"])
+                qx = np.asarray(archive["qx"])
+                qy = np.asarray(archive["qy"])
+                q = np.asarray(archive["q"])
+            t1_finite &= bool(np.isfinite(intensity).all())
+            t1_q_ok &= bool(np.allclose(q, np.hypot(qx, qy), rtol=1e-12, atol=1e-12))
+            ax.imshow(_display(intensity, mask), cmap=cmap, origin="lower")
+            ax.set_title(str(record["name"]), fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        for ax in list(axes.flat)[len(t1_cases) :]:
+            ax.set_axis_off()
+        fig.suptitle("P3 / T1 same-model synthetic matrix (log display; masks black)", fontsize=13)
+        fig.savefig(t1_output, dpi=200)
+    finally:
+        plt.close(fig)
 
     t2 = _json(t2_manifest)
     t2_cases = t2["cases"]
-    fig, axes = plt.subplots(2, 4, figsize=(12.5, 6.3), constrained_layout=True)
+    if not t2_cases:
+        raise ValueError("T2 manifest contains no cases")
+    fig, axes = plt.subplots(
+        2, len(t2_cases), figsize=(3.125 * len(t2_cases), 6.3), constrained_layout=True, squeeze=False
+    )
     t2_q_ok = True
     t2_nonnegative = True
-    for column, record in enumerate(t2_cases):
-        with np.load(t2_manifest.parent / record["npz_file"], allow_pickle=False) as archive:
-            density = np.asarray(archive["real_space_density"])
-            intensity = np.asarray(archive["intensity_noiseless"])
-            mask = np.asarray(archive["mask"])
-            qx = np.asarray(archive["qx"])
-            qy = np.asarray(archive["qy"])
-            q = np.asarray(archive["q"])
-            reference = np.asarray(archive["projection_reference"])
-        t2_nonnegative &= bool(np.isfinite(intensity).all() and np.all(intensity >= 0))
-        t2_q_ok &= bool(np.allclose(q, np.hypot(qx, qy), rtol=1e-12, atol=1e-12))
-        axes[0, column].imshow(density, cmap="gray", origin="lower")
-        axes[0, column].set_title(f"{record['category']} / real space", fontsize=9)
-        extent = [float(qx.min()), float(qx.max()), float(qy.min()), float(qy.max())]
-        axes[1, column].imshow(
-            _display(intensity, mask), cmap=cmap, origin="lower", extent=extent
-        )
-        axes[1, column].scatter(
-            reference[:, 0], reference[:, 1], s=3, c="cyan", alpha=0.55, linewidths=0
-        )
-        q_crop = max(0.75, 1.25 * float(np.max(np.abs(reference))))
-        axes[1, column].set_xlim(-q_crop, q_crop)
-        axes[1, column].set_ylim(-q_crop, q_crop)
-        axes[1, column].set_title("central FFT q + projection reference", fontsize=9)
-        for row in range(2):
-            axes[row, column].set_xticks([])
-            axes[row, column].set_yticks([])
-    fig.suptitle("P3 / T2 independent real-space lamellae + FFT", fontsize=13)
     t2_output = output / "t2_overview.png"
-    fig.savefig(t2_output, dpi=200)
-    plt.close(fig)
+    try:
+        for column, record in enumerate(t2_cases):
+            with np.load(t2_manifest.parent / record["npz_file"], allow_pickle=False) as archive:
+                density = np.asarray(archive["real_space_density"])
+                intensity = np.asarray(archive["intensity_noiseless"])
+                mask = np.asarray(archive["mask"])
+                qx = np.asarray(archive["qx"])
+                qy = np.asarray(archive["qy"])
+                q = np.asarray(archive["q"])
+                reference = np.asarray(archive["projection_reference"])
+            t2_nonnegative &= bool(np.isfinite(intensity).all() and np.all(intensity >= 0))
+            t2_q_ok &= bool(np.allclose(q, np.hypot(qx, qy), rtol=1e-12, atol=1e-12))
+            axes[0, column].imshow(density, cmap="gray", origin="lower")
+            axes[0, column].set_title(f"{record['category']} / real space", fontsize=9)
+            extent = [float(qx.min()), float(qx.max()), float(qy.min()), float(qy.max())]
+            axes[1, column].imshow(
+                _display(intensity, mask), cmap=cmap, origin="lower", extent=extent
+            )
+            axes[1, column].scatter(
+                reference[:, 0], reference[:, 1], s=3, c="cyan", alpha=0.55, linewidths=0
+            )
+            q_crop = max(0.75, 1.25 * float(np.max(np.abs(reference)))) if reference.size else 0.75
+            axes[1, column].set_xlim(-q_crop, q_crop)
+            axes[1, column].set_ylim(-q_crop, q_crop)
+            axes[1, column].set_title("central FFT q + projection reference", fontsize=9)
+            for row in range(2):
+                axes[row, column].set_xticks([])
+                axes[row, column].set_yticks([])
+        fig.suptitle("P3 / T2 independent real-space lamellae + FFT", fontsize=13)
+        fig.savefig(t2_output, dpi=200)
+    finally:
+        plt.close(fig)
 
     annotation = _json(annotation_status)
     png_paths = sorted((annotation_status.parent / "blind_payload").glob("blind_*.png"))
     if len(png_paths) != 8:
         raise ValueError(f"盲标 PNG 应为 8 张，实际为 {len(png_paths)}")
     fig, axes = plt.subplots(2, 4, figsize=(12.5, 6.5), constrained_layout=True)
-    for ax, path in zip(axes.flat, png_paths, strict=True):
-        ax.imshow(mpimg.imread(path))
-        ax.set_title(path.stem, fontsize=10)
-        ax.set_xticks([])
-        ax.set_yticks([])
-    fig.suptitle("R0 blind annotation pack (no fit overlays)", fontsize=13)
     annotation_output = output / "r0_annotation_overview.png"
-    fig.savefig(annotation_output, dpi=200)
-    plt.close(fig)
+    try:
+        for ax, path in zip(axes.flat, png_paths, strict=True):
+            ax.imshow(mpimg.imread(path))
+            ax.set_title(path.stem, fontsize=10)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        fig.suptitle("R0 blind annotation pack (no fit overlays)", fontsize=13)
+        fig.savefig(annotation_output, dpi=200)
+    finally:
+        plt.close(fig)
 
     input_hashes = annotation.get("input_hashes", [])
     report = {

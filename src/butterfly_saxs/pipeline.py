@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import threading
 import weakref
 
 import numpy as np
@@ -143,15 +144,17 @@ def _jsonable(value: Any, *, array_summary: bool = True) -> Any:
 
     if isinstance(value, np.ndarray):
         if array_summary:
-            finite = np.asarray(value)[np.isfinite(value)] if value.size else np.asarray([])
             summary: dict[str, Any] = {
                 "shape": list(value.shape),
                 "dtype": str(value.dtype),
             }
-            if finite.size:
-                summary.update(min=float(np.min(finite)), max=float(np.max(finite)))
+            if value.size and value.dtype.kind in "biuf":
+                arr = np.asarray(value)
+                finite = arr[np.isfinite(arr)] if value.dtype.kind == "f" else arr.ravel()
+                if finite.size:
+                    summary.update(min=float(np.min(finite)), max=float(np.max(finite)))
             return summary
-        return value.tolist()
+        return _jsonable(value.tolist(), array_summary=False)
     if isinstance(value, np.generic):
         # Recurse so np.float32/64 NaN and infinities receive the same strict
         # JSON treatment as native Python floats.
@@ -160,9 +163,12 @@ def _jsonable(value: Any, *, array_summary: bool = True) -> Any:
         return os.fspath(value)
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item, array_summary=array_summary) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, (list, tuple)):
         return [_jsonable(item, array_summary=array_summary) for item in value]
-    if is_dataclass(value):
+    if isinstance(value, (set, frozenset)):
+        converted = [_jsonable(item, array_summary=array_summary) for item in value]
+        return sorted(converted, key=lambda item: (type(item).__name__, repr(item)))
+    if is_dataclass(value) and not isinstance(value, type):
         return _jsonable(asdict(value), array_summary=array_summary)
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -2098,8 +2104,9 @@ def _beamstop_exclusion_mask(
         round(float(beam_center_xy[1]), 6),
         round(float(radius_px), 6),
     )
-    if isinstance(geometry_cache, Mapping) and cache_key in geometry_cache:
-        cached = geometry_cache[cache_key]
+    if isinstance(geometry_cache, Mapping):
+        with _GEOMETRY_CACHE_LOCK:
+            cached = geometry_cache.get(cache_key)
         if isinstance(cached, np.ndarray) and cached.shape == shape:
             return cached
 
@@ -2124,7 +2131,8 @@ def _beamstop_exclusion_mask(
         exclusion = ((xx - cx) ** 2 + (yy - cy) ** 2) <= (float(radius_px) ** 2)
 
     if isinstance(geometry_cache, dict):
-        geometry_cache[cache_key] = exclusion
+        with _GEOMETRY_CACHE_LOCK:
+            geometry_cache[cache_key] = exclusion
     return exclusion
 
 
@@ -2742,7 +2750,11 @@ def analyze_frame(
                 cache_key = (os.fspath(selected_poni), image.shape)
         else:
             cache_key = (id(selected_poni), image.shape)
-        base_qmap = geometry_cache.get(cache_key) if isinstance(geometry_cache, Mapping) else None
+        if isinstance(geometry_cache, Mapping):
+            with _GEOMETRY_CACHE_LOCK:
+                base_qmap = geometry_cache.get(cache_key)
+        else:
+            base_qmap = None
         if base_qmap is None:
             base_qmap = build_qmap(
                 image,
@@ -2751,7 +2763,8 @@ def analyze_frame(
                 valid_mask=None,
             )
             if isinstance(geometry_cache, dict):
-                geometry_cache[cache_key] = base_qmap
+                with _GEOMETRY_CACHE_LOCK:
+                    geometry_cache[cache_key] = base_qmap
         qmap_obj = build_qmap(
             image,
             qmap=base_qmap,
@@ -3109,6 +3122,7 @@ def export_result(
                 json.dumps(
                     _jsonable(result.observables, array_summary=False),
                     ensure_ascii=False,
+                    allow_nan=False,
                 )
             )
             np.savez_compressed(path, **arrays)
@@ -3170,6 +3184,7 @@ def _expand_inputs(inputs: Iterable[Any]) -> list[Any]:
     return expanded
 
 
+_GEOMETRY_CACHE_LOCK = threading.Lock()
 _WORKER_GEOMETRY_CACHE: dict[Any, Any] = {}
 
 
@@ -3472,34 +3487,45 @@ def _run_project_bounded(
             resume=resume,
         )
 
-    def analyze_for_project(
-        frame_ref: FrameRef,
-        initial_parameters: Any = None,
-        config: Any = None,
-    ) -> PipelineResult:
-        active_config = config if config is not None else batch_config
-        result = analyze_frame(
-            frame_ref.path,
-            poni=project_config.poni_path,
-            config=active_config,
+    use_picklable_analyzer = int(max_workers) > 1 and mode == "independent"
+    if use_picklable_analyzer:
+        analyze_for_project: Any = _BatchFrameAnalyzer(
+            poni=None if project_config.poni_path is None else os.fspath(project_config.poni_path),
             full2d=project_config.full2d,
-            initial_parameters=initial_parameters,
-            frame=frame_ref.frame_selector,
-            dataset=frame_ref.dataset_id or None,
-            geometry_cache=geometry_cache,
+            destination=None if stream_writer is not None else os.fspath(destination),
+            force=bool(force or resume),
+            resume=resume,
+            stem_counts=project_stem_counts,
         )
-        if isinstance(result.metadata, Mapping):
-            result.metadata["frame_id"] = frame_ref.id
-            if project_stem_counts.get(frame_ref.path.stem.casefold(), 0) > 1:
-                result.metadata["source_parent_token"] = frame_ref.path.parent.name
-            if frame_ref.source is not None:
-                result.metadata["series"] = frame_ref.source
-        if stream_writer is None:
-            result.output_paths = [
-                os.fspath(path)
-                for path in export_result(result, destination, force=bool(force or resume))
-            ]
-        return result
+    else:
+        def analyze_for_project(
+            frame_ref: FrameRef,
+            initial_parameters: Any = None,
+            config: Any = None,
+        ) -> PipelineResult:
+            active_config = config if config is not None else batch_config
+            result = analyze_frame(
+                frame_ref.path,
+                poni=project_config.poni_path,
+                config=active_config,
+                full2d=project_config.full2d,
+                initial_parameters=initial_parameters,
+                frame=frame_ref.frame_selector,
+                dataset=frame_ref.dataset_id or None,
+                geometry_cache=geometry_cache,
+            )
+            if isinstance(result.metadata, Mapping):
+                result.metadata["frame_id"] = frame_ref.id
+                if project_stem_counts.get(frame_ref.path.stem.casefold(), 0) > 1:
+                    result.metadata["source_parent_token"] = frame_ref.path.parent.name
+                if frame_ref.source is not None:
+                    result.metadata["series"] = frame_ref.source
+            if stream_writer is None:
+                result.output_paths = [
+                    os.fspath(path)
+                    for path in export_result(result, destination, force=bool(force or resume))
+                ]
+            return result
     try:
         run = run_batch_frames(
             values,
@@ -3538,7 +3564,7 @@ def _run_project_bounded(
         if stream_writer is not None:
             stream_writer.finalize(run)
         return run
-    except Exception:
+    except BaseException:
         if stream_writer is not None:
             stream_writer.abort()
         raise

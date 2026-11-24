@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 import copy
+import math
 import os
 import tempfile
 import tomllib
@@ -180,11 +181,12 @@ class ProjectConfig:
         export_group = _copy_mapping(root.pop("export", None), name="export")
         metadata_group = _copy_mapping(root.pop("metadata", None), name="metadata")
 
-        # Merge in increasing precedence: project defaults, dedicated groups,
-        # then flat keys.  Flat keys are convenient for tiny programmatic TOML.
+        # Merge in increasing precedence: project defaults, I/O groups,
+        # then flat keys.  Keep [analysis] and [export] in their own sections
+        # so analysis/export knobs never leak into ``metadata``.
         merged: dict[str, Any] = {}
         merged.update(project)
-        for group in (inputs_group, input_group, output_group, analysis_group, export_group):
+        for group in (inputs_group, input_group, output_group):
             merged.update(group)
         merged.update(root)
 
@@ -230,11 +232,11 @@ class ProjectConfig:
             "mask_frame",
             "mask_dataset",
         ):
-            if key in analysis:
-                continue
             source_group = input_group if key in input_group else inputs_group
             if key in source_group:
-                analysis[key] = copy.deepcopy(source_group[key])
+                if key not in analysis:
+                    analysis[key] = copy.deepcopy(source_group[key])
+                merged.pop(key, None)
         # Flat project knobs not consumed above are retained in analysis when
         # explicitly supplied by the [project] group.
         for key in (
@@ -255,7 +257,7 @@ class ProjectConfig:
             if key in merged:
                 analysis[key] = merged.pop(key)
 
-        export = _copy_mapping(data.get("export"), name="export")
+        export = export_group
         metadata = _copy_mapping(data.get("metadata"), name="metadata")
         metadata.update(metadata_group)
         # Preserve a project name/description and unknown values, rather than
@@ -362,26 +364,72 @@ def load_project(path: str | os.PathLike[str]) -> ProjectConfig:
     return ProjectConfig.from_mapping(data)
 
 
+def _escape_toml_string(text: str) -> str:
+    """Escape a Python string as the body of a TOML 1.0 basic string."""
+
+    parts: list[str] = []
+    for char in text:
+        if char == "\\":
+            parts.append("\\\\")
+        elif char == '"':
+            parts.append('\\"')
+        elif char == "\b":
+            parts.append("\\b")
+        elif char == "\t":
+            parts.append("\\t")
+        elif char == "\n":
+            parts.append("\\n")
+        elif char == "\f":
+            parts.append("\\f")
+        elif char == "\r":
+            parts.append("\\r")
+        else:
+            code = ord(char)
+            if code < 0x20 or code == 0x7F:
+                parts.append(f"\\u{code:04x}")
+            else:
+                parts.append(char)
+    return "".join(parts)
+
+
+def _is_bare_toml_key(key: str) -> bool:
+    return bool(key) and all(
+        ("a" <= char <= "z") or ("A" <= char <= "Z") or ("0" <= char <= "9") or char in "-_"
+        for char in key
+    )
+
+
 def _toml_key(value: Any) -> str:
-    """Return a deterministic TOML key for inline tables."""
+    """Return a deterministic TOML key, quoting whenever non-bare."""
 
     key = str(value)
-    if key and all(char.isalnum() or char in "-_" for char in key):
+    if _is_bare_toml_key(key):
         return key
-    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return f'"{_escape_toml_string(key)}"'
 
 
 def _toml_value(value: Any) -> str:
+    # Unwrap NumPy scalars before Python int/float checks (np.float64 subclasses float).
+    if (
+        type(value).__module__.split(".", 1)[0] == "numpy"
+        and not isinstance(value, (list, tuple, Mapping))
+        and getattr(value, "ndim", 0) == 0
+        and callable(getattr(value, "item", None))
+    ):
+        value = value.item()
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return repr(value)
+    if isinstance(value, int):
+        return repr(int(value))
+    if isinstance(value, float):
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ProjectConfigError(f"TOML 项目配置不支持非有限数值：{value!r}")
+        return repr(numeric)
     if isinstance(value, os.PathLike):
         return _toml_value(os.fspath(value))
     if isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-        return f'"{escaped}"'
+        return f'"{_escape_toml_string(value)}"'
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     if isinstance(value, Mapping):
@@ -403,7 +451,7 @@ def _emit_table(lines: list[str], name: str, values: Mapping[str, Any]) -> None:
     scalars: list[tuple[str, Any]] = []
     nested: list[tuple[str, Mapping[str, Any]]] = []
     for key, value in values.items():
-        if not isinstance(key, str) or not key or any(char in key for char in " \t\r\n."):
+        if not isinstance(key, str) or not key:
             raise ProjectConfigError(f"TOML 键名无效：{key!r}")
         if isinstance(value, Mapping):
             nested.append((key, value))
@@ -412,10 +460,10 @@ def _emit_table(lines: list[str], name: str, values: Mapping[str, Any]) -> None:
     if scalars:
         lines.append(f"[{name}]")
         for key, value in scalars:
-            lines.append(f"{key} = {_toml_value(value)}")
+            lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
         lines.append("")
     for key, value in nested:
-        _emit_table(lines, f"{name}.{key}", value)
+        _emit_table(lines, f"{name}.{_toml_key(key)}", value)
 
 
 def save_project(

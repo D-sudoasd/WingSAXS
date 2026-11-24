@@ -1345,11 +1345,41 @@ def _handle_batch(args: argparse.Namespace) -> int:
         _validate_report_options(args.report_radial_bins, args.report_angular_bins)
     config = _with_analysis(_config(args.config), _analysis_overrides(args))
     output_dir = Path(args.output or (config.output_dir if config else "results"))
+    analysis = config.analysis if config is not None else {}
+    manifest = args.manifest or analysis.get("manifest")
+    raw_inputs = list(args.inputs)
+    if not raw_inputs and config:
+        raw_inputs = list(config.input_paths)
+    if not raw_inputs and not manifest:
+        raise PipelineError("batch 没有输入；请提供路径、--manifest 或 TOML 的 inputs.files")
+    if isinstance(manifest, (str, os.PathLike)):
+        manifest_candidate = Path(manifest).expanduser()
+        if not manifest_candidate.is_file():
+            with manifest_candidate.open("rb"):
+                pass
     if args.unattended is not None:
+        if not args.output and not (config and config.output_dir):
+            raise PipelineError("unattended batch requires an explicit output directory")
+        poni_precheck = args.poni or (config.poni_path if config else None)
+        if poni_precheck is None:
+            raise PipelineError("unattended batch requires a PONI calibration")
         package_root = Path(args.unattended).expanduser().resolve(strict=False)
         output_root = output_dir.expanduser().resolve(strict=False)
         if output_root == package_root or output_root.is_relative_to(package_root):
             raise PipelineError("unattended output must be outside the raw package")
+    cli_slice_precheck = (
+        args.start is not None or args.stop is not None or args.stride is not None
+    )
+    if args.frame_range is not None and cli_slice_precheck:
+        raise PipelineError("frame_range cannot be combined with start/stop/stride")
+    resume_precheck = bool(args.resume or analysis.get("resume", False))
+    if (
+        output_dir.exists()
+        and any(path.name != ".wingsaxs.lock" for path in output_dir.iterdir())
+        and not args.force
+        and not resume_precheck
+    ):
+        raise FileExistsError(f"输出目录已有内容，未覆盖：{output_dir}（需要 --force）")
     with output_lock(output_dir, create=True):
         return _handle_batch_locked(args, config, lamellar_settings)
 
@@ -1390,28 +1420,39 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
     resume = bool(args.resume or analysis.get("resume", False))
     unattended = args.unattended is not None
     series = args.series if args.series is not None else analysis.get("series")
-    start = args.start if args.start is not None else analysis.get("start")
-    stop = args.stop if args.stop is not None else analysis.get("stop")
-    explicit_sequence = (
+    cli_slice = (
         args.start is not None
         or args.stop is not None
         or args.stride is not None
-        or args.frame_range is not None
     )
-    if explicit_sequence:
-        start = args.start if args.start is not None else analysis.get("start")
-        stop = args.stop if args.stop is not None else analysis.get("stop")
-        stride = args.stride if args.stride is not None else analysis.get("stride", 1)
-        frame_range = args.frame_range if args.frame_range is not None else analysis.get("frame_range")
+    cli_range = args.frame_range is not None
+    if cli_range and cli_slice:
+        start = args.start
+        stop = args.stop
+        stride = args.stride if args.stride is not None else 1
+        frame_range = args.frame_range
+    elif cli_range:
+        # CLI --range overrides any TOML start/stop/stride defaults.
+        start = None
+        stop = None
+        stride = 1
+        frame_range = args.frame_range
+    elif cli_slice:
+        # CLI --start/--stop/--stride overrides any TOML frame_range default.
+        if analysis.get("frame_range") is not None:
+            start = args.start
+            stop = args.stop
+            stride = args.stride if args.stride is not None else 1
+        else:
+            start = args.start if args.start is not None else analysis.get("start")
+            stop = args.stop if args.stop is not None else analysis.get("stop")
+            stride = args.stride if args.stride is not None else analysis.get("stride", 1)
+        frame_range = None
     else:
         start = analysis.get("start")
         stop = analysis.get("stop")
         stride = analysis.get("stride", 1)
-        frame_range = (
-            args.frame_range
-            if args.frame_range is not None
-            else analysis.get("frame_range")
-        )
+        frame_range = analysis.get("frame_range")
     output_dir = Path(args.output or (config.output_dir if config else "results"))
     poni = args.poni or (config.poni_path if config else None)
     if unattended:
@@ -1457,14 +1498,17 @@ def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None,
             source_path = path_analysis.get(name)
             if isinstance(source_path, (str, os.PathLike)):
                 path_analysis[name] = _unattended_source_path(source_path, package_root)
-    if explicit_sequence and frame_range is None:
+    if cli_slice and not cli_range:
         path_analysis.pop("frame_range", None)
+    elif cli_range and not cli_slice:
+        for key in ("start", "stop", "stride"):
+            path_analysis.pop(key, None)
     for name, value in (
         ("series", args.series),
-        ("start", args.start),
-        ("stop", args.stop),
-        ("stride", stride if explicit_sequence else None),
-        ("frame_range", frame_range if explicit_sequence else None),
+        ("start", start if cli_slice else None),
+        ("stop", stop if cli_slice else None),
+        ("stride", stride if cli_slice else None),
+        ("frame_range", frame_range if cli_range else None),
     ):
         if value is not None:
             path_analysis[name] = value
@@ -2233,8 +2277,9 @@ def _handle_project(args: argparse.Namespace) -> int:
     run = project_runner(args.config, force=args.force)
     compact_records = []
     for item in run.frame_results:
-        record = item.to_record()
-        if hasattr(item.result, "to_mapping"):
+        has_to_mapping = hasattr(item.result, "to_mapping")
+        record = item.to_record(include_result=not has_to_mapping)
+        if has_to_mapping:
             record["result"] = item.result.to_mapping()
         compact_records.append(record)
     has_warnings = any(item.status == "warning" for item in run.frame_results)

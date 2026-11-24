@@ -861,7 +861,7 @@ def load_campaign_config(path: str | os.PathLike[str]) -> dict[str, Any]:
                 "series": merged.get("series"),
                 "start": merged.get("start"),
                 "stop": merged.get("stop"),
-                "stride": int(merged.get("stride", 1)),
+                "stride": strict_int(merged.get("stride", 1), f"samples[{name!r}].stride", minimum=1),
                 "frame_range": merged.get("frame_range", merged.get("range")),
                 "beamstop_radius_px": sample_beamstop,
                 "deduplicate_identical_frames": sample_dedup,
@@ -931,6 +931,18 @@ def _run_sample_batch(
         )
         if not discovered:
             raise ValueError(f"no supported frames discovered in {sample['input_dir']}")
+        if sample.get("frame") is not None:
+            requested_frame = strict_int(sample["frame"], f"samples[{sample.get('name', '')!r}].frame", minimum=0)
+            filtered = [
+                row
+                for row in discovered
+                if (row.get("frame") is None) or int(row["frame"]) == requested_frame
+            ]
+            if not filtered:
+                raise ValueError(
+                    f"requested frame={requested_frame} not found in discovered frames for {sample['input_dir']}"
+                )
+            discovered = filtered
         manifest = discovered
 
     poni = sample.get("poni")
@@ -953,14 +965,14 @@ def _run_sample_batch(
 
     def analyze_for_sample(frame_ref: Any, initial_parameters: Any = None, cfg: Any = None) -> Any:
         source = getattr(frame_ref, "path", frame_ref)
-        selected_frame = sample.get("frame")
+        selected_frame = getattr(frame_ref, "frame_selector", None)
         if selected_frame is None:
-            selected_frame = getattr(frame_ref, "frame_selector", None)
-        selected_dataset = sample.get("dataset")
+            selected_frame = sample.get("frame")
+        selected_dataset = getattr(frame_ref, "dataset", None)
         if selected_dataset is None:
-            selected_dataset = getattr(frame_ref, "dataset", None)
-            if selected_dataset is None:
-                selected_dataset = getattr(frame_ref, "dataset_id", None) or None
+            selected_dataset = getattr(frame_ref, "dataset_id", None) or None
+        if selected_dataset is None:
+            selected_dataset = sample.get("dataset")
         return pipeline_module.analyze_frame(
             source,
             poni=poni,
@@ -1161,6 +1173,8 @@ def _run_sample_worker(
         return _format_sample_record(
             sample, sample_dir, outcome, time.monotonic() - sample_start
         )
+    except AnalysisCancelled:
+        raise
     except Exception as exc:  # noqa: BLE001 - isolate sample failure inside worker
         return _format_sample_error_record(
             sample,
@@ -1206,8 +1220,44 @@ def run_campaign(
         else None
     )
     out_root = Path(output_root).expanduser()
-    if out_root.exists() and any(out_root.iterdir()) and not force:
+    if (
+        out_root.exists()
+        and any(path.name != ".wingsaxs.lock" for path in out_root.iterdir())
+        and not force
+    ):
         raise FileExistsError(f"输出目录已有内容，未覆盖：{out_root}（需要 --force）")
+    from .output_lock import output_lock
+
+    with output_lock(out_root, create=True):
+        return _run_campaign_locked(
+            config=config,
+            out_root=out_root,
+            started=started,
+            effective_workers=effective_workers,
+            override_beamstop=override_beamstop,
+            force=force,
+            continue_on_error=continue_on_error,
+            report=report,
+            journal_style=journal_style,
+            progress=progress,
+            deduplicate_identical_frames=deduplicate_identical_frames,
+        )
+
+
+def _run_campaign_locked(
+    *,
+    config: dict[str, Any],
+    out_root: Path,
+    started: float,
+    effective_workers: int,
+    override_beamstop: float | str | None,
+    force: bool,
+    continue_on_error: bool,
+    report: bool | None,
+    journal_style: str | None,
+    progress: Callable[[str], None] | None,
+    deduplicate_identical_frames: bool | None,
+) -> dict[str, Any]:
     out_root.mkdir(parents=True, exist_ok=True)
 
     # Pre-assign deterministic collision-free output directories in manifest order.
@@ -1258,6 +1308,8 @@ def run_campaign(
                     idx, sample, sample_dir = future_map[fut]
                     try:
                         record = fut.result()
+                    except AnalysisCancelled:
+                        raise
                     except Exception as exc:  # noqa: BLE001 - isolate worker crash
                         record = _format_sample_error_record(
                             sample, sample_dir, type(exc).__name__, str(exc), 0.0

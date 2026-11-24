@@ -249,7 +249,9 @@ def _dataset_metadata_gaps(dataset: dict[str, Any]) -> list[str]:
     q_unit = _get_value(dataset, "calibration.q_unit")
     allowed_q_units = {
         "nm^-1",
+        "nm⁻¹",
         "Å^-1",
+        "Å⁻¹",
         "angstrom^-1",
         "A^-1",
         "1/nm",
@@ -359,9 +361,9 @@ def audit_manifest(manifest_path: str | Path, base_dir: str | Path | None = None
         item["status"] in {"pending_path", "exists_unhashed"} for item in references
     )
     pending_status_count = int(manifest.get("manifest_status", "pending") != "complete")
-    pending_status_count += sum(item["status"] != "complete" for item in manifest["datasets"])
+    pending_status_count += sum(item.get("status", "pending") != "complete" for item in manifest["datasets"])
     pending_status_count += sum(
-        item["status"] != "complete" for item in manifest["independent_user_sessions"]
+        item.get("status", "pending") != "complete" for item in manifest["independent_user_sessions"]
     )
     warning_count = (
         len(reference_errors)

@@ -488,13 +488,13 @@ def _render_png(
     ellipses: Iterable[np.ndarray] = (),
     model_ellipses: Iterable[np.ndarray] = (),
 ) -> bytes:
-    import matplotlib
-
-    matplotlib.use("Agg", force=True)
-    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
 
     image = np.where(valid, array, np.nan)
-    figure, axis = plt.subplots(figsize=(5.0, 4.4), constrained_layout=True)
+    figure = Figure(figsize=(5.0, 4.4), layout="constrained")
+    FigureCanvasAgg(figure)
+    axis = figure.add_subplot(1, 1, 1)
     try:
         extent = _extent(qx, qy, valid)
         cmap = "PuOr" if residual else "cividis"
@@ -532,7 +532,7 @@ def _render_png(
         figure.savefig(output, format="png", dpi=300, bbox_inches="tight")
         return output.getvalue()
     finally:
-        plt.close(figure)
+        figure.clear()
 
 
 def _csv_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:

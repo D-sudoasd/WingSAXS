@@ -16,6 +16,7 @@ import inspect
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Any
 
 import numpy as np
@@ -1197,6 +1198,7 @@ class ButterflyAnalysisService:
         # for every frame.  Cache only the immutable geometry arrays; per-frame
         # validity masks are attached as a lightweight mapping below.
         self._geometry_cache: dict[tuple[tuple[int, int], int], Any] = {}
+        self._geometry_cache_lock = threading.Lock()
         self._parameter_specs = _parameter_specs(parameters, self.DEFAULT_PARAMETER_SPECS)
         self._analysis_settings = _validated_analysis_settings(analysis_settings)
         if poni is not None and not (
@@ -1204,6 +1206,38 @@ class ButterflyAnalysisService:
             and poni.strip().casefold() in {"in-memory", "in_memory"}
         ):
             self.set_poni(poni)
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return a restorable snapshot of document state without exposing private attributes."""
+
+        with self._geometry_cache_lock:
+            geometry_cache = dict(self._geometry_cache)
+        return {
+            "poni_path": self.poni_path,
+            "poni": self._poni,
+            "loaded": self._loaded,
+            "qmap": self._qmap,
+            "analysis_settings": deepcopy(self._analysis_settings),
+            "parameter_specs": deepcopy(self._parameter_specs),
+            "geometry_cache": geometry_cache,
+        }
+
+    def restore_state(self, state: Mapping[str, Any]) -> None:
+        """Restore document state previously captured via :meth:`snapshot_state`."""
+
+        if not isinstance(state, Mapping):
+            raise TypeError("state must be a mapping returned by snapshot_state()")
+        self.poni_path = state.get("poni_path")
+        self._poni = state.get("poni")
+        self._loaded = state.get("loaded")
+        self._qmap = state.get("qmap")
+        if "analysis_settings" in state and isinstance(state["analysis_settings"], Mapping):
+            self._analysis_settings = deepcopy(dict(state["analysis_settings"]))
+        if "parameter_specs" in state and isinstance(state["parameter_specs"], Mapping):
+            self._parameter_specs = deepcopy(dict(state["parameter_specs"]))
+        if "geometry_cache" in state and isinstance(state["geometry_cache"], Mapping):
+            with self._geometry_cache_lock:
+                self._geometry_cache = dict(state["geometry_cache"])
 
     @property
     def parameters(self) -> dict[str, dict[str, Any]]:
@@ -1237,26 +1271,43 @@ class ButterflyAnalysisService:
     def set_poni(self, poni: str | Path | Any | None) -> Any:
         if poni is None:
             self.poni_path, self._poni = None, None
-            self._geometry_cache.clear()
-            return None
+            with self._geometry_cache_lock:
+                self._geometry_cache.clear()
+            if self._loaded is not None:
+                self._qmap = self._fallback_qmap(
+                    self._loaded.data.shape, valid_mask=self._loaded.valid_mask
+                )
+            else:
+                self._qmap = None
+            return self._qmap
         from .geometry import load_poni
 
         candidate = load_poni(poni)
-        self._geometry_cache.clear()
+        candidate_path = str(poni) if isinstance(poni, (str, Path)) else "in-memory"
         candidate_qmap = self._qmap
+        keep_key: tuple[tuple[int, int], Any] | None = None
         if self._loaded is not None:
-            # Validate shape/rotations before changing document state.  A
-            # mismatched PONI must remain an explicit error in the UI.
+            # Validate shape/rotations before changing document state or clearing
+            # cached geometry.  A mismatched PONI must remain an explicit error.
             candidate_qmap = self._geometry_for(
                 self._loaded.data.shape,
                 candidate,
                 valid_mask=self._loaded.valid_mask,
-                calibration_identity=(
-                    str(poni) if isinstance(poni, (str, Path)) else "in-memory"
-                ),
+                calibration_identity=candidate_path,
             )
+            keep_key = (
+                tuple(int(item) for item in self._loaded.data.shape),
+                candidate_path
+                if candidate_path.casefold() not in {"in-memory", "in_memory"}
+                else id(candidate),
+            )
+        with self._geometry_cache_lock:
+            kept = self._geometry_cache.get(keep_key) if keep_key is not None else None
+            self._geometry_cache.clear()
+            if keep_key is not None and kept is not None:
+                self._geometry_cache[keep_key] = kept
         self._poni = candidate
-        self.poni_path = str(poni) if isinstance(poni, (str, Path)) else "in-memory"
+        self.poni_path = candidate_path
         self._qmap = candidate_qmap
         return self._qmap
 
@@ -1277,10 +1328,12 @@ class ButterflyAnalysisService:
             tuple(int(item) for item in shape),
             identity if identity and identity.casefold() not in {"in-memory", "in_memory"} else id(poni),
         )
-        base = self._geometry_cache.get(key)
+        with self._geometry_cache_lock:
+            base = self._geometry_cache.get(key)
         if base is None:
             base = build_geometry(shape, poni)
-            self._geometry_cache[key] = base
+            with self._geometry_cache_lock:
+                self._geometry_cache[key] = base
         if valid_mask is None:
             return base
         valid = np.asarray(valid_mask, dtype=bool)
@@ -1321,7 +1374,7 @@ class ButterflyAnalysisService:
             result["mask"] = ~valid
         return result
 
-    def load_image(
+    def _load_image_state(
         self,
         path: str | Path,
         *,
@@ -1332,9 +1385,12 @@ class ButterflyAnalysisService:
         mask_frame: int | None = None,
         mask_dataset: str | None = None,
         poni: str | Path | Any | None = None,
+        base_poni: Any = None,
+        base_poni_path: str | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
-        candidate_poni = self._poni
-        candidate_poni_path = self.poni_path
+        candidate_poni = self._poni if commit else base_poni
+        candidate_poni_path = self.poni_path if commit else base_poni_path
         if poni is not None and not (
             isinstance(poni, str)
             and poni.strip().casefold() in {"in-memory", "in_memory"}
@@ -1385,13 +1441,45 @@ class ButterflyAnalysisService:
                     f"external_mask shape {mask_array.shape} does not match image shape {loaded.data.shape}"
                 )
             payload["external_mask"] = np.asarray(mask_array != 0, dtype=bool)
-        # Commit document state only after every dependent input has passed
-        # shape and selector validation.
-        self._poni = candidate_poni
-        self.poni_path = candidate_poni_path
-        self._loaded = loaded
-        self._qmap = qmap
+        if commit:
+            # Commit document state only after every dependent input has passed
+            # shape and selector validation.
+            self._poni = candidate_poni
+            self.poni_path = candidate_poni_path
+            self._loaded = loaded
+            self._qmap = qmap
         return payload
+
+    _UNSET = object()
+
+    def load_image(
+        self,
+        path: str | Path,
+        *,
+        frame: int | None = None,
+        dataset: str | None = None,
+        valid_mask: Any | None = None,
+        external_mask: Any | None = None,
+        mask_frame: int | None = None,
+        mask_dataset: str | None = None,
+        poni: str | Path | Any | None = None,
+        commit: bool = True,
+        base_poni: Any = _UNSET,
+        base_poni_path: str | None | Any = _UNSET,
+    ) -> dict[str, Any]:
+        return self._load_image_state(
+            path,
+            frame=frame,
+            dataset=dataset,
+            valid_mask=valid_mask,
+            external_mask=external_mask,
+            mask_frame=mask_frame,
+            mask_dataset=mask_dataset,
+            poni=poni,
+            base_poni=self._poni if base_poni is self._UNSET else base_poni,
+            base_poni_path=self.poni_path if base_poni_path is self._UNSET else base_poni_path,
+            commit=commit,
+        )
 
     read_image = load_image
 
@@ -1586,9 +1674,9 @@ class ButterflyAnalysisService:
         cancel_event: Any = None,
     ) -> Any:
         try:
-            merged = dict(self._analysis_settings)
+            merged = deepcopy(self._analysis_settings)
             if isinstance(analysis, Mapping):
-                merged.update(analysis)
+                merged = deep_merge_mapping(merged, analysis)
             if analysis_domain is None:
                 analysis_domain, settings = _service_analysis_domain(
                     observed, qmap, mask=mask, analysis=merged
@@ -1637,9 +1725,9 @@ class ButterflyAnalysisService:
             return None
 
     def _result_mapping(self, observed: np.ndarray | None, qmap: Any, model: Any = None, residual: Any = None, *, parameters: Mapping[str, Mapping[str, Any]] | None = None, observables: Any = None, flags: Iterable[str] = (), fit: Any = None, mask: Any = None, analysis: Mapping[str, Any] | None = None, analysis_domain: AnalysisDomain | None = None) -> dict[str, Any]:
-        analysis_settings = dict(self._analysis_settings)
+        analysis_settings = deepcopy(self._analysis_settings)
         if isinstance(analysis, Mapping):
-            analysis_settings.update(analysis)
+            analysis_settings = deep_merge_mapping(analysis_settings, analysis)
         try:
             analysis_settings = _validated_analysis_settings(analysis_settings)
         except ValueError:
@@ -2048,80 +2136,7 @@ class ButterflyAnalysisService:
                 analysis_settings=analysis_settings,
                 **extra,
             )
-            ellipse = result.get("ellipse_fit") if isinstance(result, Mapping) else {}
-            ellipse = ellipse if isinstance(ellipse, Mapping) else {}
-            geometry_parameters = dict(
-                ellipse.get("parameters", ellipse.get("parameter_values", {})) or {}
-            )
-            butterfly = result.get("butterfly") if isinstance(result, Mapping) else {}
-            candidate = butterfly.get("candidate_fit") if isinstance(butterfly, Mapping) else {}
-            for source in (ellipse, candidate if isinstance(candidate, Mapping) else {}):
-                for name in (
-                    "Ln_from_minor_axis_nm",
-                    "Lz_from_draw_axis_nm",
-                    "L_from_major_axis_nm",
-                    "L_N",
-                    "L_z",
-                    "ellipticity",
-                ):
-                    if geometry_parameters.get(name) is None and source.get(name) is not None:
-                        geometry_parameters[name] = source[name]
-            candidate_radial_q_unit = _copy_candidate_radial_comparison(
-                geometry_parameters, candidate
-            )
-            withhold_shape = _ring_only_butterfly_shape(ellipse, candidate, butterfly)
-            _stash_unpublished_periods(
-                geometry_parameters,
-                butterfly=butterfly,
-                ellipse=ellipse,
-                candidate=candidate,
-                allow_candidates=not withhold_shape,
-            )
-            if withhold_shape:
-                _withhold_unpublished_shape_parameters(geometry_parameters)
-            try:
-                geometry_rmse = float(ellipse.get("rmse"))
-            except (TypeError, ValueError):
-                geometry_rmse = None
-            try:
-                geometry_ndata = int(ellipse.get("n_points", 0))
-            except (TypeError, ValueError):
-                geometry_ndata = 0
-            geometry_q_unit = str(ellipse.get("q_unit", "unknown") or "unknown")
-            if geometry_q_unit == "unknown" and candidate_radial_q_unit not in (None, ""):
-                geometry_q_unit = str(candidate_radial_q_unit)
-            result["intensity_parameters"] = deepcopy(result.get("parameters", {}))
-            result["geometry_parameters"] = geometry_parameters
-            result["candidate_geometry_parameters"] = _candidate_geometry_parameters(ellipse, candidate)
-            result["geometry_metrics"] = {
-                "rmse": geometry_rmse,
-                "ndata": geometry_ndata,
-                "q_unit": geometry_q_unit,
-                "source": "measured_ellipse_fit",
-            }
-            result["model"] = None
-            result["residual"] = None
-            result["model_status"] = "unfitted_preview"
-            metrics = dict(result.get("metrics", {}))
-            metrics.update(
-                {
-                    "rmse": geometry_rmse,
-                    "geometry_rmse": geometry_rmse,
-                    "intensity_model_rmse": None,
-                    "ndata": geometry_ndata,
-                    "q_unit": geometry_q_unit,
-                    "model_status": "unfitted_preview",
-                    "success": bool(ellipse.get("success", False)),
-                }
-            )
-            result["metrics"] = metrics
-            result["geometry_action"] = "remeasure"
-            result["flags"] = sorted(
-                set(str(item) for item in result.get("flags", ()))
-                | {"geometry_remeasured", "intensity_model_unfitted"}
-            )
-            result["metrics"]["flags"] = list(result["flags"])
-            return result
+            return self._finalize_geometry_result(result)
         display_mask = _combined_exclusion_mask(
             detector_valid, external_mask, roi_exclusion
         )
@@ -2160,6 +2175,9 @@ class ButterflyAnalysisService:
             analysis=analysis,
             analysis_domain=domain,
         )
+        return self._finalize_geometry_result(result)
+
+    def _finalize_geometry_result(self, result: dict[str, Any]) -> dict[str, Any]:
         ellipse = result.get("ellipse_fit") if isinstance(result, Mapping) else None
         if not isinstance(ellipse, Mapping):
             ellipse = {}
@@ -2413,6 +2431,8 @@ class ButterflyAnalysisService:
         poni_identity = payload_mapping.get(
             "poni", payload_mapping.get("poni_path", self.poni_path)
         )
+        original_poni_obj = self._poni
+        original_poni_path = self.poni_path
         original_poni = resolve_batch_path(poni_identity)
         if isinstance(original_poni, str) and original_poni.casefold() in {"in-memory", "in_memory"}:
             original_poni = None
@@ -2441,7 +2461,12 @@ class ButterflyAnalysisService:
                 if not isinstance(source, Mapping):
                     source = ellipse_fit if isinstance(ellipse_fit, Mapping) else None
             if not isinstance(source, Mapping):
-                candidate = _read(initial, ("butterfly", "candidate_fit"), None)
+                butterfly_section = _read(initial, ("butterfly",), None)
+                candidate = (
+                    _read(butterfly_section, ("candidate_fit",), None)
+                    if isinstance(butterfly_section, Mapping)
+                    else _read(initial, ("candidate_fit",), None)
+                )
                 if isinstance(candidate, Mapping):
                     source = candidate
             if not isinstance(source, Mapping):
@@ -2498,16 +2523,25 @@ class ButterflyAnalysisService:
             del config
             path = _read(frame, ("path", "input_path"), frame)
             frame_selector, dataset = _frame_selectors(frame)
-            state = self.load_image(
-                path,
-                frame=frame_selector,
-                dataset=dataset,
-                valid_mask=original_valid_mask,
-                external_mask=original_mask,
-                mask_frame=payload_mapping.get("mask_frame"),
-                mask_dataset=payload_mapping.get("mask_dataset"),
-                poni=original_poni,
-            )
+            load_kwargs = {
+                "frame": frame_selector,
+                "dataset": dataset,
+                "valid_mask": original_valid_mask,
+                "external_mask": original_mask,
+                "mask_frame": payload_mapping.get("mask_frame"),
+                "mask_dataset": payload_mapping.get("mask_dataset"),
+                "poni": original_poni,
+            }
+            try:
+                state = self.load_image(
+                    path,
+                    **load_kwargs,
+                    commit=False,
+                    base_poni=original_poni_obj,
+                    base_poni_path=original_poni_path,
+                )
+            except TypeError:
+                state = self.load_image(path, **load_kwargs)
             selected = specs
             initial_seed = initial
             if warm_start and initial is not None:

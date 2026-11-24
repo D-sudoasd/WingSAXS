@@ -32,8 +32,13 @@ def json_safe(value: Any) -> Any:
         return str(value)
     if isinstance(value, Mapping):
         return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (list, tuple)):
         return [json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        converted = [json_safe(item) for item in value]
+        return sorted(converted, key=lambda item: (type(item).__name__, repr(item)))
+    if isinstance(value, type):
+        return repr(value)
     if is_dataclass(value):
         return {
             item.name: json_safe(getattr(value, item.name))

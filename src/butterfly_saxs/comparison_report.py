@@ -1849,6 +1849,25 @@ def _render_html(
     )
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    import os
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def build_comparison_report(
     sample_entries: Sequence[Mapping[str, Any]],
     output_dir: str | Path,
@@ -1859,6 +1878,7 @@ def build_comparison_report(
     target_time_h: float | None = None,
     time_anchor_tolerance_h: float = 0.5,
     post_incubation_min_a4: float = 0.05,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Generate cross-sample comparative CSVs, Nature-styled figures, and HTML/Markdown summary.
 
@@ -1885,6 +1905,8 @@ def build_comparison_report(
         Maximum absolute time difference (hours) allowed when matching ``target_time_h``.
     post_incubation_min_a4:
         Minimum 4-fold azimuthal harmonic ``A4`` threshold defining post-incubation coarsening.
+    force:
+        Overwrite existing comparison report artifacts under ``output_dir`` when ``True``.
     """
     preset = get_journal_preset(journal_style)
     export_dpi = preset.dpi if dpi is None else int(dpi)
@@ -1895,6 +1917,22 @@ def build_comparison_report(
             raise ValueError(f"target_time_h must be finite and >= 0 when provided, got {target_time_h!r}")
 
     out_root = Path(output_dir)
+    if not force:
+        planned = [
+            out_root / "cross_sample_endpoint_summary.csv",
+            out_root / "cross_sample_evolution_long.csv",
+            out_root / "comparison_summary.md",
+            out_root / "comparison_index.html",
+            out_root / "comparison_summary.json",
+        ]
+        if target_time_h is not None:
+            planned.append(out_root / "cross_sample_time_anchor_summary.csv")
+        existing = [path for path in planned if path.exists()]
+        if existing:
+            names = ", ".join(str(path) for path in existing)
+            raise FileExistsError(
+                f"Comparison report output(s) already exist; pass force=True to overwrite: {names}"
+            )
     out_root.mkdir(parents=True, exist_ok=True)
     fig_dir = out_root / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -2123,9 +2161,9 @@ def build_comparison_report(
             post_incubation_min_a4=post_incubation_min_a4,
         )
         kinetics_path = out_root / "kinetics_and_scaling_summary.json"
-        kinetics_path.write_text(
+        _write_text_atomic(
+            kinetics_path,
             json.dumps(json_safe(kinetics_summary), ensure_ascii=True, indent=2, allow_nan=False) + "\n",
-            encoding="utf-8",
         )
 
     evo_manifest = _build_evolution_figure(
@@ -2183,8 +2221,8 @@ def build_comparison_report(
     html_path = out_root / "comparison_index.html"
     json_path = out_root / "comparison_summary.json"
 
-    md_path.write_text(_render_markdown(summary, endpoint_rows), encoding="utf-8")
-    html_path.write_text(_render_html(summary, endpoint_rows), encoding="utf-8")
+    _write_text_atomic(md_path, _render_markdown(summary, endpoint_rows))
+    _write_text_atomic(html_path, _render_html(summary, endpoint_rows))
 
     outputs_map: dict[str, str] = {
         "html": str(html_path),
@@ -2199,9 +2237,9 @@ def build_comparison_report(
         outputs_map["kinetics_and_scaling_json"] = str(kinetics_path)
     summary["outputs"] = outputs_map
 
-    json_path.write_text(
+    _write_text_atomic(
+        json_path,
         json.dumps(json_safe(summary), ensure_ascii=True, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
     )
     return summary
 

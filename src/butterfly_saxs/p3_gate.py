@@ -1228,6 +1228,7 @@ def evaluate_p3_gate(
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
     return {
@@ -1255,6 +1256,7 @@ def evaluate_p3_gate(
                     ensure_ascii=True,
                     sort_keys=True,
                     separators=(",", ":"),
+                    allow_nan=False,
                 ).encode("utf-8")
             ).hexdigest(),
         },

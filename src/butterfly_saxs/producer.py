@@ -13,8 +13,8 @@ from collections.abc import Mapping
 # batch/builder is source-pinned; other sources, dependencies and analyzers
 # must match exactly. Unknown later edits continue to fail closed.
 _COMPACT_CHECKPOINT_BATCH_SHA256 = frozenset({
-    "24397a5b1e1a42dfa944e96f3bd3b7c806f6a72f4b294a6cdb31a18a0e46f696",
-    "591075a8af41bc7a8147b96af6c1303e4ff85418b9d866eaf0cf4a6b04eac315",
+    "245a4d97c55ad028a69b8690422078465c6bd2153b2dffbddeedb85f211f01de",
+    "2af9e72a526ee7a888f174a4ec83bcf66b5c16a3b3126e8751ddbe61bb9fc841",
 })
 _PREVIOUS_COMPACT_CHECKPOINT_SOURCES = frozenset({
     ('88db55573794b6f98ea0eedea998cbe12aafba0c4cdc7ab9be90931fe22af9e9', 'fa7bc9250dd8af849a0a45980e3537e651c1f4f68a66c50cd619a688701df145'),
@@ -26,12 +26,14 @@ _PREVIOUS_COMPACT_CHECKPOINT_SOURCES = frozenset({
     ("4e424ac36a0006acdb1883aa11b3d4b571ff4284d26cf0fcaf05b52426d9b572", "e479cd669d4b3eb88c89dd5ff1caf972945f14aab0cb957c22752b6559bfe62a"),
     ("2c5aab4a065f3e1328eee1beccb8cbe918f13446f79657a7d81a5fecc856acfe", "81b94845dd17d7d71ac1e82a12b9d1f26079d5aeef9e938d58f6d11dc80a2b2c"),
     ("8647f887723d2bc4d9e6e425d95f896fcff9ae34314f2bf85a513823fdd610c4", "39440ba78e13379132cc0d05a03de8c831cf9f82f6ff2660d4ebc5259a002562"),
+    ("24397a5b1e1a42dfa944e96f3bd3b7c806f6a72f4b294a6cdb31a18a0e46f696", "4a79ac625a5532324788e75c75eb48f1dc975b5ebf0ca0b1c1c7822fb3c3e584"),
+    ("591075a8af41bc7a8147b96af6c1303e4ff85418b9d866eaf0cf4a6b04eac315", "8189d6c90654e5cb6777e8407b91c448a525bf10137c3bf0c4449cd891490cb7"),
 })
 _PRETTY_CHECKPOINT_SOURCES = frozenset({
     ("9d2451115cdd219bf26118b62f930a9ba350dc6237ee408d6fd81fa0c7a3c0fa", "e87ce353aaf1b07ef85c13243a9e1ffc7fd60f0034d03582a160c787fa891544"),
     ("bb12be937d5b105fd81714923ae9413f3388ab45d97c1b7578461b489cb7c9e3", "ff5cc51d19ca4438b0073b83e0741cc43791ded7656556b70259e515fc713049"),
 })
-_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "b5a0e4b738241c1ae62b2f4b71753b852d81808492b9f959486f700c7cce7b48"
+_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "3ee714943e86aedf122e0f11e645496a3af933bbb3c2ce39e0fee8c00bf156b6"
 
 
 def _reviewed_checkpoint_builder_hash(source: bytes) -> str | None:

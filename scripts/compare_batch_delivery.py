@@ -293,8 +293,14 @@ def main():
     if args.output.exists():
         parser.error("Refusing to overwrite comparison evidence")
     result = compare(args.before, args.after, allow_overview_legend_changes=args.allow_overview_legend_changes)
-    args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({key: result[key] for key in ("passed", "files", "arrays", "csv_rows", "failures", "verification_wall_seconds")}))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    print(
+        json.dumps(
+            {key: result[key] for key in ("passed", "files", "arrays", "csv_rows", "failures", "verification_wall_seconds")},
+            allow_nan=False,
+        )
+    )
     return 0 if result["passed"] else 1
 
 

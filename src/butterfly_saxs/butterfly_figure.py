@@ -151,7 +151,28 @@ def _draw_radial_diagnostic(
         spine.set_linewidth(0.5)
 
 
-def _build_figure(data: Mapping[str, Any]) -> Figure:
+def _resolve_journal_style(
+    journal_style: str | None,
+) -> tuple[dict[str, Any], str, str | None]:
+    """Return effective rcParams, 2D colormap, and canonical preset name."""
+
+    if journal_style is None:
+        return dict(_FIGURE_RC), "cividis", None
+    from .journal_style import get_journal_preset
+
+    preset = get_journal_preset(journal_style)
+    rc = {
+        **_FIGURE_RC,
+        **preset.rc_params(),
+        "pdf.fonttype": preset.pdf_fonttype,
+        "ps.fonttype": preset.ps_fonttype,
+        "svg.fonttype": preset.svg_fonttype,
+        "axes.unicode_minus": False,
+    }
+    return rc, preset.saxs_cmap, preset.name
+
+
+def _build_figure(data: Mapping[str, Any], *, cmap: str = "cividis") -> Figure:
     width_mm = data["width_mm"]
     height_mm = data["height_mm"]
     fig = Figure(
@@ -175,7 +196,7 @@ def _build_figure(data: Mapping[str, Any]) -> Figure:
         count_ax = fig.add_axes([0.14, 0.39, 0.76, 0.045], sharex=profile_ax)
         panel_a_x, panel_b_x = 0.055, 0.055
         panel_a_y, panel_b_y = 0.975, 0.46
-    _draw_map(fig, map_ax, cbar_ax, data)
+    _draw_map(fig, map_ax, cbar_ax, data, cmap=cmap)
     _draw_radial_diagnostic(profile_ax, count_ax, data, counts_bottom=width_mm == 183.0)
     fig.text(
         panel_a_x, panel_a_y, "a", ha="left", va="top", fontsize=8.0, fontweight="bold"
@@ -198,9 +219,11 @@ def render_butterfly_figure(
     display_scale: str = "log1p",
     width_mm: float = 183.0,
     dpi: int = 600,
+    journal_style: str | None = None,
 ) -> Figure:
     """Render a measurement-based figure without exporting files or importing Qt."""
 
+    effective_rc, cmap, _preset_name = _resolve_journal_style(journal_style)
     data = _prepare_inputs(
         observed=observed,
         qx=qx,
@@ -213,8 +236,8 @@ def render_butterfly_figure(
         width_mm=width_mm,
         dpi=dpi,
     )
-    with _EXPORT_LOCK, mpl.rc_context(_FIGURE_RC):
-        figure = _build_figure(data)
+    with _EXPORT_LOCK, mpl.rc_context(effective_rc):
+        figure = _build_figure(data, cmap=cmap)
         figure.canvas.draw()
         return figure
 
@@ -843,6 +866,7 @@ def export_butterfly_figure(
     display_scale: str = "log1p",
     width_mm: float = 183.0,
     dpi: int = 600,
+    journal_style: str | None = None,
     cancel_event: Any = None,
     progress: Callable[[int, str], Any] | None = None,
 ) -> dict[str, Path]:
@@ -855,6 +879,7 @@ def export_butterfly_figure(
     """
 
     raise_if_cancelled(cancel_event, "butterfly-figure:validate")
+    effective_rc, cmap, preset_name = _resolve_journal_style(journal_style)
     target_path = Path(target).expanduser().resolve(strict=False)
     if target_path.exists():
         raise FileExistsError(f"figure target already exists: {target_path}")
@@ -898,8 +923,8 @@ def export_butterfly_figure(
     try:
         _notify(progress, 5, "render")
         raise_if_cancelled(cancel_event, "butterfly-figure:render")
-        with _EXPORT_LOCK, mpl.rc_context(_FIGURE_RC):
-            figure = _build_figure(data)
+        with _EXPORT_LOCK, mpl.rc_context(effective_rc):
+            figure = _build_figure(data, cmap=cmap)
             figure.canvas.draw()
             raise_if_cancelled(cancel_event, "butterfly-figure:save-vector")
             figure.savefig(
@@ -1004,6 +1029,8 @@ def export_butterfly_figure(
                 cancel_event=cancel_event,
             )
         figure_settings = _settings(data)
+        if preset_name is not None:
+            figure_settings["journal_style"] = preset_name
         annular_outputs: dict[str, Path] = {}
         annular_metadata: dict[str, Any] = {}
         if "annular_peaks" in result:

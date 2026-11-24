@@ -17,6 +17,7 @@ import uuid
 
 import numpy as np
 
+from . import __version__
 from .preflight_checks import PreflightCheckState
 from .preflight_context import PreflightContext
 from .preflight_io import PreflightReadState
@@ -311,7 +312,7 @@ def build_preflight_report(inputs: PreflightReportInputs) -> PreflightReportResu
         "result_type": "preflight",
         "run_id": run_id,
         "created_at": created_at.isoformat(timespec="seconds"),
-        "tool": {"name": "LamellarSAXS2D", "version": "0.1.0"},
+        "tool": {"name": "WingSAXS", "version": __version__},
         "status": {
             "status_color": status_color,
             "scientific_status": scientific_status,
