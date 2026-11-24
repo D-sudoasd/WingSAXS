@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 import math
 import numpy as np
 
+from ._primitives import finite_float as _finite
+
 # A nearly circular candidate has no identifiable ellipse direction. This is
 # a provisional geometry screen, not a statistical test of isotropy.
 NEAR_CIRCULAR_AXIS_RATIO_MIN = 0.95
@@ -97,14 +99,6 @@ def unpublished_ellipse_shape(*, quality_status=None, axis_ratio=None, flags=Non
     ) == "ring"
 
 
-def _finite(value):
-    if isinstance(value, (bool, np.bool_)):
-        return None
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
 
 
 def _first_present(mapping, *keys, default=None):
@@ -127,11 +121,19 @@ def _component_count(row):
     return 0
 
 
-def _arc_rows(trace, candidate):
-    """Read lossless per-arc evidence from either trace or fit payload."""
+def extract_arc_rows(
+    trace: Mapping | Sequence | None,
+    candidate: Mapping | None = None,
+    *,
+    include_unassigned: bool = False,
+    deep_copy: bool = False,
+) -> list[dict]:
+    """Read lossless per-arc evidence from either fit payload or trace.
 
-    # The fit adds projection/normal-residual evidence to the traced support.
-    # Prefer those diagnostics over the pre-fit rows when both are present.
+    The fit adds projection/normal-residual evidence to the traced support.
+    Prefer those post-fit diagnostics over the pre-fit rows when both are present.
+    """
+
     candidates = []
     if isinstance(candidate, Mapping):
         candidates.extend((candidate.get("arc_diagnostics"), candidate.get("arc_support")))
@@ -140,17 +142,47 @@ def _arc_rows(trace, candidate):
         diagnostics = trace.get("diagnostics")
         if isinstance(diagnostics, Mapping):
             candidates.extend((diagnostics.get("arc_diagnostics"), diagnostics.get("arc_support")))
-    if isinstance(trace, Sequence) and not isinstance(trace, (str, bytes)):
+    elif isinstance(trace, Sequence) and not isinstance(trace, (str, bytes)):
         candidates.append(trace)
     for value in candidates:
         if isinstance(value, Mapping):
             value = value.get("rows", value.get("arcs", value.get("records")))
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and value:
-            # Unassigned/rejected points remain in point diagnostics but are
-            # not an additional measured arc or a manually constrained arc.
-            return [dict(item) for item in value if isinstance(item, Mapping)
-                    and (_finite(item.get("arc_id")) is None or _finite(item["arc_id"]) >= 0)]
+            if deep_copy:
+                from copy import deepcopy
+
+                rows = [
+                    deepcopy(dict(item))
+                    for item in value
+                    if isinstance(item, Mapping)
+                    and (
+                        include_unassigned
+                        or _finite(item.get("arc_id")) is None
+                        or _finite(item["arc_id"]) >= 0
+                    )
+                ]
+            else:
+                # Unassigned/rejected points remain in point diagnostics but are
+                # not an additional measured arc or a manually constrained arc.
+                rows = [
+                    dict(item)
+                    for item in value
+                    if isinstance(item, Mapping)
+                    and (
+                        include_unassigned
+                        or _finite(item.get("arc_id")) is None
+                        or _finite(item["arc_id"]) >= 0
+                    )
+                ]
+            if rows:
+                return rows
     return []
+
+
+def _arc_rows(trace, candidate):
+    """Read lossless per-arc evidence for quality gating."""
+
+    return extract_arc_rows(trace, candidate, include_unassigned=False, deep_copy=False)
 
 
 def _dedupe_reasons(reasons):

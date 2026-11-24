@@ -18,11 +18,12 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from numbers import Integral, Real
+from numbers import Integral
 from typing import Any
 
 import numpy as np
 
+from ._primitives import finite_float as _as_finite, is_bool as _is_bool
 from .cancellation import raise_if_cancelled
 from .ellipse import (
     EllipseFitResult,
@@ -45,22 +46,6 @@ _PROJECTION_GRID = 64
 _FLAT_PROJECTION_GRID = 128
 
 
-def _as_finite(value: Any) -> float | None:
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-        return None
-    number = float(value)
-    return number if np.isfinite(number) else None
-
-
-def _is_bool(value: Any) -> bool:
-    return isinstance(value, (bool, np.bool_))
-
-
-def _arc_interval(side: str, record: Mapping[str, Any]) -> tuple[float, float] | None:
-    """Return the legacy single side-intersected manual interval."""
-
-    intervals = _arc_intervals(side, record)
-    return intervals[0] if intervals else None
 
 
 def _arc_intervals(side: str, record: Mapping[str, Any]) -> list[tuple[float, float]] | None:

@@ -23,6 +23,11 @@ from typing import Any
 
 import numpy as np
 
+from ._primitives import (
+    parse_q_window as _shared_parse_q_window,
+    safe_gradient as _safe_gradient,
+    strict_int,
+)
 from .cancellation import raise_if_cancelled
 from .butterfly_settings import MAX_RESAMPLES
 from .ridge_inputs import (
@@ -31,7 +36,6 @@ from .ridge_inputs import (
     as_qmap as _shared_as_qmap,
     invalid_mask as _shared_invalid_mask,
 )
-from .settings import strict_int
 
 try:  # scipy is a runtime dependency, but this module keeps a NumPy fallback.
     from scipy.ndimage import gaussian_filter
@@ -214,23 +218,7 @@ def _extract_image_mask(image: Any, shape: tuple[int, int]) -> np.ndarray:
 
 
 def _parse_q_window(value: Any) -> tuple[float, float] | None:
-    if value is None:
-        return None
-    if isinstance(value, Mapping):
-        low = _field(value, ("min", "q_min", "low", "start"))
-        high = _field(value, ("max", "q_max", "high", "stop"))
-    else:
-        try:
-            low, high = tuple(value)
-        except Exception as exc:
-            raise ValueError("q_window must be a (min, max) pair") from exc
-    try:
-        low_f, high_f = float(low), float(high)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("q_window limits must be finite numbers") from exc
-    if not np.isfinite(low_f) or not np.isfinite(high_f) or high_f <= low_f:
-        raise ValueError("q_window must contain finite max > min")
-    return low_f, high_f
+    return _shared_parse_q_window(value, allow_none=True)
 
 
 def _validate_integer(value: Any, name: str, *, minimum: int = 0) -> int:
@@ -321,12 +309,6 @@ def _robust_fill(image: np.ndarray, valid: np.ndarray) -> np.ndarray:
         finite_all = np.isfinite(image)
         fill = float(np.nanmedian(image[finite_all])) if np.any(finite_all) else 0.0
     return np.where(np.isfinite(image), image, fill).astype(float, copy=False)
-
-
-def _safe_gradient(array: np.ndarray, axis: int) -> np.ndarray:
-    if array.shape[axis] < 2:
-        return np.zeros_like(array, dtype=float)
-    return np.asarray(np.gradient(array, axis=axis), dtype=float)
 
 
 def _residual_field(image: np.ndarray, valid: np.ndarray, smoothing_sigma: float) -> np.ndarray:
@@ -567,16 +549,6 @@ def _normalise_noise_model(options: Mapping[str, Any]) -> str:
     if normalized not in {"empirical_residual_block", "poisson"}:
         raise ValueError("noise_model must be empirical_residual_block or explicit poisson")
     return normalized
-
-
-def _json_number(value: Any) -> float | int | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(number):
-        return None
-    return int(number) if number.is_integer() else number
 
 
 def _source_mapping(value: Any) -> Mapping[str, Any] | None:

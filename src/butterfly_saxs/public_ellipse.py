@@ -6,7 +6,12 @@ from collections.abc import Mapping
 import math
 from typing import Any
 
-from .observables import _SPACING_CENTER_REL_TOL, _q_to_nm_inverse_scale, ellipse_radius
+from ._observables_types import (
+    _SPACING_CENTER_REL_TOL,
+    _q_to_nm_inverse_scale,
+    ellipse_radius,
+)
+from ._primitives import finite_float
 
 
 
@@ -77,11 +82,7 @@ def _field(value: Any, *names: str, default: Any = None) -> Any:
 
 
 def _finite(value: Any, default: float = float("nan")) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    return number if math.isfinite(number) else default
+    return float(finite_float(value, default))
 
 
 def _origin_centered_periods(

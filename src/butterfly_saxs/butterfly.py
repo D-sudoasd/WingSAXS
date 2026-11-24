@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 import hashlib
 import json
+import sys
 from typing import Any
 
 import numpy as np
@@ -277,7 +278,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
         qmap={"q_unit": unit},
         config={"analysis": {"draw_axis_deg": float(reference) + 90.0}},
     )
-    from .observables import _symmetry_diagnostics
+    from ._observables_ellipse import _symmetry_diagnostics
 
     reference_center = _trace_reference_center(trace)
     candidate_center = (payload.get("center_qx"), payload.get("center_qy"))
@@ -449,25 +450,9 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
 
 
 def _q_step(qmap):
-    try:
-        from .ridge_inputs import representative_q_step
+    from ._primitives import representative_q_step
 
-        return representative_q_step(qmap)
-    except (ImportError, TypeError, ValueError):
-        # Keep a compatibility fallback for source checkouts where the shared
-        # input adapter is not installed yet.  The normal package path above
-        # uses both detector axes.
-        pass
-    x = np.asarray(_read(qmap, "qx"), dtype=float)
-    y = np.asarray(_read(qmap, "qy"), dtype=float)
-    steps = np.concatenate(
-        (
-            np.hypot(np.diff(x, axis=1), np.diff(y, axis=1)).ravel(),
-            np.hypot(np.diff(x, axis=0), np.diff(y, axis=0)).ravel(),
-        )
-    )
-    finite = steps[np.isfinite(steps) & (steps > 0)]
-    return float(np.median(finite)) if finite.size else None
+    return representative_q_step(qmap)
 
 
 _GEOMETRY_BOUND_ALIASES = {
@@ -894,7 +879,7 @@ def _recipe_hashable(value: Any) -> Any:
 def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
                  multistart, cancel_event, trace):
     """Rerun image-to-arcs after choices change; never bootstrap point labels."""
-    from .butterfly_ridge import _parse_q_window
+    from .tracing.topology import _parse_q_window
 
     if not (isinstance(window, (list, tuple)) and len(window) == 2):
         _img, _qx, _qy, _q, _inv = canonical_inputs(image, qmap, mask=mask)
@@ -1181,7 +1166,9 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
                       parameters=None, reference_axis_deg=0., multistart=7, cancel_event=None,
                       _radial_hint_cache=None):
     """Return serializable observed arcs, candidate geometry and evidence."""
-    from .butterfly_ridge import _RadialHintGeometryCache, _parse_q_window, trace_butterfly_ridges
+    from . import butterfly_ridge as _ridge_mod
+    from .tracing.radial_hint import _RadialHintGeometryCache
+    from .tracing.topology import _parse_q_window
     from .analysis_config import DEFAULT_ANALYSIS_SETTINGS
 
     settings = normalize_butterfly_settings(options)
@@ -1226,7 +1213,7 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
             key: value for key, value in settings.items()
             if key != "trace_method" and not key.startswith(("sector_", "annular_"))
         }
-        trace = trace_butterfly_ridges(image, qmap, q_window, mask=mask,
+        trace = _ridge_mod.trace_butterfly_ridges(image, qmap, q_window, mask=mask,
                                       reference_axis_deg=reference_axis_deg, options=curvature_settings,
                                       edits=settings["edits"], cancel_event=cancel_event,
                                       radial_hint_cache=radial_hint_cache)
@@ -1370,9 +1357,27 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
                                  fit_ellipse=True, n_angular_bins=360, n_radial_bins=256,
                                  snr_threshold=None, cancel_event=None):
     """Adapter into the existing observable bundle without changing old methods."""
-    from .observables import (AngularSpectrum, ObservableSet, _measure_lobe_radial_observables,
-                              apparent_lamellar_tilt, measure_angular_spectrum,
-                              measure_four_lobe_peaks)
+    from ._observables_angular import (
+        apparent_lamellar_tilt,
+        measure_angular_spectrum as _default_measure_angular_spectrum,
+        measure_four_lobe_peaks,
+    )
+    from ._observables_ridges import (
+        _measure_lobe_radial_observables as _default_measure_lobe_radial,
+    )
+    from ._observables_types import AngularSpectrum, ObservableSet
+
+    _obs_mod = sys.modules.get("butterfly_saxs.observables")
+    measure_angular_fn = (
+        getattr(_obs_mod, "measure_angular_spectrum", _default_measure_angular_spectrum)
+        if _obs_mod is not None
+        else _default_measure_angular_spectrum
+    )
+    measure_lobe_radial_fn = (
+        getattr(_obs_mod, "_measure_lobe_radial_observables", _default_measure_lobe_radial)
+        if _obs_mod is not None
+        else _default_measure_lobe_radial
+    )
     settings = dict(options or {})
     if not fit_ellipse:
         settings["stage"] = "trace"
@@ -1384,7 +1389,7 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
     # Landmarks are independent display/measurement diagnostics. Calculate
     # them once at this public adapter, never in each uncertainty refit.
     from .peak_landmarks import compute_peak_landmarks
-    from .butterfly_ridge import _parse_q_window, _apply_edits
+    from .tracing.topology import _apply_edits, _parse_q_window
 
     peak_image, peak_qx, peak_qy, peak_q, peak_invalid = canonical_inputs(frame, qmap, mask=mask)
     peak_window = _parse_q_window(q_window, peak_q)
@@ -1409,14 +1414,14 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
     unit = _qmap_unit(qmap)
     if settings.get("companion_observables", True):
         raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
-        angular = measure_angular_spectrum(
+        angular = measure_angular_fn(
             frame, qmap, q_window, n_bins=n_angular_bins, mask=companion_mask
         )
         raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
         lobes = measure_four_lobe_peaks(angular, symmetric_refine=True,
                                        reference_axis_deg=draw_axis_deg - 90.)
         raise_if_cancelled(cancel_event, "butterfly:lobe-peaks")
-        profiles, radial_peaks = _measure_lobe_radial_observables(
+        profiles, radial_peaks = measure_lobe_radial_fn(
             frame,
             qmap,
             q_window,

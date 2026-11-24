@@ -14,6 +14,14 @@ from typing import Any
 
 import numpy as np
 
+from ._primitives import (
+    finite_float,
+    normalize_q_unit,
+    parse_q_window,
+    q_scale_to_nm_inv,
+    safe_gradient as _gradient,
+)
+
 try:  # scipy is a declared project dependency; keep a small NumPy fallback.
     from scipy.ndimage import map_coordinates
 except Exception:  # pragma: no cover - source inspection in partial installs
@@ -146,14 +154,6 @@ def canonical_inputs(
     if mask is not None:
         invalid |= _broadcast_bool(mask, tuple(data.shape), f"mask does not broadcast to image shape {data.shape}")
     return data, qx, qy, q, invalid
-
-
-def _gradient(array: np.ndarray, axis: int) -> np.ndarray:
-    """Finite-difference gradient that handles one-pixel detector axes."""
-
-    if array.shape[axis] < 2:
-        return np.zeros_like(array, dtype=float)
-    return np.asarray(np.gradient(array, axis=axis), dtype=float)
 
 
 def representative_q_step(qmap: Any, qy: Any = None) -> float | None:
@@ -289,7 +289,11 @@ __all__ = [
     "canonical_inputs",
     "coordinate_derivatives",
     "field",
+    "finite_float",
     "invalid_mask",
+    "normalize_q_unit",
+    "parse_q_window",
+    "q_scale_to_nm_inv",
     "representative_q_step",
     "robust_noise",
     "sample",

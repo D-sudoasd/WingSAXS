@@ -23,26 +23,18 @@ try:
 except Exception:  # pragma: no cover - only for incomplete installations
     least_squares = None
 
-from .observables import APPARENT_FLAGS, _extract_maps, _get_field, _q_limits
+from ._observables_types import (
+    APPARENT_FLAGS,
+    _MappingResult,
+    _extract_maps,
+    _get_field,
+    _q_limits,
+)
 from .parameters import ParameterSet, ParameterSpec
 from .cancellation import raise_if_cancelled
 
 
 MODEL_FLAGS = APPARENT_FLAGS + ("empirical_model_only",)
-
-
-class _MappingResult:
-    def __getitem__(self, key: str) -> Any:
-        return getattr(self, key)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
-
-    def keys(self) -> tuple[str, ...]:
-        return tuple(self.__dataclass_fields__)  # type: ignore[attr-defined]
-
-    def as_dict(self) -> dict[str, Any]:
-        return {key: getattr(self, key) for key in self.keys()}
 
 
 @dataclass

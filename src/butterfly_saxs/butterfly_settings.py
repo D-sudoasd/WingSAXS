@@ -7,13 +7,7 @@ from copy import deepcopy
 import math
 from numbers import Integral
 
-from .settings import strict_int
-
-
-def _is_bool(value) -> bool:
-    return isinstance(value, bool) or (
-        type(value).__module__ == "numpy" and type(value).__name__ in {"bool", "bool_"}
-    )
+from ._primitives import is_bool as _is_bool, strict_int
 
 
 # v2 records all-arc holdout and per-arc support diagnostics; v2.1 preserves

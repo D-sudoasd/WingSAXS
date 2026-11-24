@@ -1,63 +1,58 @@
-"""Scientific source adaptation and deterministic lamellar schematic geometry."""
+"""Deterministic lamellar schematic scene construction decomposed by stage."""
 
 from __future__ import annotations
-import os
+
 from collections.abc import Mapping, Sequence
 from typing import Any
+
 import numpy as np
 
-from .lamellar_models import LamellarScene, LamellarSettings, _empty_scene
-from .lamellar_utils import (
+from ..public_ellipse import _origin_centered_periods
+from ._common import (
+    _BLUE,
+    _CORNER_SIGNS,
+    _MISSING,
+    _ORANGE,
+    _axial_distance_deg,
+    _axial_wrap_deg,
     _finite,
     _finite_positive,
     _normalise_q_unit,
+    _origin_centered_xy,
     _q_scale_to_nm,
     _read,
 )
-from .lamellar_adapter import (
-    _exact_integer,
+from .adapter import (
+    _direction_for_group,
     _ellipse_components,
     _ellipse_parameter_records,
     _ellipse_payload,
-    _parameter_value,
-    _direction_for_group,
+    _exact_integer,
     _execution_failure,
     _group_populations,
     _metadata_base,
+    _parameter_value,
     _period_record,
     _q_unit_from_source,
+    _radial_peak_direction_support,
     _radial_peaks,
     _source_identity,
     _source_mapping,
     _stable_seed,
     observed_direction_support,
 )
-from .public_ellipse import _origin_centered_periods
+from .models import LamellarScene, LamellarSettings, _empty_scene
 
-_MISSING = object()
-_CORNER_SIGNS = np.asarray(
-    (
-        (-1.0, -1.0, -1.0),
-        (1.0, -1.0, -1.0),
-        (1.0, 1.0, -1.0),
-        (-1.0, 1.0, -1.0),
-        (-1.0, -1.0, 1.0),
-        (1.0, -1.0, 1.0),
-        (1.0, 1.0, 1.0),
-        (-1.0, 1.0, 1.0),
-    ),
-    dtype=float,
-)
-_BLUE = np.asarray((0.20, 0.45, 0.72, 0.82), dtype=float)
-_ORANGE = np.asarray((0.92, 0.47, 0.18, 0.82), dtype=float)
 _AXIAL_ZERO_TOL_DEG = 1e-8
 _STACK_ROTATION_COS_TOL = 1e-6
 
 
-def _axial_wrap_deg(angle_deg: float) -> float:
-    """Wrap an unoriented in-plane direction into [-90, 90) degrees."""
-
-    return float((float(angle_deg) + 90.0) % 180.0 - 90.0)
+def _origin_centered(
+    center: tuple[float, float] | None, a: float | None, b: float | None
+) -> bool:
+    if center is None:
+        return False
+    return _origin_centered_xy(center[0], center[1], a, b)
 
 
 def _stack_rotation_geometry(
@@ -94,11 +89,6 @@ def _stack_rotation_parameter_record(value: float) -> dict[str, Any]:
             "normal (measured q direction or manual setting) is applied geometrically and is not inferred from the ellipse"
         ),
     }
-
-
-def _axial_distance_deg(first: float, second: float) -> float:
-    difference = (float(second) - float(first) + 90.0) % 180.0 - 90.0
-    return abs(difference)
 
 
 def _direction_only_group(
@@ -242,15 +232,6 @@ def _ellipse_center(ellipse: Any) -> tuple[float, float] | None:
     return (float(cx), float(cy)) if cx is not None and cy is not None else None
 
 
-def _origin_centered(
-    center: tuple[float, float] | None, a: float | None, b: float | None
-) -> bool:
-    if center is None or a is None or b is None or a <= 0.0 or b <= 0.0:
-        return False
-    tolerance = 1.0e-8 * max(1.0, abs(a), abs(b))
-    return float(np.hypot(*center)) <= tolerance
-
-
 def _prefer_q_unit(primary: Any, fallback: Any) -> str:
     """Choose the primary q unit unless it is missing or unknown."""
 
@@ -384,31 +365,6 @@ def _ellipse_q_radius(member: Mapping[str, Any], angle_deg: float) -> float | No
     denominator = float(np.hypot(b * np.cos(delta), a * np.sin(delta)))
     radius = a * b / denominator if denominator > 0.0 else float("nan")
     return float(radius) if np.isfinite(radius) and radius > 0.0 else None
-
-
-def _radial_peak_direction_support(
-    peaks: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Expose retained radial-peak observations as direction evidence."""
-
-    rows: list[dict[str, Any]] = []
-    for item in peaks:
-        rows.append(
-            {
-                "point_index": int(item["index"]),
-                "q": float(item["q"]),
-                "angle_deg": float(item["angle_deg"]),
-                "q_unit": str(item["q_unit"]),
-                "branch_id": item.get("branch_id"),
-                "branch_id_source": "radial_peak_branch_id" if item.get("branch_id") is not None else None,
-                "source": "lobe_radial_peaks",
-                "status": str(item.get("status", "available")),
-                "reason": str(item.get("reason", "")),
-                "valid": True,
-                "accepted": True,
-            }
-        )
-    return rows
 
 
 def _apply_ellipse_directional_periods(
@@ -642,21 +598,12 @@ def _apply_ellipse_directional_periods(
             assumptions.append(
                 "Finite candidate ellipse parameters drive a provisional direction-dependent schematic; formal derived values remain null."
             )
-    if first_error is not None and not any(
-        _finite_positive(item.get("period")) is not None for item in populations
-    ):
-        return first_error
     return first_error
 
 
-def build_lamellar_scene(
-    source: Any, settings: Mapping[str, Any] | LamellarSettings | None = None
-) -> LamellarScene:
-    resolved = LamellarSettings.from_mapping(settings)
-    root = _source_mapping(source)
-    identity = _source_identity(source, root)
-    raw_peaks = _radial_peaks(root)
-    q_unit = _q_unit_from_source(root, raw_peaks)
+def _resolve_draw_axis_and_state(
+    root: Mapping[str, Any], resolved: LamellarSettings
+) -> tuple[float, str | None, bool, list[str], dict[str, Any] | None]:
     draw_axis = _finite(_read(root, ("draw_axis_deg",), _MISSING))
     if draw_axis is None:
         observables = _read(root, ("observables", "measurements"), None)
@@ -702,518 +649,204 @@ def build_lamellar_scene(
         assumptions.append(
             "Stack rotation α is an explicit conditional model setting, signed relative to each source normal tilt (measured q direction or manual setting); it is not extracted from the fitted ellipse or refined against the measured intensity. Alpha defines the baseline source-plane geometry before optional orientation spread and out-of-plane tilt."
         )
-    flags: list[str] = []
-    if execution_failure is not None and resolved.period_source != "manual":
-        metadata = _metadata_base(
-            resolved,
-            identity,
-            status="unavailable",
-            available=False,
-            message=f"Source execution status is {execution_failure}; measured peaks are not treated as current.",
-            draw_axis_deg=draw_axis,
-            reference_period=resolved.reference_period or 1.0,
-            assumptions=assumptions,
-            parameter_sources=(
-                [stack_rotation_source] if stack_rotation_source is not None else []
-            ),
-            q_unit=q_unit,
-            flags=("source_execution_failed",),
+    return draw_axis, execution_failure, stale, assumptions, stack_rotation_source
+
+
+def _build_manual_populations(
+    resolved: LamellarSettings,
+    parameter_sources: list[dict[str, Any]],
+    assumptions: list[str],
+) -> tuple[list[dict[str, Any]], str]:
+    period = float(resolved.manual_period)
+    angle = float(resolved.manual_angle_deg)
+    if resolved.manual_second_orientation:
+        directions: tuple[tuple[int, float], ...] = (
+            (0, angle),
+            (1, float(resolved.manual_second_angle_deg)),
         )
-        return _empty_scene(resolved, metadata)
-    if stale and resolved.period_source != "manual":
-        metadata = _metadata_base(
-            resolved,
-            identity,
-            status="stale",
-            available=False,
-            message="The source result is marked stale; no current lamellar scene is available.",
-            draw_axis_deg=draw_axis,
-            reference_period=resolved.reference_period or 1.0,
-            assumptions=assumptions,
-            parameter_sources=(
-                [stack_rotation_source] if stack_rotation_source is not None else []
-            ),
-            q_unit=q_unit,
-            flags=("stale_source",),
-        )
-        return _empty_scene(resolved, metadata)
-    populations: list[dict[str, Any]] = []
-    parameter_sources: list[dict[str, Any]] = []
-    direction_support: list[dict[str, Any]] | None = None
-    direction_diagnostics: dict[str, Any] | None = None
-    ellipse_period_error: str | None = None
-    length_unit = "relative"
-    ellipse_for_metadata = _ellipse_payload(root)
-    parameter_sources.extend(_ellipse_parameter_records(ellipse_for_metadata))
-    if stack_rotation_source is not None:
-        parameter_sources.append(stack_rotation_source)
-    if resolved.period_source == "manual":
-        period = float(resolved.manual_period)
-        angle = float(resolved.manual_angle_deg)
-        if resolved.manual_second_orientation:
-            directions = ((0, angle), (1, float(resolved.manual_second_angle_deg)))
-            if resolved.selected_branch >= 0:
-                directions = (directions[int(resolved.selected_branch)],)
-            assumptions.append(
-                "A second manual lamellar-normal direction is included at the explicitly set angle; the two manual direction groups are allocated as evenly as possible and seed-shuffled for visualization, not fitted populations or measured fractions."
-            )
-        else:
-            branch = 0 if resolved.selected_branch < 0 else int(resolved.selected_branch)
-            directions = ((branch, angle),)
-        populations = [
-            {
-                "branch_id": branch,
-                "period": period,
-                "length_unit": resolved.manual_unit,
-                "angle_deg": direction_angle,
-                "status": "manual",
-                "orientation_assumption": "explicit manual direction",
-            }
-            for branch, direction_angle in directions
-        ]
-        parameter_sources.append(
-            _period_record(
-                "period",
-                period,
-                resolved.manual_unit,
-                "manual",
-                "manual",
-                "explicit manual assumption",
-            )
-        )
-        length_unit = resolved.manual_unit
-        assumptions.append("Period and angle are explicit manual assumptions supplied by the caller.")
-    elif not raw_peaks and resolved.period_source != "ellipse":
-        parameter_sources.append(
-            _period_record(
-                "period",
-                None,
-                "relative",
-                "lobe_radial_peaks",
-                "unavailable",
-                "no valid radial lobe peaks; annulus q is not accepted",
-            )
-        )
-        metadata = _metadata_base(
-            resolved,
-            identity,
-            status="unavailable",
-            available=False,
-            message="No valid lobe_radial_peaks with a positive radial q_star were found; annulus/azimuthal q is not used.",
-            draw_axis_deg=draw_axis,
-            reference_period=resolved.reference_period or 1.0,
-            assumptions=assumptions,
-            parameter_sources=parameter_sources,
-            q_unit=q_unit,
-            flags=("no_valid_lobe_radial_peaks", "spacing_unavailable_unknown_q_unit"),
-        )
-        return _empty_scene(resolved, metadata)
-    elif resolved.period_source == "ellipse":
-        support = observed_direction_support(root)
-        if not support:
-            support = _radial_peak_direction_support(raw_peaks)
-        if not support:
-            metadata = _metadata_base(
-                resolved,
-                identity,
-                status="unavailable",
-                available=False,
-                message=(
-                    "The ellipse supplies reciprocal-space shape and period candidates, "
-                    "but no retained observed ridge points or radial lobe peaks are "
-                    "available to set a lamellar-normal direction."
-                ),
-                draw_axis_deg=draw_axis,
-                reference_period=resolved.reference_period or 1.0,
-                assumptions=assumptions,
-                parameter_sources=parameter_sources,
-                q_unit=q_unit,
-                flags=("no_observed_direction_support",),
-            )
-            metadata["direction_support"] = []
-            return _empty_scene(resolved, metadata)
-        direction_support = support
-        populations, direction_diagnostics, direction_error = _direction_populations(support)
-        explicit_populations = [
-            item for item in populations if _exact_integer(item.get("branch_id")) is not None
-            and int(item["branch_id"]) >= 0
-        ]
-        if direction_error is not None and not explicit_populations:
-            metadata = _metadata_base(
-                resolved,
-                identity,
-                status="unavailable",
-                available=False,
-                message=direction_error,
-                draw_axis_deg=draw_axis,
-                reference_period=resolved.reference_period or 1.0,
-                assumptions=assumptions,
-                parameter_sources=parameter_sources,
-                q_unit=q_unit,
-                flags=("ambiguous_observed_directions",),
-            )
-            metadata["direction_support"] = support
-            metadata["direction_diagnostics"] = direction_diagnostics
-            return _empty_scene(resolved, metadata)
-        if direction_error is not None:
-            flags.append("ambiguous_unassigned_direction_retained")
-        parameter_sources.append(
-            _period_record(
-                "observed_direction_support",
-                None,
-                "degree",
-                _direction_source_label(support),
-                "available",
-                "direction only; retained observed q-space support is not replaced by fitted ellipse angle",
-            )
-        )
+        if resolved.selected_branch >= 0:
+            directions = (directions[int(resolved.selected_branch)],)
         assumptions.append(
-            "Ellipse-mode schematic normals use only retained observed ridge-point or radial lobe-peak directions. The fitted ellipse theta defines q-space geometry and is not treated as the lamellar-normal angle."
-        )
-        flags.append(
-            "ellipse_direction_from_radial_lobe_peaks"
-            if all("lobe_radial_peaks" in str(row.get("source", "")) for row in support)
-            else "ellipse_direction_from_observed_ridge_points"
+            "A second manual lamellar-normal direction is included at the explicitly set angle; the two manual direction groups are allocated as evenly as possible and seed-shuffled for visualization, not fitted populations or measured fractions."
         )
     else:
-        groups = _group_populations(raw_peaks)
-        reference_by_unit: dict[str, float] = {}
-        for item in raw_peaks:
-            if item["q_nm_inv"] is None:
-                unit_key = _normalise_q_unit(item["q_unit"])
-                reference_by_unit.setdefault(unit_key, float(item["q"]))
-        for branch, group in groups:
-            angle, inconsistent_angle = _direction_for_group(group)
-            first = group[0]
-            q_nm_values = [
-                item["q_nm_inv"] for item in group if item["q_nm_inv"] is not None
-            ]
-            q_nm = float(q_nm_values[0]) if q_nm_values else None
-            inconsistent_q = False
-            uncertain_q = False
-            if len(q_nm_values) == len(group):
-                inconsistent_q = any(
-                    abs(float(item) - q_nm) > max(1e-12, 0.05 * q_nm)
-                    for item in q_nm_values[1:]
-                )
-            else:
-                native_units = {_normalise_q_unit(item["q_unit"]) for item in group}
-                if len(native_units) == 1:
-                    native_q = float(first["q"])
-                    inconsistent_q = any(
-                        abs(float(item["q"]) - native_q) > max(1e-12, 0.05 * native_q)
-                        for item in group[1:]
-                    )
-                else:
-                    uncertain_q = len(group) > 1
-            relative_q_unit: str | None = None
-            if q_nm is not None:
-                period = float(2.0 * np.pi / q_nm)
-                unit = "nm"
-                period_status = (
-                    "candidate"
-                    if any(
-                        item["status"] in {"candidate", "provisional", "undetermined"}
-                        for item in group
-                    )
-                    else "available"
-                )
-                period_source_name = "lobe_radial_peaks"
-                period_reason = (
-                    "2π/q from the first valid radial lobe peak in this branch"
-                )
-                length_unit = "nm"
-            else:
-                q_value = float(first["q"])
-                relative_q_unit = _normalise_q_unit(first["q_unit"])
-                reference_q_native = reference_by_unit.get(relative_q_unit, q_value)
-                base = (
-                    float(resolved.reference_period)
-                    if resolved.reference_period is not None
-                    else 1.0
-                )
-                period = float(base * reference_q_native / q_value)
-                unit = "relative"
-                period_status = (
-                    "candidate"
-                    if any(
-                        item["status"] in {"candidate", "provisional", "undetermined"}
-                        for item in group
-                    )
-                    else "available"
-                )
-                period_source_name = "lobe_radial_peaks"
-                period_reason = f"normalized to explicit reference q={reference_q_native:g} ({first['q_unit'] or 'unknown'})"
-                length_unit = "relative"
-                flags.append("spacing_unavailable_unknown_q_unit")
-                assumptions.append(
-                    "Unknown q units are displayed on an explicit relative scale normalized to the retained reference q."
-                )
-            if uncertain_q:
-                flags.append("mixed_q_unit_support")
-                period_reason += "; opposite q units are mixed and cannot be compared"
-                period_status = "candidate"
-            if inconsistent_angle or inconsistent_q:
-                flags.append("inconsistent_opposite_support")
-                period_reason += f"; opposite q values={[float(item['q']) for item in group]} are inconsistent and were not mirrored or fabricated"
-                period_status = (
-                    "candidate" if period_status == "available" else period_status
-                )
-            if any(
-                item["status"] in {"candidate", "provisional", "undetermined"}
-                for item in group
-            ):
-                flags.append("candidate_radial_support")
-            populations.append(
-                {
-                    "branch_id": int(branch),
-                    "period": period,
-                    "length_unit": unit,
-                    "relative_q_unit": relative_q_unit,
-                    "angle_deg": angle,
-                    "status": "candidate"
-                    if period_status == "candidate"
-                    else "schematic",
-                    "support_indices": [int(item["index"]) for item in group],
-                    "support_q_values": [float(item["q"]) for item in group],
-                    "support_q_units": [str(item["q_unit"]) for item in group],
-                }
-            )
-            parameter_sources.append(
-                _period_record(
-                    "period",
-                    None if period_status == "candidate" else period,
-                    unit,
-                    period_source_name,
-                    period_status,
-                    period_reason,
-                    candidate_value=period if period_status == "candidate" else None,
-                )
-            )
-            q_record = q_nm if q_nm is not None else float(first["q"])
-            parameter_sources.append(
-                _period_record(
-                    "q_star",
-                    None if period_status == "candidate" else q_record,
-                    "nm^-1" if q_nm is not None else str(first["q_unit"]),
-                    "lobe_radial_peaks",
-                    "available" if period_status == "available" else period_status,
-                    "retained radial peak",
-                    candidate_value=q_record if period_status == "candidate" else None,
-                )
-            )
-    if resolved.period_source == "ellipse":
-        assert direction_support is not None
-        ellipse_period_error = _apply_ellipse_directional_periods(
-            root,
-            resolved,
-            populations,
-            direction_support,
-            draw_axis,
-            q_unit,
-            parameter_sources,
-            flags,
-            assumptions,
-        )
-    selected = [
-        population
-        for population in populations
-        if resolved.selected_branch < 0
-        or int(population["branch_id"]) == int(resolved.selected_branch)
+        branch = 0 if resolved.selected_branch < 0 else int(resolved.selected_branch)
+        directions = ((branch, angle),)
+    populations = [
+        {
+            "branch_id": branch,
+            "period": period,
+            "length_unit": resolved.manual_unit,
+            "angle_deg": direction_angle,
+            "status": "manual",
+            "orientation_assumption": "explicit manual direction",
+        }
+        for branch, direction_angle in directions
     ]
-    if resolved.period_source == "ellipse":
-        selected = [
-            population
-            for population in selected
-            if _finite_positive(population.get("period")) is not None
+    parameter_sources.append(
+        _period_record(
+            "period",
+            period,
+            resolved.manual_unit,
+            "manual",
+            "manual",
+            "explicit manual assumption",
+        )
+    )
+    assumptions.append("Period and angle are explicit manual assumptions supplied by the caller.")
+    return populations, resolved.manual_unit
+
+
+def _build_radial_populations(
+    raw_peaks: list[dict[str, Any]],
+    resolved: LamellarSettings,
+    parameter_sources: list[dict[str, Any]],
+    flags: list[str],
+    assumptions: list[str],
+) -> tuple[list[dict[str, Any]], str]:
+    populations: list[dict[str, Any]] = []
+    length_unit = "relative"
+    groups = _group_populations(raw_peaks)
+    reference_by_unit: dict[str, float] = {}
+    for item in raw_peaks:
+        if item["q_nm_inv"] is None:
+            unit_key = _normalise_q_unit(item["q_unit"])
+            reference_by_unit.setdefault(unit_key, float(item["q"]))
+    for branch, group in groups:
+        angle, inconsistent_angle = _direction_for_group(group)
+        first = group[0]
+        q_nm_values = [
+            item["q_nm_inv"] for item in group if item["q_nm_inv"] is not None
         ]
-    if not selected:
-        metadata = _metadata_base(
-            resolved,
-            identity,
-            status="unavailable",
-            available=False,
-            message=(
-                ellipse_period_error
-                or f"Selected branch {resolved.selected_branch} has no supported lamellar population."
-            ),
-            draw_axis_deg=draw_axis,
-            reference_period=resolved.reference_period or 1.0,
-            assumptions=assumptions,
-            parameter_sources=parameter_sources,
-            populations=populations,
-            q_unit=q_unit,
-            flags=(*flags, "selected_branch_unavailable"),
-        )
-        if direction_support is not None:
-            metadata["direction_support"] = direction_support
-            metadata["direction_diagnostics"] = direction_diagnostics
-        return _empty_scene(resolved, metadata)
-    selected_units = {
-        str(population.get("length_unit", length_unit))
-        for population in selected
-        if _finite_positive(population.get("period")) is not None
-    }
-    if len(selected_units) > 1:
-        mixed_units = sorted(selected_units)
-        message = (
-            "Selected populations use incompatible length units ("
-            + " and ".join(mixed_units)
-            + "); select one branch before generating a scene."
-        )
-        metadata = _metadata_base(
-            resolved,
-            identity,
-            status="unavailable",
-            available=False,
-            message=message,
-            draw_axis_deg=draw_axis,
-            reference_period=resolved.reference_period or 1.0,
-            assumptions=assumptions,
-            parameter_sources=parameter_sources,
-            populations=populations,
-            q_unit=q_unit,
-            flags=(*flags, "mixed_length_units"),
-        )
-        metadata["length_unit"] = "relative"
-        metadata["mixed_length_units"] = mixed_units
-        if direction_support is not None:
-            metadata["direction_support"] = direction_support
-            metadata["direction_diagnostics"] = direction_diagnostics
-        return _empty_scene(resolved, metadata)
-    selected_relative_q_units = {
-        str(population["relative_q_unit"])
-        for population in selected
-        if population.get("length_unit") == "relative"
-        and population.get("relative_q_unit") not in (None, "")
-        and _finite_positive(population.get("period")) is not None
-    }
-    if len(selected_relative_q_units) > 1:
-        mixed_q_units = sorted(selected_relative_q_units)
-        message = (
-            "Selected populations use incompatible non-physical q units ("
-            + " and ".join(mixed_q_units)
-            + "); select one branch before generating a scene."
-        )
-        metadata = _metadata_base(
-            resolved,
-            identity,
-            status="unavailable",
-            available=False,
-            message=message,
-            draw_axis_deg=draw_axis,
-            reference_period=resolved.reference_period or 1.0,
-            assumptions=assumptions,
-            parameter_sources=parameter_sources,
-            populations=populations,
-            q_unit=q_unit,
-            flags=(*flags, "mixed_q_unit_support"),
-        )
-        metadata["length_unit"] = "relative"
-        metadata["mixed_q_units"] = mixed_q_units
-        if direction_support is not None:
-            metadata["direction_support"] = direction_support
-            metadata["direction_diagnostics"] = direction_diagnostics
-        return _empty_scene(resolved, metadata)
-    if (
-        len(selected) < 2
-        and resolved.selected_branch < 0
-        and resolved.period_source != "manual"
-    ):
-        flags.append("single_branch_supported")
-    if selected_units:
-        length_unit = next(iter(selected_units))
-    periods = [
-        float(item["period"])
-        for item in selected
-        if _finite_positive(item.get("period")) is not None
-    ]
-    if not periods:
-        metadata = _metadata_base(
-            resolved,
-            identity,
-            status="unavailable",
-            available=False,
-            message=(
-                ellipse_period_error
-                or "No finite positive period remained after source adaptation."
-            ),
-            draw_axis_deg=draw_axis,
-            reference_period=resolved.reference_period or 1.0,
-            assumptions=assumptions,
-            parameter_sources=parameter_sources,
-            populations=populations,
-            q_unit=q_unit,
-            flags=flags,
-        )
-        if direction_support is not None:
-            metadata["direction_support"] = direction_support
-            metadata["direction_diagnostics"] = direction_diagnostics
-        return _empty_scene(resolved, metadata)
-    if resolved.period_source == "ellipse" and any(
-        population.get("status") == "unavailable" for population in populations
-    ):
-        flags.append("partial_ellipse_direction_support")
-    if resolved.stack_rotation_deg is not None:
-        for population in selected:
-            try:
-                phi, alpha, delta, shear_ratio = _stack_rotation_geometry(
-                    float(population["angle_deg"]),
-                    float(draw_axis),
-                    float(resolved.stack_rotation_deg),
-                )
-            except ValueError as exc:
-                metadata = _metadata_base(
-                    resolved, identity, status="unavailable", available=False,
-                    message=str(exc), draw_axis_deg=draw_axis,
-                    reference_period=resolved.reference_period or max(periods),
-                    assumptions=assumptions, parameter_sources=parameter_sources,
-                    populations=populations, q_unit=q_unit,
-                    flags=(*flags, "stack_rotation_singular_geometry"),
-                )
-                if direction_support is not None:
-                    metadata["direction_support"] = direction_support
-                    metadata["direction_diagnostics"] = direction_diagnostics
-                return _empty_scene(resolved, metadata)
-            population.update(
-                {
-                    "lamellar_normal_phi_deg": phi,
-                    "stack_rotation_alpha_deg": alpha,
-                    "stack_axis_angle_relative_to_draw_axis_deg": alpha,
-                    "stack_to_normal_angle_deg": delta,
-                    "lateral_shift_ratio": shear_ratio,
-                    "orientation_assumption": (
-                        "explicit manual normal with conditional stack rotation"
-                        if resolved.period_source == "manual"
-                        else "observed q-direction normal assumption with conditional stack rotation"
-                    ),
-                }
+        q_nm = float(q_nm_values[0]) if q_nm_values else None
+        inconsistent_q = False
+        uncertain_q = False
+        if len(q_nm_values) == len(group):
+            inconsistent_q = any(
+                abs(float(item) - q_nm) > max(1e-12, 0.05 * q_nm)
+                for item in q_nm_values[1:]
             )
+        else:
+            native_units = {_normalise_q_unit(item["q_unit"]) for item in group}
+            if len(native_units) == 1:
+                native_q = float(first["q"])
+                inconsistent_q = any(
+                    abs(float(item["q"]) - native_q) > max(1e-12, 0.05 * native_q)
+                    for item in group[1:]
+                )
+            else:
+                uncertain_q = len(group) > 1
+        relative_q_unit: str | None = None
+        if q_nm is not None:
+            period = float(2.0 * np.pi / q_nm)
+            unit = "nm"
+            period_status = (
+                "candidate"
+                if any(
+                    item["status"] in {"candidate", "provisional", "undetermined"}
+                    for item in group
+                )
+                else "available"
+            )
+            period_source_name = "lobe_radial_peaks"
+            period_reason = "2π/q from the first valid radial lobe peak in this branch"
+            length_unit = "nm"
+        else:
+            q_value = float(first["q"])
+            relative_q_unit = _normalise_q_unit(first["q_unit"])
+            reference_q_native = reference_by_unit.get(relative_q_unit, q_value)
+            base = (
+                float(resolved.reference_period)
+                if resolved.reference_period is not None
+                else 1.0
+            )
+            period = float(base * reference_q_native / q_value)
+            unit = "relative"
+            period_status = (
+                "candidate"
+                if any(
+                    item["status"] in {"candidate", "provisional", "undetermined"}
+                    for item in group
+                )
+                else "available"
+            )
+            period_source_name = "lobe_radial_peaks"
+            period_reason = f"normalized to explicit reference q={reference_q_native:g} ({first['q_unit'] or 'unknown'})"
+            length_unit = "relative"
+            flags.append("spacing_unavailable_unknown_q_unit")
+            assumptions.append(
+                "Unknown q units are displayed on an explicit relative scale normalized to the retained reference q."
+            )
+        if uncertain_q:
+            flags.append("mixed_q_unit_support")
+            period_reason += "; opposite q units are mixed and cannot be compared"
+            period_status = "candidate"
+        if inconsistent_angle or inconsistent_q:
+            flags.append("inconsistent_opposite_support")
+            period_reason += f"; opposite q values={[float(item['q']) for item in group]} are inconsistent and were not mirrored or fabricated"
+            period_status = "candidate" if period_status == "available" else period_status
+        if any(
+            item["status"] in {"candidate", "provisional", "undetermined"}
+            for item in group
+        ):
+            flags.append("candidate_radial_support")
+        populations.append(
+            {
+                "branch_id": int(branch),
+                "period": period,
+                "length_unit": unit,
+                "relative_q_unit": relative_q_unit,
+                "angle_deg": angle,
+                "status": "candidate" if period_status == "candidate" else "schematic",
+                "support_indices": [int(item["index"]) for item in group],
+                "support_q_values": [float(item["q"]) for item in group],
+                "support_q_units": [str(item["q_unit"]) for item in group],
+            }
+        )
+        parameter_sources.append(
+            _period_record(
+                "period",
+                None if period_status == "candidate" else period,
+                unit,
+                period_source_name,
+                period_status,
+                period_reason,
+                candidate_value=period if period_status == "candidate" else None,
+            )
+        )
+        q_record = q_nm if q_nm is not None else float(first["q"])
+        parameter_sources.append(
+            _period_record(
+                "q_star",
+                None if period_status == "candidate" else q_record,
+                "nm^-1" if q_nm is not None else str(first["q_unit"]),
+                "lobe_radial_peaks",
+                "available" if period_status == "available" else period_status,
+                "retained radial peak",
+                candidate_value=q_record if period_status == "candidate" else None,
+            )
+        )
+    return populations, length_unit
+
+
+def _plan_packet_slots_and_spacing(
+    resolved: LamellarSettings,
+    selected: list[dict[str, Any]],
+    periods: list[float],
+    assumptions: list[str],
+) -> tuple[float, float, float, list[tuple[int, int, int]], int, int]:
     layout_period = (
         float(resolved.reference_period)
         if resolved.reference_period is not None
         else float(max(periods))
     )
-    # A retained project scale may predate this frame or be a manual
-    # normalization smaller than its current period. Use it for lower-bound
-    # layout only when it is large enough to contain the generated packets.
     layout_period = max(layout_period, max(periods))
     n_layers = int(resolved.layer_count)
-    centres: list[np.ndarray] = []
-    sizes: list[np.ndarray] = []
-    orientations: list[np.ndarray] = []
-    vertices: list[np.ndarray] = []
-    stack_ids: list[int] = []
-    branch_ids: list[int] = []
-    colors: list[np.ndarray] = []
-    # Separate whole packets, including their stack length and optional slip.
     maximum_shear = max(
         (
             abs(
                 float(
-                    population.get(
-                        "lateral_shift_ratio", resolved.lateral_shift_ratio
-                    )
+                    population.get("lateral_shift_ratio", resolved.lateral_shift_ratio)
                 )
             )
             for population in selected
@@ -1264,10 +897,6 @@ def build_lamellar_scene(
             elif has_two:
                 population_index = slot % len(selected)
             else:
-                # Preserve the established even-slot identity when the other
-                # fitted branch is absent in a frame. Manual two-direction
-                # previews still fill every slot through their two explicit
-                # assumptions above.
                 if resolved.period_source != "manual" and slot % 2:
                     continue
                 population_index = 0
@@ -1278,6 +907,29 @@ def build_lamellar_scene(
     total_slots = max(1, int(resolved.stack_count))
     grid_columns = max(1, int(np.ceil(np.sqrt(total_slots))))
     grid_rows = int(np.ceil(total_slots / grid_columns))
+    return layout_period, spacing, packet_gap_ratio, slot_entries, grid_columns, grid_rows
+
+
+def _generate_slab_geometry(
+    resolved: LamellarSettings,
+    selected: list[dict[str, Any]],
+    slot_entries: list[tuple[int, int, int]],
+    spacing: float,
+    layout_period: float,
+    packet_gap_ratio: float,
+    grid_columns: int,
+    grid_rows: int,
+    draw_axis: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n_layers = int(resolved.layer_count)
+    centres: list[np.ndarray] = []
+    sizes: list[np.ndarray] = []
+    orientations: list[np.ndarray] = []
+    vertices: list[np.ndarray] = []
+    stack_ids: list[int] = []
+    branch_ids: list[int] = []
+    colors: list[np.ndarray] = []
+
     for stack_id, population_index, slot in slot_entries:
         population = selected[population_index]
         branch = int(population["branch_id"])
@@ -1395,6 +1047,7 @@ def build_lamellar_scene(
             stack_ids.append(stack_id)
             branch_ids.append(branch)
             colors.append(_BLUE.copy() if branch_slot % 2 == 0 else _ORANGE.copy())
+
     centre_array = (
         np.asarray(centres, dtype=float).reshape((-1, 3))
         if centres
@@ -1429,6 +1082,354 @@ def build_lamellar_scene(
         )
     else:
         bounds = np.asarray(((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)), dtype=float)
+    return (
+        centre_array,
+        size_array,
+        orientation_array,
+        vertex_array,
+        np.asarray(stack_ids, dtype=int),
+        np.asarray(branch_ids, dtype=int),
+        color_array,
+        bounds,
+    )
+
+
+def build_lamellar_scene(
+    source: Any, settings: Mapping[str, Any] | LamellarSettings | None = None
+) -> LamellarScene:
+    """Build a deterministic 3D lamellar schematic scene from observed SAXS evidence."""
+
+    resolved = LamellarSettings.from_mapping(settings)
+    root = _source_mapping(source)
+    identity = _source_identity(source, root)
+    raw_peaks = _radial_peaks(root)
+    q_unit = _q_unit_from_source(root, raw_peaks)
+    draw_axis, execution_failure, stale, assumptions, stack_rotation_source = (
+        _resolve_draw_axis_and_state(root, resolved)
+    )
+
+    if execution_failure is not None and resolved.period_source != "manual":
+        metadata = _metadata_base(
+            resolved,
+            identity,
+            status="unavailable",
+            available=False,
+            message=f"Source execution status is {execution_failure}; measured peaks are not treated as current.",
+            draw_axis_deg=draw_axis,
+            reference_period=resolved.reference_period or 1.0,
+            assumptions=assumptions,
+            parameter_sources=[stack_rotation_source] if stack_rotation_source is not None else [],
+            q_unit=q_unit,
+            flags=("source_execution_failed",),
+        )
+        return _empty_scene(resolved, metadata)
+    if stale and resolved.period_source != "manual":
+        metadata = _metadata_base(
+            resolved,
+            identity,
+            status="stale",
+            available=False,
+            message="The source result is marked stale; no current lamellar scene is available.",
+            draw_axis_deg=draw_axis,
+            reference_period=resolved.reference_period or 1.0,
+            assumptions=assumptions,
+            parameter_sources=[stack_rotation_source] if stack_rotation_source is not None else [],
+            q_unit=q_unit,
+            flags=("stale_source",),
+        )
+        return _empty_scene(resolved, metadata)
+
+    flags: list[str] = []
+    parameter_sources: list[dict[str, Any]] = []
+    direction_support: list[dict[str, Any]] | None = None
+    direction_diagnostics: dict[str, Any] | None = None
+    ellipse_period_error: str | None = None
+    length_unit = "relative"
+
+    ellipse_for_metadata = _ellipse_payload(root)
+    parameter_sources.extend(_ellipse_parameter_records(ellipse_for_metadata))
+    if stack_rotation_source is not None:
+        parameter_sources.append(stack_rotation_source)
+
+    if resolved.period_source == "manual":
+        populations, length_unit = _build_manual_populations(
+            resolved, parameter_sources, assumptions
+        )
+    elif not raw_peaks and resolved.period_source != "ellipse":
+        parameter_sources.append(
+            _period_record(
+                "period",
+                None,
+                "relative",
+                "lobe_radial_peaks",
+                "unavailable",
+                "no valid radial lobe peaks; annulus q is not accepted",
+            )
+        )
+        metadata = _metadata_base(
+            resolved,
+            identity,
+            status="unavailable",
+            available=False,
+            message="No valid lobe_radial_peaks with a positive radial q_star were found; annulus/azimuthal q is not used.",
+            draw_axis_deg=draw_axis,
+            reference_period=resolved.reference_period or 1.0,
+            assumptions=assumptions,
+            parameter_sources=parameter_sources,
+            q_unit=q_unit,
+            flags=("no_valid_lobe_radial_peaks", "spacing_unavailable_unknown_q_unit"),
+        )
+        return _empty_scene(resolved, metadata)
+    elif resolved.period_source == "ellipse":
+        support = observed_direction_support(root) or _radial_peak_direction_support(raw_peaks)
+        if not support:
+            metadata = _metadata_base(
+                resolved,
+                identity,
+                status="unavailable",
+                available=False,
+                message=(
+                    "The ellipse supplies reciprocal-space shape and period candidates, "
+                    "but no retained observed ridge points or radial lobe peaks are "
+                    "available to set a lamellar-normal direction."
+                ),
+                draw_axis_deg=draw_axis,
+                reference_period=resolved.reference_period or 1.0,
+                assumptions=assumptions,
+                parameter_sources=parameter_sources,
+                q_unit=q_unit,
+                flags=("no_observed_direction_support",),
+            )
+            metadata["direction_support"] = []
+            return _empty_scene(resolved, metadata)
+        direction_support = support
+        populations, direction_diagnostics, direction_error = _direction_populations(support)
+        explicit_populations = [
+            item
+            for item in populations
+            if _exact_integer(item.get("branch_id")) is not None and int(item["branch_id"]) >= 0
+        ]
+        if direction_error is not None and not explicit_populations:
+            metadata = _metadata_base(
+                resolved,
+                identity,
+                status="unavailable",
+                available=False,
+                message=direction_error,
+                draw_axis_deg=draw_axis,
+                reference_period=resolved.reference_period or 1.0,
+                assumptions=assumptions,
+                parameter_sources=parameter_sources,
+                q_unit=q_unit,
+                flags=("ambiguous_observed_directions",),
+            )
+            metadata["direction_support"] = support
+            metadata["direction_diagnostics"] = direction_diagnostics
+            return _empty_scene(resolved, metadata)
+        if direction_error is not None:
+            flags.append("ambiguous_unassigned_direction_retained")
+        parameter_sources.append(
+            _period_record(
+                "observed_direction_support",
+                None,
+                "degree",
+                _direction_source_label(support),
+                "available",
+                "direction only; retained observed q-space support is not replaced by fitted ellipse angle",
+            )
+        )
+        assumptions.append(
+            "Ellipse-mode schematic normals use only retained observed ridge-point or radial lobe-peak directions. The fitted ellipse theta defines q-space geometry and is not treated as the lamellar-normal angle."
+        )
+        flags.append(
+            "ellipse_direction_from_radial_lobe_peaks"
+            if all("lobe_radial_peaks" in str(row.get("source", "")) for row in support)
+            else "ellipse_direction_from_observed_ridge_points"
+        )
+        ellipse_period_error = _apply_ellipse_directional_periods(
+            root,
+            resolved,
+            populations,
+            direction_support,
+            draw_axis,
+            q_unit,
+            parameter_sources,
+            flags,
+            assumptions,
+        )
+    else:
+        populations, length_unit = _build_radial_populations(
+            raw_peaks, resolved, parameter_sources, flags, assumptions
+        )
+
+    def _unavailable_with_support(msg: str, extra_flags: Sequence[str] = ()) -> LamellarScene:
+        meta = _metadata_base(
+            resolved,
+            identity,
+            status="unavailable",
+            available=False,
+            message=msg,
+            draw_axis_deg=draw_axis,
+            reference_period=resolved.reference_period or 1.0,
+            assumptions=assumptions,
+            parameter_sources=parameter_sources,
+            populations=populations,
+            q_unit=q_unit,
+            flags=(*flags, *extra_flags),
+        )
+        if direction_support is not None:
+            meta["direction_support"] = direction_support
+            meta["direction_diagnostics"] = direction_diagnostics
+        return _empty_scene(resolved, meta)
+
+    selected = [
+        population
+        for population in populations
+        if resolved.selected_branch < 0
+        or int(population["branch_id"]) == int(resolved.selected_branch)
+    ]
+    if resolved.period_source == "ellipse":
+        selected = [
+            population
+            for population in selected
+            if _finite_positive(population.get("period")) is not None
+        ]
+    if not selected:
+        return _unavailable_with_support(
+            ellipse_period_error
+            or f"Selected branch {resolved.selected_branch} has no supported lamellar population.",
+            ("selected_branch_unavailable",),
+        )
+
+    selected_units = {
+        str(population.get("length_unit", length_unit))
+        for population in selected
+        if _finite_positive(population.get("period")) is not None
+    }
+    if len(selected_units) > 1:
+        mixed_units = sorted(selected_units)
+        scene_unavail = _unavailable_with_support(
+            "Selected populations use incompatible length units ("
+            + " and ".join(mixed_units)
+            + "); select one branch before generating a scene.",
+            ("mixed_length_units",),
+        )
+        scene_unavail.metadata["length_unit"] = "relative"
+        scene_unavail.metadata["mixed_length_units"] = mixed_units
+        return scene_unavail
+
+    selected_relative_q_units = {
+        str(population["relative_q_unit"])
+        for population in selected
+        if population.get("length_unit") == "relative"
+        and population.get("relative_q_unit") not in (None, "")
+        and _finite_positive(population.get("period")) is not None
+    }
+    if len(selected_relative_q_units) > 1:
+        mixed_q_units = sorted(selected_relative_q_units)
+        scene_unavail = _unavailable_with_support(
+            "Selected populations use incompatible non-physical q units ("
+            + " and ".join(mixed_q_units)
+            + "); select one branch before generating a scene.",
+            ("mixed_q_unit_support",),
+        )
+        scene_unavail.metadata["length_unit"] = "relative"
+        scene_unavail.metadata["mixed_q_units"] = mixed_q_units
+        return scene_unavail
+
+    if (
+        len(selected) < 2
+        and resolved.selected_branch < 0
+        and resolved.period_source != "manual"
+    ):
+        flags.append("single_branch_supported")
+    if selected_units:
+        length_unit = next(iter(selected_units))
+    periods = [
+        float(item["period"])
+        for item in selected
+        if _finite_positive(item.get("period")) is not None
+    ]
+    if not periods:
+        return _unavailable_with_support(
+            ellipse_period_error or "No finite positive period remained after source adaptation."
+        )
+    if resolved.period_source == "ellipse" and any(
+        population.get("status") == "unavailable" for population in populations
+    ):
+        flags.append("partial_ellipse_direction_support")
+
+    if resolved.stack_rotation_deg is not None:
+        for population in selected:
+            try:
+                phi, alpha, delta, shear_ratio = _stack_rotation_geometry(
+                    float(population["angle_deg"]),
+                    float(draw_axis),
+                    float(resolved.stack_rotation_deg),
+                )
+            except ValueError as exc:
+                meta = _metadata_base(
+                    resolved,
+                    identity,
+                    status="unavailable",
+                    available=False,
+                    message=str(exc),
+                    draw_axis_deg=draw_axis,
+                    reference_period=resolved.reference_period or max(periods),
+                    assumptions=assumptions,
+                    parameter_sources=parameter_sources,
+                    populations=populations,
+                    q_unit=q_unit,
+                    flags=(*flags, "stack_rotation_singular_geometry"),
+                )
+                if direction_support is not None:
+                    meta["direction_support"] = direction_support
+                    meta["direction_diagnostics"] = direction_diagnostics
+                return _empty_scene(resolved, meta)
+            population.update(
+                {
+                    "lamellar_normal_phi_deg": phi,
+                    "stack_rotation_alpha_deg": alpha,
+                    "stack_axis_angle_relative_to_draw_axis_deg": alpha,
+                    "stack_to_normal_angle_deg": delta,
+                    "lateral_shift_ratio": shear_ratio,
+                    "orientation_assumption": (
+                        "explicit manual normal with conditional stack rotation"
+                        if resolved.period_source == "manual"
+                        else "observed q-direction normal assumption with conditional stack rotation"
+                    ),
+                }
+            )
+
+    (
+        layout_period,
+        spacing,
+        packet_gap_ratio,
+        slot_entries,
+        grid_columns,
+        grid_rows,
+    ) = _plan_packet_slots_and_spacing(resolved, selected, periods, assumptions)
+    (
+        centre_array,
+        size_array,
+        orientation_array,
+        vertex_array,
+        stack_id_array,
+        branch_id_array,
+        color_array,
+        bounds,
+    ) = _generate_slab_geometry(
+        resolved,
+        selected,
+        slot_entries,
+        spacing,
+        layout_period,
+        packet_gap_ratio,
+        grid_columns,
+        grid_rows,
+        draw_axis,
+    )
+
     scene_status = (
         "candidate"
         if any(item.get("status") == "candidate" for item in selected)
@@ -1472,8 +1473,8 @@ def build_lamellar_scene(
         sizes=size_array,
         orientations=orientation_array,
         vertices=vertex_array,
-        stack_ids=np.asarray(stack_ids, dtype=int),
-        branch_ids=np.asarray(branch_ids, dtype=int),
+        stack_ids=stack_id_array,
+        branch_ids=branch_id_array,
         colors=color_array,
         bounds=bounds,
         length_unit=length_unit,
@@ -1481,15 +1482,4 @@ def build_lamellar_scene(
     )
 
 
-def load_lamellar_sources(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
-    from .lamellar_sources import load_lamellar_sources as _load
-
-    return _load(path)
-
-
-__all__ = (
-    "LamellarScene",
-    "LamellarSettings",
-    "build_lamellar_scene",
-    "load_lamellar_sources",
-)
+__all__ = ["build_lamellar_scene"]

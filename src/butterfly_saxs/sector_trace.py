@@ -15,8 +15,12 @@ from typing import Any
 
 import numpy as np
 
+from ._primitives import strict_int
 from .arc_support import freeze_observed_support
-from .butterfly_ridge import (
+from .cancellation import raise_if_cancelled
+from .ridge_inputs import canonical_inputs
+from .sector_peaks import measure_sector_peaks
+from .tracing.topology import (
     _apply_edits,
     _apply_seeds,
     _arc_topology,
@@ -27,10 +31,6 @@ from .butterfly_ridge import (
     _public_point,
     _refresh_arc_identity,
 )
-from .cancellation import raise_if_cancelled
-from .ridge_inputs import canonical_inputs
-from .sector_peaks import measure_sector_peaks
-from .settings import strict_int
 
 METHOD_VERSION = "butterfly-radial-sector-v1.0"
 

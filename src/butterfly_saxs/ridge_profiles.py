@@ -15,9 +15,10 @@ from typing import Any
 
 import numpy as np
 
+from ._primitives import parse_q_window as _shared_parse_q_window
 from .ridge_inputs import (
-    as_image as _shared_as_image,
-    as_qmap as _shared_as_qmap,
+    as_image as _as_image,
+    as_qmap as _as_qmap,
     coordinate_derivatives as _coordinate_derivatives,
     field as _field,
     representative_q_step as _representative_q_step,
@@ -36,14 +37,6 @@ except Exception:  # pragma: no cover - useful for source inspection only
 
 
 METHOD_VERSION = "butterfly-ridge-profiles-v1.0"
-
-
-def _as_image(image: Any) -> tuple[np.ndarray, np.ndarray | None]:
-    return _shared_as_image(image)
-
-
-def _as_qmap(qmap: Any, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-    return _shared_as_qmap(qmap, shape)
 
 
 def _normalise_options(options: Any) -> dict[str, Any]:
@@ -745,21 +738,13 @@ def wang2007_vertical_slice_check(
 
 
 def _parse_q_window(q_window: Any, q: np.ndarray) -> tuple[float, float]:
-    if q_window is None:
-        finite = q[np.isfinite(q)]
-        return (float(np.min(finite)), float(np.max(finite))) if finite.size else (float("nan"), float("nan"))
-    if isinstance(q_window, Mapping):
-        low = _field(q_window, ("q_min", "min", "low", "start"), None)
-        high = _field(q_window, ("q_max", "max", "high", "stop"), None)
-    else:
-        try:
-            low, high = q_window
-        except Exception as exc:
-            raise ValueError("q_window must be a (q_min, q_max) pair or mapping") from exc
-    low, high = float(low), float(high)
-    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
-        raise ValueError("q_window must contain finite q_min < q_max")
-    return low, high
+    parsed = _shared_parse_q_window(
+        q_window,
+        q,
+        empty_fallback=(float("nan"), float("nan")),
+    )
+    assert parsed is not None
+    return parsed
 
 
 # Friendly aliases for callers that use the descriptive names from the

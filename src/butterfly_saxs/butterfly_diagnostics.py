@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
 import numpy as np
+
+from .butterfly_quality import extract_arc_rows
 
 
 def profile_residuals(profiles: dict) -> None:
@@ -26,24 +27,12 @@ def arc_diagnostic_rows(trace: Mapping | Sequence | None, candidate: Mapping | N
     or export it, but it does not certify scientific acceptance.
     """
 
-    candidates = []
-    if isinstance(candidate, Mapping):
-        candidates.extend((candidate.get("arc_diagnostics"), candidate.get("arc_support")))
-    if isinstance(trace, Mapping):
-        candidates.extend((trace.get("arc_diagnostics"), trace.get("arc_support")))
-        diagnostics = trace.get("diagnostics")
-        if isinstance(diagnostics, Mapping):
-            candidates.extend((diagnostics.get("arc_diagnostics"), diagnostics.get("arc_support")))
-    elif isinstance(trace, Sequence) and not isinstance(trace, (str, bytes)):
-        candidates.append(trace)
-    rows = []
-    for value in candidates:
-        if isinstance(value, Mapping):
-            value = value.get("rows", value.get("arcs", value.get("records")))
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            rows = [deepcopy(item) for item in value if isinstance(item, Mapping)]
-            if rows:
-                break
+    rows = extract_arc_rows(
+        trace,
+        candidate,
+        include_unassigned=True,
+        deep_copy=True,
+    )
     return {
         "rows": rows,
         "source": "observed_arc_support",

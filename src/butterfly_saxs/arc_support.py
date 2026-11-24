@@ -18,11 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import math
-from numbers import Integral, Real
+from numbers import Integral
 from typing import Any
 
 import numpy as np
 
+from ._primitives import finite_float as _finite
 from .cancellation import raise_if_cancelled
 
 
@@ -34,11 +35,6 @@ _PAD_MULTIPLIER = 2.0
 _GAP_THRESHOLD_MULTIPLIER = 4.0
 
 
-def _finite(value: Any) -> float | None:
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-        return None
-    number = float(value)
-    return number if np.isfinite(number) else None
 
 
 def _json_scalar(value: Any) -> Any:
@@ -51,10 +47,6 @@ def _json_scalar(value: Any) -> Any:
 
 def _point_id(point: Mapping[str, Any], fallback: int) -> Any:
     return _json_scalar(point.get("point_id", point.get("id", fallback)))
-
-
-def _same_id(left: Any, right: Any) -> bool:
-    return left == right or str(left) == str(right)
 
 
 def _q(point: Mapping[str, Any]) -> tuple[float, float] | None:

@@ -12,16 +12,24 @@ from typing import Any
 
 import numpy as np
 
+from ._observables_ridges import _azimuthal_peak_ridges
+from ._observables_types import _q_unit
+from ._primitives import strict_int
 from .arc_support import freeze_observed_support
-from .butterfly_ridge import (
-    _apply_edits, _apply_seeds, _arc_topology, _assign_reference_branches,
-    _normalise_options, _parse_q_window, _point_signature, _public_point,
-    _refresh_arc_identity,
-)
 from .cancellation import raise_if_cancelled
 from .ridge_inputs import Q_ALIASES, array_field, canonical_inputs
 from .sector_peaks import _local_representative_q_step
-from .settings import strict_int
+from .tracing.topology import (
+    _apply_edits,
+    _apply_seeds,
+    _arc_topology,
+    _assign_reference_branches,
+    _normalise_options,
+    _parse_q_window,
+    _point_signature,
+    _public_point,
+    _refresh_arc_identity,
+)
 
 METHOD_VERSION = "butterfly-annular-trajectory-v1.1"
 
@@ -337,8 +345,6 @@ def _select_and_connect(points, *, angle_step_deg, min_track_points=3):
 
 def trace_butterfly_annuli(image, qmap, q_window, *, mask=None, reference_axis_deg=0.,
                           options=None, edits=None, cancel_event=None) -> dict[str, Any]:
-    from .observables import _azimuthal_peak_ridges, _q_unit
-
     started = time.perf_counter()
     data, qx, qy, q, invalid = canonical_inputs(image, qmap, mask=mask)
     window = _parse_q_window(q_window, q)

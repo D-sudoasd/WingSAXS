@@ -15,6 +15,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from scipy.signal import find_peaks, peak_prominences, peak_widths
 
+from ._primitives import finite_float, strict_int
 from .cancellation import raise_if_cancelled
 from .serialization import json_safe
 
@@ -68,13 +69,13 @@ def _parse_window(value: Any, name: str) -> tuple[float, float] | None:
             low, high = value[0], value[1]
         except (TypeError, KeyError, IndexError, ValueError) as exc:
             raise TypeError(f"{name} must contain two finite q values") from exc
-    try:
-        pair = float(low), float(high)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must contain two finite q values") from exc
-    if not all(math.isfinite(item) for item in pair) or pair[0] >= pair[1]:
+    low_f = finite_float(low)
+    high_f = finite_float(high)
+    if low_f is None or high_f is None:
+        raise ValueError(f"{name} must contain two finite q values")
+    if low_f >= high_f:
         raise ValueError(f"{name} must be finite and strictly increasing")
-    return pair
+    return low_f, high_f
 
 
 def _options_from(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -104,14 +105,10 @@ def _options_from(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "raw_support_sigma",
         "angular_noise_smoothing_sigma_bins",
     ):
-        if isinstance(out[key], (bool, np.bool_)):
-            raise ValueError(f"options[{key!r}] must be numeric")
-        try:
-            out[key] = float(out[key])
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"options[{key!r}] must be numeric") from exc
-        if not math.isfinite(out[key]):
-            raise ValueError(f"options[{key!r}] must be finite")
+        parsed = finite_float(out[key])
+        if parsed is None:
+            raise ValueError(f"options[{key!r}] must be finite and numeric")
+        out[key] = parsed
 
     for key in (
         "angular_bins",
@@ -120,16 +117,7 @@ def _options_from(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "maximum_lobes",
         "radial_bins",
     ):
-        item = out[key]
-        if isinstance(item, (bool, np.bool_)):
-            raise ValueError(f"options[{key!r}] must be an integer")
-        try:
-            cast = int(item)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"options[{key!r}] must be an integer") from exc
-        if cast != item:
-            raise ValueError(f"options[{key!r}] must be an integer")
-        out[key] = cast
+        out[key] = strict_int(out[key], f"options[{key!r}]")
 
     if out["smoothing_sigma_px"] < 0.0:
         raise ValueError("smoothing_sigma_px must be non-negative")
@@ -516,26 +504,59 @@ def _angular_candidates(
         float(options["minimum_prominence"]),
         float(options["minimum_prominence_sigma"]) * noise_sigma,
     )
-    wlen = int(
-        max(
-            5,
-            round(2.0 * float(options["minimum_peak_separation_deg"]) / bin_width) + 1,
+    sup_indices = np.flatnonzero(supported)
+    m = int(sup_indices.size)
+    geom_counts = profile.get("geometric_pixel_counts")
+    cov_frac = profile.get("coverage_fraction")
+    min_cov = float(options["minimum_angular_coverage_fraction"])
+    if geom_counts is not None and cov_frac is not None:
+        unmasked_hole = (
+            (np.asarray(geom_counts, dtype=np.int64) == 0)
+            | (np.asarray(cov_frac, dtype=np.float64) >= min_cov)
         )
-    )
-    if wlen % 2 == 0:
-        wlen += 1
-    wlen = min(wlen, 2 * n_bins - 1)
-    if wlen % 2 == 0:
-        wlen -= 1
+    else:
+        unmasked_hole = supported
+    max_bridge_bins = max(2, int(math.floor(12.0 / bin_width)))
+    break_after: list[int] = []
+    for k in range(m):
+        curr_idx = int(sup_indices[k])
+        next_idx = int(sup_indices[(k + 1) % m])
+        step_bins = (next_idx - curr_idx) % n_bins
+        if step_bins == 1:
+            continue
+        gap_len = step_bins - 1
+        if gap_len > max_bridge_bins:
+            break_after.append(k)
+            continue
+        gap_idx = (curr_idx + np.arange(1, step_bins, dtype=np.int64)) % n_bins
+        if not bool(np.all(unmasked_hole[gap_idx])):
+            break_after.append(k)
+
     peak_measures: list[tuple[int, float, float]] = []
-    if bool(np.all(supported)):
-        extended = np.tile(values, 3)
+    if not break_after:
+        seg_vals = values[sup_indices]
+        seg_angles = centers[sup_indices]
+        unwrapped_deg = np.concatenate((seg_angles - 360.0, seg_angles, seg_angles + 360.0))
+        sample_grid = np.arange(3 * m, dtype=np.float64)
+        avg_step_deg = 360.0 / m
+        loop_wlen = int(
+            max(
+                5,
+                round(2.0 * float(options["minimum_peak_separation_deg"]) / avg_step_deg) + 1,
+            )
+        )
+        if loop_wlen % 2 == 0:
+            loop_wlen += 1
+        loop_wlen = min(loop_wlen, 2 * m - 1)
+        if loop_wlen % 2 == 0:
+            loop_wlen -= 1
+        extended = np.tile(seg_vals, 3)
         repeated_peaks, _ = find_peaks(extended)
-        middle = repeated_peaks[(repeated_peaks >= n_bins) & (repeated_peaks < 2 * n_bins)]
+        middle = repeated_peaks[(repeated_peaks >= m) & (repeated_peaks < 2 * m)]
         for peak_extended in middle:
-            index = int(peak_extended - n_bins)
+            index = int(sup_indices[int(peak_extended - m)])
             prominence_data = peak_prominences(
-                extended, np.asarray([peak_extended]), wlen=max(3, wlen)
+                extended, np.asarray([peak_extended]), wlen=max(3, loop_wlen)
             )
             prominence = float(prominence_data[0][0])
             width_data = peak_widths(
@@ -544,27 +565,42 @@ def _angular_candidates(
                 rel_height=0.5,
                 prominence_data=prominence_data,
             )
-            width_deg = float(width_data[0][0] * bin_width)
-            peak_measures.append((index, prominence, width_deg))
+            left_deg = float(np.interp(width_data[2][0], sample_grid, unwrapped_deg))
+            right_deg = float(np.interp(width_data[3][0], sample_grid, unwrapped_deg))
+            peak_measures.append((index, prominence, right_deg - left_deg))
     else:
-        # Analyze each contiguous supported circular run independently so
-        # masked gaps never introduce an artificial cliff or edge peak.
-        first_gap = int(np.flatnonzero(~supported)[0])
-        shift = (first_gap + 1) % n_bins
-        sup_rot = np.roll(supported, -shift)
-        val_rot = np.roll(values, -shift)
-        padded = np.r_[False, sup_rot, False]
-        starts = np.flatnonzero(padded[1:] & ~padded[:-1])
-        ends = np.flatnonzero(~padded[1:] & padded[:-1])
-        for run_start, run_end in zip(starts.tolist(), ends.tolist()):
-            run_len = run_end - run_start
+        # Analyze each contiguous supported arc independently across real masked
+        # or unpopulated gaps so gap boundaries never fabricate cliff peaks.
+        num_breaks = len(break_after)
+        for r in range(num_breaks):
+            start_k = (break_after[r] + 1) % m
+            end_k = break_after[(r + 1) % num_breaks]
+            run_len = (end_k - start_k) % m + 1
             if run_len < 3:
                 continue
-            segment = val_rot[run_start:run_end]
+            run_idx = np.roll(sup_indices, -start_k)[:run_len]
+            segment = values[run_idx]
             local_peaks, _ = find_peaks(segment)
             if not local_peaks.size:
                 continue
-            run_wlen = min(max(3, wlen), run_len)
+            raw_angles = centers[run_idx]
+            seg_angles = raw_angles[0] + np.concatenate(
+                ([0.0], np.cumsum(np.diff(raw_angles) % 360.0))
+            )
+            sample_grid = np.arange(run_len, dtype=np.float64)
+            avg_step_deg = float(seg_angles[-1] - seg_angles[0]) / max(run_len - 1, 1)
+            run_wlen = int(
+                max(
+                    3,
+                    round(
+                        2.0
+                        * float(options["minimum_peak_separation_deg"])
+                        / max(avg_step_deg, bin_width)
+                    )
+                    + 1,
+                )
+            )
+            run_wlen = min(run_wlen, run_len)
             if run_wlen % 2 == 0 and run_wlen > 3:
                 run_wlen -= 1
             prominence_data = peak_prominences(segment, local_peaks, wlen=run_wlen)
@@ -574,13 +610,16 @@ def _angular_candidates(
                 rel_height=0.5,
                 prominence_data=prominence_data,
             )
-            for local_peak, prom, width_bins in zip(
+            left_degs = np.interp(width_data[2], sample_grid, seg_angles)
+            right_degs = np.interp(width_data[3], sample_grid, seg_angles)
+            for local_peak, prom, left_d, right_d in zip(
                 local_peaks.tolist(),
                 prominence_data[0].tolist(),
-                width_data[0].tolist(),
+                left_degs.tolist(),
+                right_degs.tolist(),
             ):
-                index = int((shift + run_start + local_peak) % n_bins)
-                peak_measures.append((index, float(prom), float(width_bins * bin_width)))
+                index = int(run_idx[local_peak])
+                peak_measures.append((index, float(prom), float(right_d - left_d)))
     records: list[dict[str, Any]] = []
     for index, prominence, width_deg in peak_measures:
         if not supported[index]:

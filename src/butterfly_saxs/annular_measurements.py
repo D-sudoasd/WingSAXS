@@ -8,15 +8,9 @@ from typing import Any
 import numpy as np
 
 
+from ._primitives import finite_float as _finite
+
 QUADRANTS = ("QI", "QII", "QIII", "QIV")
-
-
-def _finite(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if np.isfinite(number) else None
 
 
 def _delta(angle: float) -> float:

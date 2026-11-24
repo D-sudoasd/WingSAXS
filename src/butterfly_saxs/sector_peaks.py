@@ -21,8 +21,13 @@ from typing import Any
 
 import numpy as np
 
+from ._observables_types import _q_unit
+from ._primitives import (
+    finite_float as _shared_finite_float,
+    parse_q_window as _shared_parse_q_window,
+    strict_int as _strict_int,
+)
 from .cancellation import raise_if_cancelled
-from .observables import _q_unit
 from .ridge_inputs import Q_ALIASES, array_field, canonical_inputs, robust_noise
 
 try:  # scipy is a declared project dependency, but retain a small fallback.
@@ -58,50 +63,18 @@ def _option(values: Mapping[str, Any], name: str, default: Any, *aliases: str) -
 
 
 def _finite_float(value: Any, name: str, *, minimum: float | None = None) -> float:
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a finite number, not bool")
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite number") from exc
-    if not np.isfinite(result):
+    result = _shared_finite_float(value)
+    if result is None:
         raise ValueError(f"{name} must be a finite number")
     if minimum is not None and result < minimum:
         raise ValueError(f"{name} must be >= {minimum:g}")
     return result
 
 
-def _strict_int(value: Any, name: str, *, minimum: int = 0) -> int:
-    """Parse an integer option without silently truncating floats or bools."""
-
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be an integer, not bool")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be an integer") from exc
-    if not np.isfinite(numeric) or not numeric.is_integer():
-        raise ValueError(f"{name} must be an integer")
-    result = int(numeric)
-    if result < minimum:
-        raise ValueError(f"{name} must be >= {minimum}")
-    return result
-
-
 def _q_window(value: Any) -> tuple[float, float]:
-    if isinstance(value, Mapping):
-        low = value.get("q_min", value.get("min", value.get("low", value.get("start"))))
-        high = value.get("q_max", value.get("max", value.get("high", value.get("stop"))))
-    else:
-        try:
-            low, high = value
-        except (TypeError, ValueError) as exc:
-            raise ValueError("q_window must be a finite (q_min, q_max) pair") from exc
-    low = _finite_float(low, "q_window[0]")
-    high = _finite_float(high, "q_window[1]")
-    if high <= low:
-        raise ValueError("q_window must have q_max > q_min")
-    return low, high
+    parsed = _shared_parse_q_window(value)
+    assert parsed is not None
+    return parsed
 
 
 def _contiguous_runs(supported: np.ndarray) -> list[tuple[int, int]]:
