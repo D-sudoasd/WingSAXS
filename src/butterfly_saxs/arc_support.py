@@ -668,7 +668,8 @@ def freeze_observed_support(
         arc for arc in arc_values
         if not _is_unassigned_arc_id(arc.get("arc_id", arc.get("id", -1)))
     ]
-    points_by_arc: dict[Any, list[tuple[int, Mapping[str, Any]]]] = {}
+    points_by_arc: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
+    arc_id_by_key: dict[str, Any] = {}
     unassigned_point_count = 0
     for index, point in enumerate(points):
         if not isinstance(point, Mapping):
@@ -677,8 +678,9 @@ def freeze_observed_support(
         if _is_unassigned_arc_id(arc_id):
             unassigned_point_count += 1
             continue
-        points_by_arc.setdefault(arc_id, []).append((index, point))
-        points_by_arc.setdefault(str(arc_id), points_by_arc[arc_id])
+        key = str(arc_id)
+        arc_id_by_key.setdefault(key, arc_id)
+        points_by_arc.setdefault(key, []).append((index, point))
     records: list[dict[str, Any]] = []
     seen_arc_keys: set[str] = set()
     for raw_arc in arc_values:
@@ -688,17 +690,16 @@ def freeze_observed_support(
         if key in seen_arc_keys:
             continue
         seen_arc_keys.add(key)
-        members = points_by_arc.get(arc_id, points_by_arc.get(key, []))
+        members = points_by_arc.get(key, [])
         record = _arc_support_record(raw_arc, members)
         if isinstance(raw_arc, dict):
             raw_arc.update(record)
         records.append(record)
     # Preserve point records even if a caller forgot to include an arc object.
-    for arc_id, members in list(points_by_arc.items()):
-        key = str(arc_id)
+    for key, members in list(points_by_arc.items()):
         if key in seen_arc_keys:
             continue
-        raw_arc = {"arc_id": arc_id}
+        raw_arc = {"arc_id": arc_id_by_key[key]}
         record = _arc_support_record(raw_arc, members)
         records.append(record)
         seen_arc_keys.add(key)
@@ -721,7 +722,23 @@ def freeze_observed_support(
             continue
         arc_record = by_arc.get(str(point.get("arc_id", -1)))
         if arc_record is None:
-            point.update({"support_version": SUPPORT_VERSION, "support_frozen": False, "support_status": "unavailable_no_arc"})
+            point.update(
+                {
+                    "support_version": SUPPORT_VERSION,
+                    "support_frozen": False,
+                    "support_status": "unavailable_no_arc",
+                    "support_components": [],
+                    "support_rectangles": [],
+                    "support_component_ids": [],
+                    "observed_support": {
+                        "version": SUPPORT_VERSION,
+                        "arc_id": None,
+                        "status": "unavailable_no_arc",
+                        "components": [],
+                        "gap_count": 0,
+                    },
+                }
+            )
             continue
         point["support_version"] = SUPPORT_VERSION
         point["support_frozen"] = bool(arc_record.get("support_frozen", False))
@@ -758,7 +775,8 @@ def freeze_observed_support(
                 "gap_count": int(arc_record.get("support_gap_count", 0)),
             }
         else:
-            point.setdefault("support_components", [])
+            point["support_components"] = []
+            point["support_rectangles"] = []
             point["support_component_ids"] = []
             point["observed_support"] = {
                 "version": SUPPORT_VERSION,

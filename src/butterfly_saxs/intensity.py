@@ -228,6 +228,153 @@ def canonical_parameter_name(key: Any) -> str:
     return _ALIASES.get(name, name)
 
 
+def _scaled_spec_bound(bound: float | None, scale: float) -> float | None:
+    if bound is None:
+        return None
+    val = float(bound)
+    return val * scale if math.isfinite(val) else val
+
+
+def _clamp_to_spec_bounds(value: float, lo: float | None, hi: float | None) -> float:
+    out = float(value)
+    if lo is not None and math.isfinite(lo) and out < lo:
+        out = float(lo)
+    if hi is not None and math.isfinite(hi) and out > hi:
+        out = float(hi)
+    return out
+
+
+def _expand_parameter_set_shorthands(pset: ParameterSet) -> ParameterSet:
+    """Expand shorthand specs (radial_fwhm, radial_width, amplitude) into canonical specs."""
+
+    shorthand_keys = [
+        key
+        for key in pset.names
+        if canonical_parameter_name(key) in {"radial_fwhm", "radial_width", "amplitude"}
+    ]
+    if not shorthand_keys:
+        return pset
+
+    out = pset.copy()
+    resolved = pset.resolve()
+    fwhm_per_sigma = 2.0 * math.sqrt(2.0 * math.log(2.0))
+    gamma_per_sigma = math.sqrt(2.0 * math.log(2.0))
+
+    for src_key in shorthand_keys:
+        if src_key not in out:
+            continue
+        canon = canonical_parameter_name(src_key)
+        src = out[src_key]
+        raw_val = float(resolved.get(src_key, src.value))
+
+        if canon == "radial_fwhm":
+            fwhm = abs(_positive(raw_val, 0.0))
+            sig_scale = 1.0 / fwhm_per_sigma
+            gam_scale = 0.5
+            sig_min = _scaled_spec_bound(src.min, sig_scale)
+            sig_max = _scaled_spec_bound(src.max, sig_scale)
+            gam_min = _scaled_spec_bound(src.min, gam_scale)
+            gam_max = _scaled_spec_bound(src.max, gam_scale)
+            sig_val = _clamp_to_spec_bounds(
+                fwhm * sig_scale if fwhm > 0.0 else float(DEFAULT_PARAMETERS["radial_sigma"]),
+                sig_min,
+                sig_max,
+            )
+            gam_val = _clamp_to_spec_bounds(
+                fwhm * gam_scale if fwhm > 0.0 else float(DEFAULT_PARAMETERS["radial_gamma"]),
+                gam_min,
+                gam_max,
+            )
+            replace_sigma = ("radial_sigma" not in out) or (
+                src.vary and not out["radial_sigma"].vary and not out["radial_sigma"].is_tied
+            )
+            replace_gamma = ("radial_gamma" not in out) or (
+                src.vary and not out["radial_gamma"].vary and not out["radial_gamma"].is_tied
+            )
+            if src.vary:
+                if replace_sigma:
+                    out["radial_sigma"] = ParameterSpec(
+                        sig_val, min=sig_min, max=sig_max, vary=True, name="radial_sigma"
+                    )
+                if replace_gamma and "radial_sigma" in out:
+                    out["radial_gamma"] = ParameterSpec(
+                        gam_val,
+                        vary=False,
+                        expr=f"radial_sigma * {gamma_per_sigma:.17g}",
+                        name="radial_gamma",
+                    )
+                elif replace_gamma:
+                    out["radial_gamma"] = ParameterSpec(
+                        gam_val, min=gam_min, max=gam_max, vary=True, name="radial_gamma"
+                    )
+            else:
+                if "radial_sigma" not in out and fwhm > 0.0:
+                    out["radial_sigma"] = ParameterSpec(
+                        sig_val, min=sig_min, max=sig_max, vary=False, name="radial_sigma"
+                    )
+                if "radial_gamma" not in out and fwhm > 0.0:
+                    out["radial_gamma"] = ParameterSpec(
+                        gam_val, min=gam_min, max=gam_max, vary=False, name="radial_gamma"
+                    )
+
+        elif canon == "radial_width":
+            w_min = _scaled_spec_bound(src.min, 1.0)
+            w_max = _scaled_spec_bound(src.max, 1.0)
+            w_val = _clamp_to_spec_bounds(
+                abs(_positive(raw_val, float(DEFAULT_PARAMETERS["radial_sigma"]))),
+                w_min,
+                w_max,
+            )
+            replace_sigma = ("radial_sigma" not in out) or (
+                src.vary and not out["radial_sigma"].vary and not out["radial_sigma"].is_tied
+            )
+            replace_gamma = ("radial_gamma" not in out) or (
+                src.vary and not out["radial_gamma"].vary and not out["radial_gamma"].is_tied
+            )
+            if src.vary:
+                if replace_sigma:
+                    out["radial_sigma"] = ParameterSpec(
+                        w_val, min=w_min, max=w_max, vary=True, name="radial_sigma"
+                    )
+                if replace_gamma and "radial_sigma" in out:
+                    out["radial_gamma"] = ParameterSpec(
+                        w_val, vary=False, expr="radial_sigma", name="radial_gamma"
+                    )
+                elif replace_gamma:
+                    out["radial_gamma"] = ParameterSpec(
+                        w_val, min=w_min, max=w_max, vary=True, name="radial_gamma"
+                    )
+            else:
+                if "radial_sigma" not in out:
+                    out["radial_sigma"] = ParameterSpec(
+                        w_val, min=w_min, max=w_max, vary=False, name="radial_sigma"
+                    )
+                if "radial_gamma" not in out:
+                    out["radial_gamma"] = ParameterSpec(
+                        w_val, min=w_min, max=w_max, vary=False, name="radial_gamma"
+                    )
+
+        elif canon == "amplitude":
+            amp_min = _scaled_spec_bound(src.min, 1.0)
+            amp_max = _scaled_spec_bound(src.max, 1.0)
+            amp_val = _clamp_to_spec_bounds(raw_val, amp_min, amp_max)
+            for target in ("amplitude_plus", "amplitude_minus"):
+                replace_amp = (target not in out) or (
+                    src.vary and not out[target].vary and not out[target].is_tied
+                )
+                if replace_amp:
+                    out[target] = ParameterSpec(
+                        amp_val, min=amp_min, max=amp_max, vary=src.vary, name=target
+                    )
+
+        try:
+            del out[src_key]
+        except ValueError:
+            out[src_key] = src.copy(vary=False, name=src_key)
+
+    return out
+
+
 def _parameter_mapping(parameters: Any) -> dict[str, Any]:
     """Extract values from a shared ParameterSet or ordinary mapping."""
 
@@ -259,14 +406,16 @@ def _parameter_mapping(parameters: Any) -> dict[str, Any]:
                         raise ValueError(
                             f"supply either {radians_name} (radians) or {degree_name} (degrees), not both"
                         )
+            candidates = _expand_parameter_set_shorthands(candidates)
         else:
             normalized = {_normal_key(key) for key in candidates}
+            canonical_keys = {canonical_parameter_name(key) for key in candidates}
             for radians_name, degree_names in (
                 ("theta", {"theta_deg", "theta_degrees"}),
                 ("lobe_angle", {"lobe_angle_deg", "lobe_angle_degrees"}),
                 ("angular_width", {"angular_width_deg", "angular_width_degrees"}),
             ):
-                if radians_name in normalized and normalized.intersection(degree_names):
+                if (radians_name in normalized or radians_name in canonical_keys) and normalized.intersection(degree_names):
                     degree_name = sorted(normalized.intersection(degree_names))[0]
                     raise ValueError(
                         f"supply either {radians_name} (radians) or {degree_name} (degrees), not both"
@@ -331,6 +480,14 @@ def parameter_values(parameters: Any = None) -> dict[str, Any]:
         if "radial_gamma" not in supplied:
             values["radial_gamma"] = values["radial_width"]
         values.pop("radial_width", None)
+    if "radial_fwhm" in supplied:
+        fwhm = abs(_positive(values.get("radial_fwhm"), 0.0))
+        if fwhm > 0.0:
+            if "radial_sigma" not in supplied:
+                values["radial_sigma"] = fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+            if "radial_gamma" not in supplied:
+                values["radial_gamma"] = fwhm / 2.0
+        values.pop("radial_fwhm", None)
     return values
 
 
@@ -495,10 +652,16 @@ class DoubleEllipseIntensityModel:
 
 def _fixed_names(parameters: Any, explicit: Any = None) -> set[str]:
     fixed: set[str] = set()
+    explicit_fixed: set[str] = set()
     if isinstance(explicit, Mapping):
-        fixed.update(canonical_parameter_name(k) for k, v in explicit.items() if bool(v))
+        explicit_fixed.update(canonical_parameter_name(k) for k, v in explicit.items() if bool(v))
     elif explicit is not None:
-        fixed.update(canonical_parameter_name(k) for k in explicit)
+        explicit_fixed.update(canonical_parameter_name(k) for k in explicit)
+    if "radial_fwhm" in explicit_fixed or "radial_width" in explicit_fixed:
+        explicit_fixed.update(("radial_sigma", "radial_gamma"))
+    if "amplitude" in explicit_fixed:
+        explicit_fixed.update(("amplitude_plus", "amplitude_minus"))
+    fixed.update(explicit_fixed)
     source = parameters
     attr = _get_field(source, ("fixed", "fixed_names"))
     if isinstance(attr, Mapping):
@@ -593,6 +756,11 @@ def _restore_parameters(original: Any, values: Mapping[str, Any]) -> Any:
                         known[name] = value
             if known:
                 restored.update_values(known)
+            if "radial_fwhm" in restored and "radial_fwhm" not in values:
+                try:
+                    del restored["radial_fwhm"]
+                except ValueError:
+                    pass
             return restored
         except Exception:
             pass
@@ -771,20 +939,76 @@ def _parameter_key_order(values: Mapping[str, Any], fixed: set[str]) -> list[str
     return names
 
 
+def _nudge_inside_bounds(
+    vector: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> np.ndarray:
+    """Clip vector into [lower, upper] and nudge endpoints strictly interior when possible."""
+
+    result = np.asarray(vector, dtype=float).copy()
+    for index, (value, lo, hi) in enumerate(zip(result, lower, upper)):
+        val = float(value)
+        if np.isfinite(lo) and val < lo:
+            val = float(lo)
+        if np.isfinite(hi) and val > hi:
+            val = float(hi)
+        if np.isfinite(lo) and val <= lo:
+            candidate = float(np.nextafter(lo, hi if np.isfinite(hi) else np.inf))
+            if not np.isfinite(hi) or candidate < hi:
+                val = candidate
+            else:
+                val = float(0.5 * (lo + hi))
+        if np.isfinite(hi) and val >= hi:
+            candidate = float(np.nextafter(hi, lo if np.isfinite(lo) else -np.inf))
+            if not np.isfinite(lo) or candidate > lo:
+                val = candidate
+            else:
+                val = float(0.5 * (lo + hi))
+        if np.isfinite(lo) and np.isfinite(hi) and (val < lo or val > hi):
+            val = float(0.5 * (lo + hi))
+        result[index] = val
+    return result
+
+
 def _candidate_parameter_values(
     original: Any,
     base_values: Mapping[str, Any],
     names: Sequence[str],
     vector: Sequence[float],
+    *,
+    explicit_bounds: Mapping[str, Sequence[float]] | None = None,
 ) -> dict[str, Any]:
     updates = {name: float(value) for name, value in zip(names, vector)}
     if isinstance(original, ParameterSet):
         candidate = original.copy()
-        allowed = {
-            name: value
-            for name, value in updates.items()
-            if name in candidate.names and not candidate[name].is_tied
-        }
+        allowed: dict[str, float] = {}
+        for name, value in updates.items():
+            if name not in candidate.names or candidate[name].is_tied:
+                continue
+            spec = candidate[name]
+            val = float(value)
+            has_explicit = isinstance(explicit_bounds, Mapping) and (
+                name in explicit_bounds or canonical_parameter_name(name) in explicit_bounds
+            )
+            if has_explicit:
+                # Explicit fit bounds override ParameterSet spec bounds; relax the
+                # copied spec bounds only when needed so tied expressions still resolve.
+                new_min = spec.min
+                new_max = spec.max
+                if new_min is not None and val < new_min:
+                    new_min = val
+                if new_max is not None and val > new_max:
+                    new_max = val
+                if new_min != spec.min or new_max != spec.max:
+                    candidate[name] = spec.copy(value=val, min=new_min, max=new_max, name=name)
+                    continue
+            else:
+                if spec.min is not None and np.isfinite(spec.min) and val < spec.min:
+                    val = float(spec.min)
+                if spec.max is not None and np.isfinite(spec.max) and val > spec.max:
+                    val = float(spec.max)
+            allowed[name] = val
         if allowed:
             candidate.update_values(allowed)
         return parameter_values(candidate)
@@ -826,11 +1050,17 @@ def _estimate_intensity_scale(
         return initial, False, intensity_scale
     if isinstance(initial, ParameterSet):
         scaled = initial.copy()
-        allowed = {
-            name: value
-            for name, value in updates.items()
-            if name in scaled.names and not scaled[name].is_tied
-        }
+        allowed: dict[str, float] = {}
+        for name, value in updates.items():
+            if name not in scaled.names or scaled[name].is_tied:
+                continue
+            spec = scaled[name]
+            bounded = float(value)
+            if spec.min is not None and np.isfinite(spec.min):
+                bounded = max(bounded, float(spec.min))
+            if spec.max is not None and np.isfinite(spec.max):
+                bounded = min(bounded, float(spec.max))
+            allowed[name] = bounded
         if allowed:
             scaled.update_values(allowed)
         return scaled, bool(allowed), intensity_scale
@@ -908,6 +1138,8 @@ def fit_intensity_model(
     all_indices = np.flatnonzero(finite)
     if not all_indices.size:
         raise ValueError("q window and mask leave no finite pixels for fitting")
+    if isinstance(initial, ParameterSet):
+        initial = _expand_parameter_set_shorthands(initial)
     fixed_names = _fixed_names(initial, fixed)
     scale_estimated = False
     intensity_scale: float | None = None
@@ -939,7 +1171,7 @@ def fit_intensity_model(
         )
         residual = prediction - values_obs
         weighted = scaled_residual(residual[all_indices], all_indices)
-        no_free_cost = 0.5 * float(np.sum(weighted**2))
+        no_free_cost = _robust_cost(weighted, robust_loss, f_scale)
         return IntensityFitResult(
             _restore_parameters(initial, values), initial, True, "no free parameters",
             no_free_cost,
@@ -982,7 +1214,7 @@ def fit_intensity_model(
         upper.append(hi)
     lower_arr, upper_arr = np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
     current = np.asarray([float(values[name]) for name in names], dtype=float)
-    current = np.clip(current, lower_arr + 1e-12, upper_arr - 1e-12)
+    current = _nudge_inside_bounds(current, lower_arr, upper_arr)
     if intensity_scale is not None:
         zero_background_indices = [
             index
@@ -998,10 +1230,12 @@ def fit_intensity_model(
             start_value = float(intensity_scale) / len(zero_background_indices)
             background_start_estimated = False
             for index in zero_background_indices:
-                estimated_start = np.clip(
-                    start_value,
-                    lower_arr[index] + 1e-12,
-                    upper_arr[index] - 1e-12,
+                estimated_start = float(
+                    _nudge_inside_bounds(
+                        np.asarray([start_value], dtype=float),
+                        lower_arr[index : index + 1],
+                        upper_arr[index : index + 1],
+                    )[0]
                 )
                 background_start_estimated |= abs(estimated_start - current[index]) > np.finfo(float).eps
                 current[index] = estimated_start
@@ -1025,7 +1259,9 @@ def fit_intensity_model(
 
         def residual_fn(vector: np.ndarray) -> np.ndarray:
             raise_if_cancelled(cancel_event, "intensity:residual")
-            candidate = _candidate_parameter_values(initial, values, names, vector)
+            candidate = _candidate_parameter_values(
+                initial, values, names, vector, explicit_bounds=bounds
+            )
             predicted = np.asarray(
                 double_ellipse_intensity(
                     xsel,
@@ -1056,7 +1292,9 @@ def fit_intensity_model(
                 max_nfev=int(max_nfev),
             )
             raise_if_cancelled(cancel_event, "intensity:complete")
-            candidate_values = _candidate_parameter_values(initial, values, names, result.x)
+            candidate_values = _candidate_parameter_values(
+                initial, values, names, result.x, explicit_bounds=bounds
+            )
             candidate_full_prediction = np.asarray(
                 double_ellipse_intensity(
                     qx[all_indices],
@@ -1104,7 +1342,9 @@ def fit_intensity_model(
         selected_record["selected_for_full_objective"] = True
         selected_sample_cost = float(result.cost)
         current = result_vector
-        values = _candidate_parameter_values(initial, values, names, current)
+        values = _candidate_parameter_values(
+            initial, values, names, current, explicit_bounds=bounds
+        )
         history.append({
             "scale": scale,
             "n_pixels": int(len(selected)),
@@ -1140,7 +1380,7 @@ def fit_intensity_model(
     stderr = {name: float("nan") for name in values}
     if best_result is not None and getattr(best_result, "jac", None) is not None:
         jacobian = np.asarray(best_result.jac, dtype=float)
-        if jacobian.ndim == 2 and jacobian.shape[1] == len(names) and jacobian.size:
+        if jacobian.ndim == 2 and jacobian.shape[1] == len(names) and jacobian.size and np.all(np.isfinite(jacobian)):
             normal_matrix = jacobian.T @ jacobian
             try:
                 condition = float(np.linalg.cond(normal_matrix))
@@ -1170,7 +1410,9 @@ def fit_intensity_model(
         raise_if_cancelled(cancel_event, "intensity:bound-diagnostics")
         projected = current.copy()
         projected[index] = endpoint
-        candidate = _candidate_parameter_values(initial, values, names, projected)
+        candidate = _candidate_parameter_values(
+            initial, values, names, projected, explicit_bounds=bounds
+        )
         bound_prediction = double_ellipse_intensity(
             qx[all_indices], qy[all_indices], candidate, reference_axis_deg=reference_axis_deg
         )

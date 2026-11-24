@@ -146,14 +146,36 @@ def _frame_parameters(base: Mapping[str, Any], index: int, n_frames: int, evolut
     if isinstance(evolution, Mapping):
         fraction = 0.0 if n_frames <= 1 else float(index) / float(n_frames - 1)
         for key, trajectory in evolution.items():
-            if isinstance(trajectory, Sequence) and not isinstance(trajectory, (str, bytes)) and len(trajectory) >= 2:
-                try:
-                    start, stop = float(trajectory[0]), float(trajectory[-1])
-                    values[key] = start + fraction * (stop - start)
-                except (TypeError, ValueError):
-                    values[key] = trajectory[min(index, len(trajectory) - 1)]
+            if isinstance(trajectory, np.ndarray):
+                if trajectory.ndim == 0:
+                    values[key] = trajectory.item()
+                    continue
+                if trajectory.ndim != 1:
+                    raise ValueError(f"evolution trajectory for {key!r} must be 1-D")
+                seq: Sequence[Any] = trajectory.tolist()
+            elif isinstance(trajectory, Sequence) and not isinstance(trajectory, (str, bytes)):
+                seq = trajectory
             else:
                 values[key] = trajectory
+                continue
+
+            if len(seq) == 0:
+                raise ValueError(f"evolution trajectory for {key!r} cannot be empty")
+            if len(seq) == 1:
+                values[key] = seq[0]
+            elif len(seq) == n_frames and n_frames > 2:
+                values[key] = seq[index]
+            elif len(seq) == 2:
+                try:
+                    start, stop = float(seq[0]), float(seq[1])
+                    values[key] = start + fraction * (stop - start)
+                except (TypeError, ValueError):
+                    values[key] = seq[min(index, 1)]
+            else:
+                raise ValueError(
+                    f"evolution trajectory for {key!r} has length {len(seq)}; "
+                    f"expected 2 for (start, stop) interpolation or n_frames={n_frames}"
+                )
     return values
 
 

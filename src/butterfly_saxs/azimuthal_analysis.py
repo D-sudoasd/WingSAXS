@@ -10,8 +10,10 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass, field
 import math
+import os
 from pathlib import Path
-from typing import Any
+import tempfile
+from typing import Any, Mapping
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -305,8 +307,9 @@ def _detect_peak_seeds(
     min_separation_deg: float,
     min_height_fraction: float,
 ) -> tuple[list[int], float]:
+    angles = np.asarray(profile.angle_deg, dtype=float)
     values = np.asarray(profile.intensity, dtype=float)
-    supported = np.isfinite(values) & (np.asarray(profile.counts) > 0)
+    supported = np.isfinite(angles) & np.isfinite(values) & (np.asarray(profile.counts) > 0)
     indices = np.flatnonzero(supported)
     if indices.size < 3:
         return [], float("nan")
@@ -403,15 +406,6 @@ def fit_azimuthal_peaks(
     if np.any(geometry_counts == 0):
         coverage_flags.append("angular_bins_without_q_support")
     baseline_seed = float(np.percentile(y[observed], 20.0)) if np.any(observed) else float("nan")
-    seeds, detected_baseline = _detect_peak_seeds(
-        profile,
-        max_peaks=max_peaks,
-        min_separation_deg=min_separation_deg,
-        min_height_fraction=min_height_fraction,
-    )
-    if np.isfinite(detected_baseline):
-        baseline_seed = detected_baseline
-
     empty_model = np.full(x.shape, baseline_seed if np.isfinite(baseline_seed) else np.nan, dtype=float)
     empty_residual = np.full(x.shape, np.nan, dtype=float)
     if np.any(observed) and np.isfinite(baseline_seed):
@@ -513,6 +507,18 @@ def fit_azimuthal_peaks(
             initial_centres_deg=init_centres,
             settings=c2_settings,
         )
+
+    seeds, detected_baseline = _detect_peak_seeds(
+        profile,
+        max_peaks=max_peaks,
+        min_separation_deg=min_separation_deg,
+        min_height_fraction=min_height_fraction,
+    )
+    if np.isfinite(detected_baseline):
+        baseline_seed = detected_baseline
+        empty_model = np.full(x.shape, baseline_seed, dtype=float)
+        empty_residual = np.full(x.shape, np.nan, dtype=float)
+        empty_residual[observed] = y[observed] - empty_model[observed]
 
     if not seeds:
         return AzimuthalFitResult(
@@ -646,51 +652,99 @@ def export_azimuthal_csv_bundle(
     if destination.suffix.lower() != ".csv":
         destination = destination.with_suffix(".csv")
     peaks_path = destination.with_name(f"{destination.stem}_peaks.csv")
-    if not overwrite and (destination.exists() or peaks_path.exists()):
+    targets = (destination, peaks_path)
+    if not overwrite and any(path.exists() for path in targets):
         raise FileExistsError("one or both azimuthal CSV outputs already exist")
+    if any(path.exists() and path.is_dir() for path in targets):
+        raise IsADirectoryError("an azimuthal export output path is a directory")
+    c2_bridge = fit.settings.get("c2_bridge") if isinstance(fit.settings, Mapping) else None
+    c2_value = _csv_number(c2_bridge.get("c2")) if isinstance(c2_bridge, Mapping) else ""
+    chi_sym_value = _csv_number(c2_bridge.get("chi_sym_deg")) if isinstance(c2_bridge, Mapping) else ""
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.writer(stream)
-        writer.writerow([
-            "angle_deg", "intensity", "count", "geometry_count", "coverage",
-            "fitted_intensity", "residual", "q_min", "q_max", "q_unit",
-            "source", "profile_flags", "fit_model", "fit_success",
-        ])
-        for index, angle in enumerate(profile.angle_deg):
+    temporary_paths: list[Path] = []
+    reservations: list[Path] = []
+    try:
+        for output in targets:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8-sig",
+                newline="",
+                delete=False,
+                dir=destination.parent,
+                prefix=f".{output.stem}.",
+                suffix=".tmp",
+            ) as handle:
+                temporary_paths.append(Path(handle.name))
+        with temporary_paths[0].open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.writer(stream)
             writer.writerow([
-                _csv_number(angle),
-                _csv_number(profile.intensity[index]),
-                int(profile.counts[index]),
-                int(profile.geometry_counts[index]),
-                _csv_number(profile.coverage[index]),
-                _csv_number(fit.model[index]) if np.isfinite(fit.model[index]) else "",
-                _csv_number(fit.residual[index]) if np.isfinite(fit.residual[index]) else "",
-                _csv_number(profile.q_min), _csv_number(profile.q_max), profile.q_unit,
-                profile.source or "", ";".join(profile.flags), fit.model_name, int(fit.success),
+                "angle_deg", "intensity", "count", "geometry_count", "coverage",
+                "fitted_intensity", "residual", "q_min", "q_max", "q_unit",
+                "source", "profile_flags", "fit_model", "fit_success",
             ])
-    with peaks_path.open("w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.writer(stream)
-        writer.writerow([
-            "peak_id", "center_deg", "amplitude", "fwhm_deg", "eta", "kappa",
-            "baseline", "rmse", "r_squared", "fit_success", "fit_message", "fit_flags",
-            "q_min", "q_max", "q_unit", "source", "fit_model",
-        ])
-        for index, peak in enumerate(fit.peaks, start=1):
+            for index, angle in enumerate(profile.angle_deg):
+                writer.writerow([
+                    _csv_number(angle),
+                    _csv_number(profile.intensity[index]),
+                    int(profile.counts[index]),
+                    int(profile.geometry_counts[index]),
+                    _csv_number(profile.coverage[index]),
+                    _csv_number(fit.model[index]) if np.isfinite(fit.model[index]) else "",
+                    _csv_number(fit.residual[index]) if np.isfinite(fit.residual[index]) else "",
+                    _csv_number(profile.q_min), _csv_number(profile.q_max), profile.q_unit,
+                    profile.source or "", ";".join(profile.flags), fit.model_name, int(fit.success),
+                ])
+        with temporary_paths[1].open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.writer(stream)
             writer.writerow([
-                index, _csv_number(peak.center_deg), _csv_number(peak.amplitude),
-                _csv_number(peak.fwhm_deg), _csv_number(peak.eta), _csv_number(peak.kappa),
-                _csv_number(fit.baseline), _csv_number(fit.rmse), _csv_number(fit.r_squared),
-                int(fit.success), fit.message, ";".join(fit.flags),
-                _csv_number(profile.q_min), _csv_number(profile.q_max), profile.q_unit,
-                profile.source or "", fit.model_name,
+                "peak_id", "center_deg", "amplitude", "fwhm_deg", "eta", "kappa",
+                "baseline", "rmse", "r_squared", "fit_success", "fit_message", "fit_flags",
+                "q_min", "q_max", "q_unit", "source", "fit_model", "c2", "chi_sym_deg",
             ])
-        if not fit.peaks:
-            writer.writerow([
-                "", "", "", "", "", "", _csv_number(fit.baseline),
-                _csv_number(fit.rmse), _csv_number(fit.r_squared), int(fit.success),
-                fit.message, ";".join(fit.flags), _csv_number(profile.q_min),
-                _csv_number(profile.q_max), profile.q_unit, profile.source or "", fit.model_name,
-            ])
+            for index, peak in enumerate(fit.peaks, start=1):
+                writer.writerow([
+                    index, _csv_number(peak.center_deg), _csv_number(peak.amplitude),
+                    _csv_number(peak.fwhm_deg), _csv_number(peak.eta), _csv_number(peak.kappa),
+                    _csv_number(fit.baseline), _csv_number(fit.rmse), _csv_number(fit.r_squared),
+                    int(fit.success), fit.message, ";".join(fit.flags),
+                    _csv_number(profile.q_min), _csv_number(profile.q_max), profile.q_unit,
+                    profile.source or "", fit.model_name, c2_value, chi_sym_value,
+                ])
+            if not fit.peaks:
+                writer.writerow([
+                    "", "", "", "", "", "", _csv_number(fit.baseline),
+                    _csv_number(fit.rmse), _csv_number(fit.r_squared), int(fit.success),
+                    fit.message, ";".join(fit.flags), _csv_number(profile.q_min),
+                    _csv_number(profile.q_max), profile.q_unit, profile.source or "", fit.model_name,
+                    c2_value, chi_sym_value,
+                ])
+        if overwrite:
+            for temporary, output in zip(temporary_paths, targets):
+                os.replace(temporary, output)
+        else:
+            try:
+                for output in targets:
+                    descriptor = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+                    os.close(descriptor)
+                    reservations.append(output)
+            except FileExistsError:
+                raise FileExistsError("one or both azimuthal CSV outputs already exist") from None
+            for temporary, output in zip(temporary_paths, targets):
+                os.replace(temporary, output)
+                if output in reservations:
+                    reservations.remove(output)
+    finally:
+        for temporary in temporary_paths:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for reserved in reservations:
+            try:
+                reserved.unlink(missing_ok=True)
+            except OSError:
+                pass
     return destination, peaks_path
 
 

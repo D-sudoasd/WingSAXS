@@ -289,7 +289,7 @@ def _parse_points(
         if not isinstance(raw, Mapping):
             reason = "malformed_point"
         else:
-            diagnostic["point_id"] = raw.get("point_id", index)
+            diagnostic["point_id"] = raw.get("point_id", raw.get("id", index))
             qx = _as_finite(raw.get("qx"))
             qy = _as_finite(raw.get("qy"))
             if qx is not None:
@@ -340,7 +340,7 @@ def _parse_points(
                     reason = "malformed_or_disjoint_arc_interval"
                 else:
                     rectangles = _support_records(raw, support_registry)
-                    support_point_id = raw.get("point_id")
+                    support_point_id = raw.get("point_id", raw.get("id", index))
                     support_point_ids = {
                         str(point_id)
                         for rectangle in rectangles
@@ -954,6 +954,7 @@ def _project_point_to_support(
     local_u, local_v = None, None
     if domain and precomputed_unconstrained is None:
         local_u, local_v = _local_coordinates(np.asarray([point], dtype=float), geometry)
+    from_rectangle_intervals = False
     if rectangles:
         # Fast path for the common case: the unconstrained closest point in a
         # manual/side domain already lies inside an observed rectangle.  A
@@ -1005,11 +1006,14 @@ def _project_point_to_support(
                         "support_violation_q": 0.0,
                         "objective_distance": candidate["distance"],
                     }
-        # The unconstrained t is the closest domain-arc point.  Any later
-        # rectangle-clipped t is a worse residual.  Enumerating sinusoid
-        # roots for that farther point on every Jacobian sample is what
-        # made detector-sized butterfly fits look hung; keep the exact
-        # domain-arc distance as the infeasible penalty instead.
+        # The unconstrained closest point fell outside the observed rectangles,
+        # but one or more rectangles are slab-reachable.  Intersect only those
+        # reachable rectangles analytically so feasible boundary-clipped
+        # projections are retained instead of falsely declared infeasible.
+        for rectangle in reachable:
+            for interval in _rectangle_intervals(geometry, rectangle, domain):
+                local_candidates.append((interval["lo"], interval["hi"], interval))
+        from_rectangle_intervals = bool(local_candidates)
     elif manual_intervals is not None:
         for index, (lo, hi) in enumerate(domain):
             local_candidates.append(
@@ -1027,26 +1031,28 @@ def _project_point_to_support(
                 )
             )
     if local_candidates:
-        if precomputed_unconstrained is None:
-            for lo, hi, metadata in local_candidates:
-                # The helper above works in a branch-local frame.  Convert the observed
-                # q point to that frame before evaluating it.
-                projection = _project_ellipse_arc(
-                    local_u,
-                    local_v,
-                    geometry.a,
-                    geometry.b,
-                    np.asarray([lo]),
-                    np.asarray([hi]),
-                    include_global_oracle=include_global_oracle,
-                )
+        if precomputed_unconstrained is None or from_rectangle_intervals:
+            if local_u is None or local_v is None:
+                local_u, local_v = _local_coordinates(np.asarray([point], dtype=float), geometry)
+            t_mins = np.asarray([lo for lo, _, _ in local_candidates], dtype=float)
+            t_maxs = np.asarray([hi for _, hi, _ in local_candidates], dtype=float)
+            projection = _project_ellipse_arc(
+                np.full(t_mins.shape, float(local_u[0]), dtype=float),
+                np.full(t_mins.shape, float(local_v[0]), dtype=float),
+                geometry.a,
+                geometry.b,
+                t_mins,
+                t_maxs,
+                include_global_oracle=include_global_oracle,
+            )
+            for idx, (_lo, _hi, metadata) in enumerate(local_candidates):
                 candidates.append(
                     {
-                        "t": float(projection["t"][0]),
-                        "distance": float(projection["distance"][0]),
-                        "global_distance": float(projection["global_distance"][0]),
-                        "at_endpoint": bool(projection["at_endpoint"][0]),
-                        "endpoint_clipped": bool(projection["endpoint_clipped"][0]),
+                        "t": float(projection["t"][idx]),
+                        "distance": float(projection["distance"][idx]),
+                        "global_distance": float(projection["global_distance"][idx]),
+                        "at_endpoint": bool(projection["at_endpoint"][idx]),
+                        "endpoint_clipped": bool(projection["endpoint_clipped"][idx]),
                         "metadata": metadata,
                     }
                 )
@@ -1068,12 +1074,23 @@ def _project_point_to_support(
                 )
     if not candidates:
         if unconstrained:
-            # Rectangle intersection can be empty while the side/manual domain
-            # still has a closest ellipse point.  That exact domain-arc
-            # distance is the finite penalty; resampling the same arc on a
-            # 33-point grid is a slower approximation of the same quantity.
+            # Rectangle intersection is genuinely empty while the side/manual
+            # domain still has a closest ellipse point.  Ensure the finite
+            # penalty never drops below either the domain-arc distance or the
+            # closest ellipse point's true distance to the support rectangles.
             best = min(unconstrained, key=lambda item: (item["distance"], item["t"]))
-            penalty = float(max(best["distance"], 1.0e-12))
+            rect_violation = (
+                _q_rectangle_violation(geometry.point(best["t"]), rectangles)
+                if rectangles
+                else None
+            )
+            penalty = float(
+                max(
+                    best["distance"],
+                    rect_violation if rect_violation is not None else 0.0,
+                    1.0e-12,
+                )
+            )
         else:
             penalty = _support_violation_q(point, geometry, rectangles, domain)
         return {

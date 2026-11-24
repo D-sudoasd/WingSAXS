@@ -1194,6 +1194,7 @@ def fit_c2_bridge_four_lobe(
     valid_mask: Any = None,
     counts: Any = None,
     nominal_draw_axis_deg: float = 90.0,
+    bright_axis_convention: str = "draw",
     initial_chi_sym_deg: float | None = None,
     initial_alpha_deg: float | None = None,
     initial_fwhm_deg: float = 30.0,
@@ -1218,6 +1219,15 @@ def fit_c2_bridge_four_lobe(
     y = np.asarray(intensity, dtype=float)
     if x.ndim != 1 or y.ndim != 1 or x.shape != y.shape or x.size < 8:
         raise ValueError("angle_deg and intensity must be matching 1D arrays with at least 8 bins")
+
+    convention = str(bright_axis_convention or "draw").strip().lower()
+    if convention not in {"draw", "reference"}:
+        raise ValueError("bright_axis_convention must be 'draw' or 'reference'")
+    canonical_tie_axis_deg = (
+        float(nominal_draw_axis_deg) % 180.0
+        if convention == "draw"
+        else float((float(nominal_draw_axis_deg) - 90.0) % 180.0)
+    )
 
     fwhm_lo, fwhm_hi = float(fwhm_bounds_deg[0]), float(fwhm_bounds_deg[1])
     if not (math.isfinite(fwhm_lo) and math.isfinite(fwhm_hi) and 0.0 < fwhm_lo < fwhm_hi <= 360.0):
@@ -1492,6 +1502,7 @@ def fit_c2_bridge_four_lobe(
         )
 
     best_c2_fit = None
+    best_c2_cost = float("inf")
     best_c2_sse = float("inf")
     initial_centers_used: tuple[float, ...] = ()
 
@@ -1512,8 +1523,10 @@ def fit_c2_bridge_four_lobe(
                 res = _fit_one_seed(ax_seed, a_seed, include_c2=True)
             except (ValueError, RuntimeError, FloatingPointError):
                 continue
+            cost = float(res.cost)
             sse = float(np.sum(res.fun ** 2))
-            if math.isfinite(sse) and sse < best_c2_sse:
+            if math.isfinite(cost) and cost < best_c2_cost:
+                best_c2_cost = cost
                 best_c2_sse = sse
                 best_c2_fit = res
                 initial_centers_used = _butterfly_lobe_centers_deg(ax_seed, a_seed)
@@ -1562,7 +1575,7 @@ def fit_c2_bridge_four_lobe(
         amps_raw,
         sigs_raw,
         prefer_acute_opening=prefer_acute_opening and (alpha_lo <= 45.0 <= alpha_hi),
-        nominal_draw_axis_deg=nominal_draw_axis_deg,
+        nominal_draw_axis_deg=canonical_tie_axis_deg,
     )
     centers = _butterfly_lobe_centers_deg(chi_sym, alpha_deg)
     fwhms = [float(s * _FWHM_PER_SIGMA) for s in sigmas]
@@ -1615,7 +1628,7 @@ def fit_c2_bridge_four_lobe(
     # Nested flat-baseline (c2 = 0) 4-lobe fit for direct scientific comparison
     n_params_flat = n_params_c2 - 1
     best_flat_fit = None
-    best_flat_sse = float("inf")
+    best_flat_cost = float("inf")
     if include_flat_comparison:
         flat_seeds = [(chi_sym, alpha_deg), ((chi_sym + 90.0) % 180.0, max(alpha_lo + 1.0, min(alpha_hi - 1.0, 90.0 - alpha_deg)))]
         for ax_s, a_s in flat_seeds:
@@ -1623,9 +1636,9 @@ def fit_c2_bridge_four_lobe(
                 fres = _fit_one_seed(ax_s, float(np.clip(a_s, alpha_lo + 0.5, alpha_hi - 0.5)), include_c2=False)
             except (ValueError, RuntimeError, FloatingPointError):
                 continue
-            fsse = float(np.sum(fres.fun ** 2))
-            if math.isfinite(fsse) and fsse < best_flat_sse:
-                best_flat_sse = fsse
+            fcost = float(fres.cost)
+            if math.isfinite(fcost) and fcost < best_flat_cost:
+                best_flat_cost = fcost
                 best_flat_fit = fres
 
     flat_comparison: dict[str, Any] | None = None
@@ -1638,7 +1651,7 @@ def fit_c2_bridge_four_lobe(
             famps,
             fsigs,
             prefer_acute_opening=prefer_acute_opening and (alpha_lo <= 45.0 <= alpha_hi),
-            nominal_draw_axis_deg=nominal_draw_axis_deg,
+            nominal_draw_axis_deg=canonical_tie_axis_deg,
         )
         ffwhms = [float(s * _FWHM_PER_SIGMA) for s in fsigs]
         flat_fwhm_med = float(np.median(ffwhms))
@@ -2784,16 +2797,19 @@ def _fit_1d_transverse_gaussian(
     elif at_mu_bound:
         valid, reason = False, "center_at_bound"
 
-    # Estimate sigma stderr from Jacobian
+    # Estimate sigma stderr from Jacobian (only when Jacobian is finite and full rank)
     fwhm_stderr = None
-    if valid and n_obs > 4 and fit.jac is not None:
+    if valid and n_obs > 4 and fit.jac is not None and np.all(np.isfinite(fit.jac)):
         try:
-            jtj = fit.jac.T @ fit.jac
-            s2 = sse / float(n_obs - 4)
-            cov = np.linalg.pinv(jtj) * s2
-            var_sig = float(cov[3, 3])
-            if math.isfinite(var_sig) and var_sig >= 0.0:
-                fwhm_stderr = _finite(math.sqrt(var_sig) * _FWHM_PER_SIGMA)
+            svals = np.linalg.svd(fit.jac, compute_uv=False)
+            tol = float(svals[0]) * max(fit.jac.shape) * np.finfo(float).eps if svals.size else 0.0
+            if svals.size == 4 and float(svals[-1]) > tol:
+                jtj = fit.jac.T @ fit.jac
+                s2 = sse / float(n_obs - 4)
+                cov = np.linalg.pinv(jtj) * s2
+                var_sig = float(cov[3, 3])
+                if math.isfinite(var_sig) and var_sig >= 0.0:
+                    fwhm_stderr = _finite(math.sqrt(var_sig) * _FWHM_PER_SIGMA)
         except np.linalg.LinAlgError:
             pass
 
@@ -3091,19 +3107,32 @@ def measure_perpendicular_streak_width(
         stride_y = max(1, qx_arr.shape[0] // 64)
         stride_x = max(1, qx_arr.shape[1] // 64)
         dx_med = (
-            float(np.nanmedian(np.abs(np.diff(qx_arr[::stride_y, :], axis=1))))
+            float(
+                np.nanmedian(
+                    np.hypot(
+                        np.diff(qx_arr[::stride_y, :], axis=1),
+                        np.diff(qy_arr[::stride_y, :], axis=1),
+                    )
+                )
+            )
             if qx_arr.shape[1] > 1
             else 0.0
         )
         dy_med = (
-            float(np.nanmedian(np.abs(np.diff(qy_arr[:, ::stride_x], axis=0))))
+            float(
+                np.nanmedian(
+                    np.hypot(
+                        np.diff(qx_arr[:, ::stride_x], axis=0),
+                        np.diff(qy_arr[:, ::stride_x], axis=0),
+                    )
+                )
+            )
             if qy_arr.shape[0] > 1
             else 0.0
         )
+        pos_steps = [v for v in (dx_med, dy_med) if math.isfinite(v) and v > 0.0]
         pixel_dq = max(
-            min(v for v in (dx_med, dy_med) if v > 0.0)
-            if (dx_med > 0.0 or dy_med > 0.0)
-            else (q_max - q_min) / 100.0,
+            min(pos_steps) if pos_steps else (q_max - q_min) / 100.0,
             1.0e-9,
         )
 
@@ -3422,12 +3451,24 @@ def fit_power_law_coarsening(
     L_use = L_arr[idx_sel]
     n_pts = int(t_use.size)
     n_params = 2 if (model_kind == "power_law" or fix_L0 is not None) else 3
-    if n_pts < n_params:
+    n_distinct_t = int(np.unique(t_use).size) if n_pts else 0
+    t_span = float(np.ptp(t_use)) if n_pts else 0.0
+    if n_pts < n_params or n_distinct_t < n_params or t_span <= 1.0e-12:
+        unavail_flag = (
+            "insufficient_points_for_coarsening_fit"
+            if n_pts < n_params
+            else "degenerate_time_span_for_coarsening_fit"
+        )
+        unavail_msg = (
+            f"Need at least {n_params} valid points for {model_kind}; found {n_pts}."
+            if n_pts < n_params
+            else f"Need at least {n_params} distinct time points spanning > 0 for {model_kind}; found {n_distinct_t}."
+        )
         return json_safe({
             "success": False,
             "status": "unavailable",
             "model": model_kind,
-            "message": f"Need at least {n_params} valid points for {model_kind}; found {n_pts}.",
+            "message": unavail_msg,
             "n_points": n_pts,
             "dof": 0,
             "parameters": None,
@@ -3437,7 +3478,7 @@ def fit_power_law_coarsening(
             "rmse": None,
             "weighted_rmse": None,
             "reduced_chi_square": None,
-            "flags": ["insufficient_points_for_coarsening_fit"],
+            "flags": [unavail_flag],
         })
 
     sw, abs_sigma = _resolve_1d_weights(n_pts, sig_sel, w_sel)
@@ -3514,7 +3555,23 @@ def fit_power_law_coarsening(
                 if math.isfinite(res.cost) and res.cost < best_cost:
                     best_cost = float(res.cost)
                     best_fit = res
-        assert best_fit is not None
+        if best_fit is None:
+            return json_safe({
+                "success": False,
+                "status": "failed",
+                "model": model_kind,
+                "message": "Offset power-law optimizer failed to produce a finite fit on all seeds.",
+                "n_points": n_pts,
+                "dof": max(n_pts - n_params, 0),
+                "parameters": None,
+                "stderr": None,
+                "ci": None,
+                "r_squared": None,
+                "rmse": None,
+                "weighted_rmse": None,
+                "reduced_chi_square": None,
+                "flags": ["coarsening_optimizer_failed"],
+            })
         fit = best_fit
 
     pred = _eval(fit.x, t_use)
@@ -3537,21 +3594,28 @@ def fit_power_law_coarsening(
     stderr_dict: dict[str, float | None] = {name: None for name in param_names}
     ci_dict: dict[str, list[float | None] | None] = {name: None for name in param_names}
 
-    if dof > 0 and fit.jac is not None:
+    if dof > 0 and fit.jac is not None and np.all(np.isfinite(fit.jac)):
         try:
-            jtj = fit.jac.T @ fit.jac
-            scale_var = 1.0 if (abs_sigma and (red_chi2 is None or red_chi2 <= 1.0)) else (sse_w / float(dof))
-            cov = np.linalg.pinv(jtj) * scale_var
-            t_crit = float(student_t.ppf(0.5 * (1.0 + float(confidence_level)), df=dof))
-            for i, name in enumerate(param_names):
-                var_i = float(cov[i, i])
-                if math.isfinite(var_i) and var_i >= 0.0:
-                    se_i = math.sqrt(var_i)
-                    stderr_dict[name] = _finite(se_i)
-                    val_i = float(fit.x[i])
-                    ci_dict[name] = [_finite(val_i - t_crit * se_i), _finite(val_i + t_crit * se_i)]
+            svals = np.linalg.svd(fit.jac, compute_uv=False)
+            tol = float(svals[0]) * max(fit.jac.shape) * np.finfo(float).eps if svals.size else 0.0
+            if svals.size < n_params or float(svals[-1]) <= tol:
+                flags.append("rank_deficient_jacobian")
+            else:
+                jtj = fit.jac.T @ fit.jac
+                scale_var = 1.0 if (abs_sigma and (red_chi2 is None or red_chi2 <= 1.0)) else (sse_w / float(dof))
+                cov = np.linalg.pinv(jtj) * scale_var
+                t_crit = float(student_t.ppf(0.5 * (1.0 + float(confidence_level)), df=dof))
+                for i, name in enumerate(param_names):
+                    var_i = float(cov[i, i])
+                    if math.isfinite(var_i) and var_i >= 0.0:
+                        se_i = math.sqrt(var_i)
+                        stderr_dict[name] = _finite(se_i)
+                        val_i = float(fit.x[i])
+                        ci_dict[name] = [_finite(val_i - t_crit * se_i), _finite(val_i + t_crit * se_i)]
         except np.linalg.LinAlgError:
             flags.append("covariance_estimation_failed")
+    elif dof > 0:
+        flags.append("covariance_estimation_failed")
     else:
         flags.append("zero_dof_no_uncertainty_interval")
 
@@ -3878,6 +3942,7 @@ def run_window_sensitivity_audit(
             seed_prof,
             counts=seed_cnt,
             nominal_draw_axis_deg=nominal_draw_axis_deg,
+            bright_axis_convention=convention,
             initial_chi_sym_deg=seed_harm.get("friedel_bisector_deg"),
             initial_alpha_deg=seed_harm.get("wing_half_opening_estimate_deg"),
             max_nfev=1500,
@@ -3936,6 +4001,7 @@ def run_window_sensitivity_audit(
             w_prof,
             counts=w_cnt,
             nominal_draw_axis_deg=nominal_draw_axis_deg,
+            bright_axis_convention=convention,
             initial_chi_sym_deg=harm.get("friedel_bisector_deg"),
             initial_alpha_deg=harm.get("wing_half_opening_estimate_deg"),
             max_nfev=1500,

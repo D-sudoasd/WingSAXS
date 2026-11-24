@@ -72,9 +72,10 @@ class GeometryMaps:
         if self.chi_deg is None:
             self.chi_deg = np.degrees(self.chi_rad) % 360.0
         else:
-            self.chi_deg = np.asarray(self.chi_deg, dtype=np.float64)
-            if self.chi_deg.shape != mask.shape:
+            chi_deg_arr = np.asarray(self.chi_deg, dtype=np.float64)
+            if chi_deg_arr.shape != mask.shape:
                 raise GeometryShapeError("chi_deg shape does not match geometry maps")
+            self.chi_deg = np.mod(chi_deg_arr, 360.0)
         self.metadata = dict(self.metadata)
         self.metadata.setdefault("shape", list(mask.shape))
         self.metadata.setdefault("q_unit", "nm^-1")
@@ -400,7 +401,7 @@ def build_geometry_cache(
         if q_mag.shape != qx.shape:
             raise GeometryShapeError("geometry mapping q shape must match qx/qy shape")
         if "chi_deg" in geometry and geometry["chi_deg"] is not None:
-            chi_deg = np.asarray(geometry["chi_deg"], dtype=np.float64)
+            chi_deg = np.mod(np.asarray(geometry["chi_deg"], dtype=np.float64), 360.0)
         elif "chi_rad" in geometry and geometry["chi_rad"] is not None:
             chi_deg = np.mod(np.degrees(np.asarray(geometry["chi_rad"], dtype=np.float64)), 360.0)
         else:

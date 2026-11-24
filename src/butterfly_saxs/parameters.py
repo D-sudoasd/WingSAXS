@@ -296,8 +296,13 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
                 raise
 
     def __delitem__(self, name: str) -> None:
+        old = self._parameters[name]
         del self._parameters[name]
-        self._check_dependencies()
+        try:
+            self._check_dependencies()
+        except Exception:
+            self._parameters[name] = old
+            raise
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._parameters)
@@ -423,14 +428,20 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
         unknown = set(values) - set(self._parameters)
         if unknown:
             raise KeyError(f"unknown parameter(s): {', '.join(sorted(unknown))}")
-        for name, value in values.items():
-            spec = self._parameters[name]
-            if spec.is_tied and not allow_tied:
-                raise ValueError(f"cannot directly set tied parameter {name!r}")
-            if spec.is_tied:
-                raise ValueError(f"tied parameter {name!r} is defined by expr")
-            spec.set_value(value)
-        self.resolve()
+        previous = {name: spec.value for name, spec in self._parameters.items()}
+        try:
+            for name, value in values.items():
+                spec = self._parameters[name]
+                if spec.is_tied:
+                    if not allow_tied:
+                        raise ValueError(f"cannot directly set tied parameter {name!r}")
+                    continue
+                spec.set_value(value)
+            self.resolve()
+        except Exception:
+            for name, old_value in previous.items():
+                self._parameters[name].value = old_value
+            raise
         return self
 
     set_values = update_values
@@ -467,18 +478,16 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
     def as_dict(self, *, resolved: bool = False, include_specs: bool = False) -> dict[str, Any]:
         if resolved or not include_specs:
             return self.resolve()
-        if include_specs:
-            return {
-                name: {
-                    "value": spec.value,
-                    "min": spec.min,
-                    "max": spec.max,
-                    "vary": spec.vary,
-                    "expr": spec.expr,
-                }
-                for name, spec in self._parameters.items()
+        return {
+            name: {
+                "value": spec.value,
+                "min": spec.min,
+                "max": spec.max,
+                "vary": spec.vary,
+                "expr": spec.expr,
             }
-        return {name: spec.value for name, spec in self._parameters.items()}
+            for name, spec in self._parameters.items()
+        }
 
     to_dict = as_dict
 

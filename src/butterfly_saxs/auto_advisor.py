@@ -634,7 +634,6 @@ def _radial_profile_and_window(
     # while fine peak-finding inside [q_floor, q_max] runs at full 1x1 pixel resolution.
     use_coarse_2d_stride = intensity.shape[0] >= 512 and intensity.shape[1] >= 512
     coarse_stride = 2 if use_coarse_2d_stride else 1
-    coarse_scale = coarse_stride * coarse_stride
 
     if use_coarse_2d_stride:
         q_sub_2d = q_map[::2, ::2]
@@ -644,7 +643,6 @@ def _radial_profile_and_window(
         if q_vals_all.size < 64:
             use_coarse_2d_stride = False
             coarse_stride = 1
-            coarse_scale = 1
             q_vals_all = q_map[clean_valid]
             i_vals_all = intensity[clean_valid]
         else:
@@ -704,8 +702,6 @@ def _radial_profile_and_window(
     obs_idx[obs_idx >= n_rbins] = n_rbins - 1
     obs_counts_raw = np.bincount(obs_idx, minlength=n_rbins)
 
-    obs_counts = obs_counts_raw * coarse_scale
-
     radial_mean = np.full(n_rbins, np.nan, dtype=np.float64)
     radial_med = np.full(n_rbins, np.nan, dtype=np.float64)
     radial_p90 = np.full(n_rbins, np.nan, dtype=np.float64)
@@ -734,8 +730,10 @@ def _radial_profile_and_window(
         obs_starts = np.zeros(n_rbins, dtype=np.int64)
         obs_ends = np.zeros(n_rbins, dtype=np.int64)
 
-    # Estimate active outer diffuse background floor & noise from outermost 20% of active bins
-    valid_bins = np.flatnonzero(np.isfinite(radial_med) & (obs_counts >= 3))
+    # Estimate active outer diffuse background floor & noise from outermost 20% of active bins.
+    # Use raw strided bin counts (obs_counts_raw) for sample-size thresholds and standard errors,
+    # since radial_mean/p90 average obs_counts_raw pixels rather than obs_counts_raw * coarse_scale.
+    valid_bins = np.flatnonzero(np.isfinite(radial_med) & (obs_counts_raw >= 3))
     if valid_bins.size == 0:
         valid_bins = np.flatnonzero(np.isfinite(radial_med))
 
@@ -768,10 +766,10 @@ def _radial_profile_and_window(
     finite_sig = np.isfinite(signal_curve)
     peak_signal = float(np.nanmax(signal_curve)) if np.any(finite_sig) else 0.0
     peak_aniso = float(np.nanmax(aniso_excess)) if np.any(np.isfinite(aniso_excess)) else 0.0
-    sqrt_n = np.sqrt(np.maximum(obs_counts, 1))
-    se_mean = np.where(obs_counts > 0, noise_scale / sqrt_n, np.inf)
-    se_p90 = np.where(obs_counts > 0, 1.71 * noise_scale / sqrt_n, np.inf)
-    se_aniso = np.where(obs_counts > 0, 2.15 * noise_scale / sqrt_n, np.inf)
+    sqrt_n = np.sqrt(np.maximum(obs_counts_raw, 1))
+    se_mean = np.where(obs_counts_raw > 0, noise_scale / sqrt_n, np.inf)
+    se_p90 = np.where(obs_counts_raw > 0, 1.71 * noise_scale / sqrt_n, np.inf)
+    se_aniso = np.where(obs_counts_raw > 0, 2.15 * noise_scale / sqrt_n, np.inf)
     snr_mean = np.where(np.isfinite(excess_mean), excess_mean / np.maximum(se_mean, 1e-12), 0.0)
     snr_p90 = np.where(np.isfinite(excess_p90), excess_p90 / np.maximum(se_p90, 1e-12), 0.0)
     snr_aniso = np.where(np.isfinite(aniso_excess), aniso_excess / np.maximum(se_aniso, 1e-12), 0.0)
@@ -864,9 +862,14 @@ def _radial_profile_and_window(
         return None, False
 
     if valid_bins.size >= 3 and peak_signal > 0.0 and q_max > q_floor:
-        in_fine = (q_vals >= q_floor) & (q_vals <= q_max)
-        fine_q = q_vals[in_fine]
-        fine_i = i_vals[in_fine]
+        if use_coarse_2d_stride:
+            in_fine_2d = active_clean & (q_map >= q_floor) & (q_map <= q_max)
+            fine_q = q_map[in_fine_2d]
+            fine_i = intensity[in_fine_2d]
+        else:
+            in_fine = (q_vals >= q_floor) & (q_vals <= q_max)
+            fine_q = q_vals[in_fine]
+            fine_i = i_vals[in_fine]
         n_fine = int(np.clip(round((q_max - q_floor) / max(1.5 * pixel_dq, 1e-12)), 24, 96))
         fine_edges = np.linspace(q_floor, q_max, n_fine + 1, dtype=np.float64)
         fine_centers = 0.5 * (fine_edges[:-1] + fine_edges[1:])
@@ -909,7 +912,7 @@ def _radial_profile_and_window(
             q_min = max(float(beamstop["shadow_edge_q"]) + pixel_dq, min(q_min, 0.80 * q_star_direct))
     else:
         sig_thresh_inner = max(3.0 * noise_scale, 0.05 * peak_signal)
-        strong_bins = np.flatnonzero(finite_sig & (signal_curve >= sig_thresh_inner) & (obs_counts >= 3))
+        strong_bins = np.flatnonzero(finite_sig & (signal_curve >= sig_thresh_inner) & (obs_counts_raw >= 3))
         if strong_bins.size:
             first_sig_idx = int(strong_bins[0])
             inner_idx = max(0, first_sig_idx - max(2, int(round(0.15 * first_sig_idx))))
@@ -1108,36 +1111,40 @@ def _find_circular_peaks(
         if all(_circular_angle_diff_360(angle, existing[2]) >= min_sep_deg for existing in selected):
             selected.append((height_val, idx, angle))
 
-    # Measure FWHM for each selected peak
+    # Measure FWHM for each selected peak; never fabricate a crossing at a masked gap.
     med_base = float(np.nanpercentile(profile, 20.0))
     peaks: list[dict[str, float]] = []
     for height_val, idx, angle in selected:
         half_level = med_base + 0.5 * (height_val - med_base)
         left_steps = 0.0
+        left_crossed = False
         for step in range(1, n // 2):
             val = profile[(idx - step) % n]
             prev_val = profile[(idx - step + 1) % n]
             if not np.isfinite(val):
-                left_steps = float(step)
+                left_crossed = False
                 break
             if val <= half_level:
                 frac = (prev_val - half_level) / max(prev_val - val, 1e-12)
                 left_steps = float(step - 1 + np.clip(frac, 0.0, 1.0))
+                left_crossed = True
                 break
             left_steps = float(step)
         right_steps = 0.0
+        right_crossed = False
         for step in range(1, n // 2):
             val = profile[(idx + step) % n]
             prev_val = profile[(idx + step - 1) % n]
             if not np.isfinite(val):
-                right_steps = float(step)
+                right_crossed = False
                 break
             if val <= half_level:
                 frac = (prev_val - half_level) / max(prev_val - val, 1e-12)
                 right_steps = float(step - 1 + np.clip(frac, 0.0, 1.0))
+                right_crossed = True
                 break
             right_steps = float(step)
-        fwhm_deg = float((left_steps + right_steps) * step_deg)
+        fwhm_deg = float((left_steps + right_steps) * step_deg) if (left_crossed and right_crossed) else float("nan")
         peaks.append(
             {
                 "angle_deg": angle,
@@ -1161,26 +1168,35 @@ def _refine_reflection_bisector(
     valid = np.isfinite(profile)
     if np.count_nonzero(valid) < 8:
         return float(seed_deg % 180.0)
-    # Search candidate bisectors every 0.5 deg around seed
+    # Search candidate bisectors every 0.5 deg around seed using linear
+    # interpolation strictly between observed adjacent bins (never across gaps).
     offsets = np.linspace(-search_half_width_deg, search_half_width_deg, 49)
-    best_axis = float(seed_deg % 180.0)
-    best_err = float("inf")
-    # Build periodic lookup on fine grid only at valid observed angles
     step = 360.0 / n
+    scored: list[tuple[float, float, float]] = []
     for off in offsets:
         cand = (seed_deg + float(off)) % 180.0
         # Reflect each valid bin across cand: reflected = (2*cand - chi) % 360
         refl_chi = (2.0 * cand - chi_deg) % 360.0
-        refl_idx = np.rint((refl_chi - 0.5 * step) / step).astype(np.int64) % n
-        both = valid & valid[refl_idx]
+        pos = ((refl_chi - 0.5 * step) / step) % n
+        idx0 = np.floor(pos).astype(np.int64) % n
+        idx1 = (idx0 + 1) % n
+        frac = pos - np.floor(pos)
+        both = valid & valid[idx0] & valid[idx1]
         if np.count_nonzero(both) < 6:
             continue
-        diffs = profile[both] - profile[refl_idx[both]]
+        refl_val = (1.0 - frac[both]) * profile[idx0[both]] + frac[both] * profile[idx1[both]]
+        diffs = profile[both] - refl_val
         err = float(np.mean(diffs * diffs))
-        if err < best_err:
-            best_err = err
-            best_axis = cand
-    return float(best_axis % 180.0)
+        if math.isfinite(err):
+            scored.append((err, float(off), cand))
+    if not scored:
+        return float(seed_deg % 180.0)
+    min_err = min(item[0] for item in scored)
+    tie_tol = 1e-12 * max(min_err, 1.0)
+    tied = [item for item in scored if item[0] <= min_err + tie_tol]
+    # Center tied minima symmetrically instead of biasing toward the leftmost offset.
+    mean_off = float(np.mean([item[1] for item in tied]))
+    return float((seed_deg + mean_off) % 180.0)
 
 
 def _assess_streak_and_ray_geometry(
@@ -1415,9 +1431,15 @@ def _analyze_symmetry_and_morphology(
         lobe_angles,
     )
 
-    # Determine narrowest peak FWHM (both raw and smoothed)
-    raw_min_fwhm = min((pk["fwhm_deg"] for pk in raw_peaks), default=None)
-    smooth_min_fwhm = min((pk["fwhm_deg"] for pk in smooth_peaks), default=None)
+    # Determine narrowest peak FWHM (both raw and smoothed), skipping gap-interrupted NaNs
+    raw_min_fwhm = min(
+        (pk["fwhm_deg"] for pk in raw_peaks if math.isfinite(pk["fwhm_deg"])),
+        default=None,
+    )
+    smooth_min_fwhm = min(
+        (pk["fwhm_deg"] for pk in smooth_peaks if math.isfinite(pk["fwhm_deg"])),
+        default=None,
+    )
     max_raw_peak = max((pk["intensity"] for pk in raw_peaks), default=0.0)
     raw_med = float(np.nanmedian(raw_profile)) if np.any(has_obs) else 0.0
     raw_mad = float(1.4826 * np.nanmedian(np.abs(raw_profile[has_obs] - raw_med))) if np.any(has_obs) else 0.0
@@ -1432,7 +1454,8 @@ def _analyze_symmetry_and_morphology(
         if has_obs[opp_bin]:
             opp_val = float(raw_profile[opp_bin])
             if (
-                top_raw["fwhm_deg"] <= 14.0
+                math.isfinite(top_raw["fwhm_deg"])
+                and top_raw["fwhm_deg"] <= 14.0
                 and (top_raw["intensity"] - raw_med) >= 3.0 * max(opp_val - raw_med, noise_scale)
                 and raw_peak_z >= 8.0
             ):
@@ -2027,9 +2050,13 @@ def advise_frame(
             )
             q_unit = str(getattr(geometry_cache, "q_unit", "nm^-1") or "nm^-1")
         else:
+            if not getattr(geometry_cache, "is_full_frame_roi", False) or geometry_cache.q_mag_roi.shape != shape:
+                raise ValueError(
+                    "geometry_cache with cropped ROI must retain a full-frame geometry object for advise_frame"
+                )
             q_map = geometry_cache.q_mag_roi
             chi_deg = geometry_cache.chi_deg_roi
-            q_unit = str(getattr(geometry_cache, "q_unit", "nm^-1") or "nm^-1")
+            q_unit = str(getattr(geometry_cache, "q_unit", "unknown") or "unknown")
         valid_mask = valid_mask & geometry_cache.valid_mask
         beam_center_xy = geometry_cache.beam_center_xy
         pixel_dq = geometry_cache.pixel_dq

@@ -231,8 +231,12 @@ def canonical_ellipse_payload(
         cx = _finite(values.get("cx", 0.0), 0.0)
         cy = _finite(values.get("cy", 0.0), 0.0)
     q_unit = _field(fit, "q_unit", default=None)
-    if q_unit is None and isinstance(qmap, Mapping):
-        q_unit = qmap.get("q_unit", qmap.get("unit"))
+    if (q_unit is None or str(q_unit).strip().lower() in {"", "unknown"}) and qmap is not None:
+        q_unit = _field(qmap, "q_unit", "unit", default=None)
+        if q_unit is None:
+            qmap_meta = _field(qmap, "metadata", default=None)
+            if isinstance(qmap_meta, Mapping):
+                q_unit = qmap_meta.get("q_unit", qmap_meta.get("unit"))
     if q_unit is None:
         q_unit = "unknown"
     reference_axis = _finite(_field(fit, "reference_axis_deg", default=float("nan")))

@@ -294,12 +294,16 @@ def load_image(
             source, frame=frame, dataset=dataset
         )
     elif kind == "raster":
-        if dataset is not None or frame is not None:
-            raise DataIOError("frame/dataset selectors are not applicable to a raster image")
+        if dataset is not None:
+            raise DatasetSelectionError("dataset is not applicable to a raster image")
+        if frame is not None and int(frame) != 0:
+            raise FrameSelectionError(
+                f"raster source {source} contains one image; frame must be 0"
+            )
         from PIL import Image
 
         with Image.open(source) as image:
-            if image.mode not in {"1", "L", "I", "I;16", "F"}:
+            if image.mode not in {"1", "L", "I", "I;16", "I;16L", "I;16B", "I;16N", "F"}:
                 raise DataShapeError(
                     "colour/palette images are not scalar intensity data; "
                     "export the original 2-D intensity matrix or a grayscale image"
@@ -308,7 +312,8 @@ def load_image(
         metadata = {"format": suffix.lstrip("."), "raster_intensity": True}
         if suffix in {".jpg", ".jpeg"}:
             metadata["warning"] = "lossy JPEG intensity; use original detector values for quantitative measurements"
-        selected_frame = selected_dataset = None
+        selected_frame = 0 if frame is not None else None
+        selected_dataset = None
     elif kind == "npy":
         if dataset is not None:
             raise DatasetSelectionError("dataset is not applicable to NPY")
@@ -619,8 +624,12 @@ def _read_npz(
             if "q_unit" in keys:
                 raw_unit = np.asarray(archive["q_unit"])
                 if raw_unit.ndim != 0:
-                    raise DataShapeError("NPZ q_unit 必须是标量字符串")
-                qmap["q_unit"] = str(raw_unit.item())
+                    raise DataShapeError("NPZ 中的 q_unit 必须是单个标量字符串")
+                raw_scalar = raw_unit.item()
+                if isinstance(raw_scalar, (bytes, bytearray, np.bytes_)):
+                    qmap["q_unit"] = bytes(raw_scalar).decode("utf-8")
+                else:
+                    qmap["q_unit"] = str(raw_scalar)
         uncertainty: np.ndarray | None = None
         uncertainty_source: str | None = None
         if uncertainty_dataset is not None:
@@ -760,7 +769,29 @@ def _read_tiff(
                         # A malformed vendor tag must not prevent intensity data
                         # from being read; the tag itself is simply omitted.
                         continue
-            array = selected_series.asarray()
+            series_shape = tuple(int(dim) for dim in selected_series.shape)
+            selected: np.ndarray | None = None
+            selected_frame: int | None = None
+            if (
+                frame is not None
+                and len(series_shape) == 3
+                and not _looks_like_channel_last_shape(series_shape)
+                and len(selected_series.pages) == series_shape[0]
+            ):
+                frame_index = int(frame)
+                if frame_index >= series_shape[0]:
+                    raise FrameSelectionError(
+                        f"frame {frame_index} is outside TIFF source {source} "
+                        f"with {series_shape[0]} frames"
+                    )
+                page = selected_series.pages[frame_index]
+                if page is not None:
+                    page_array = np.asarray(page.asarray())
+                    if page_array.shape == (series_shape[1], series_shape[2]):
+                        selected = page_array
+                        selected_frame = frame_index
+            if selected is None:
+                array = selected_series.asarray()
             selected_series_metadata = {
                 "index": series_index,
                 "shape": list(selected_series.shape),
@@ -781,9 +812,10 @@ def _read_tiff(
         "ome_metadata": ome_metadata,
         "tags": tags,
     }
-    selected, selected_frame = _select_frame(
-        array, frame=frame, source=source, source_kind="TIFF"
-    )
+    if selected is None:
+        selected, selected_frame = _select_frame(
+            array, frame=frame, source=source, source_kind="TIFF"
+        )
     return selected, metadata, selected_frame, selected_dataset
 
 
@@ -1157,6 +1189,10 @@ def _coerce_mask_array(value: Any, shape: Sequence[int], *, name: str) -> np.nda
         )
     if array.dtype.kind == "O":
         raise DataShapeError(f"{name} cannot be object-valued")
+    if array.dtype.kind == "f":
+        if name == "valid_mask":
+            return np.asarray(np.isfinite(array) & (array != 0), dtype=bool)
+        return np.asarray((~np.isfinite(array)) | (array != 0), dtype=bool)
     return np.asarray(array != 0, dtype=bool)
 
 

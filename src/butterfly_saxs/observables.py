@@ -21,7 +21,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from .cancellation import raise_if_cancelled
+from .cancellation import AnalysisCancelled, raise_if_cancelled
 
 try:  # scipy is a declared project dependency, but keep imports friendly.
     from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates
@@ -588,7 +588,7 @@ def _normalized_q_unit(unit: Any) -> str:
         .casefold()
         .replace(" ", "")
         .replace("⁻¹", "^-1")
-        .replace("⁻", "^")
+        .replace("⁻", "^-")
         .replace("−", "-")
         .replace("å", "a")
         .replace("Å", "a")
@@ -687,11 +687,23 @@ def _extract_maps(frame: Any, qmap: Any, extra_mask: Any = None) -> tuple[np.nda
     if qmask is not None:
         valid &= ~np.broadcast_to(np.asarray(qmask, dtype=bool), shape)
     valid_mask = _array_field(frame, ("valid_mask", "valid"))
-    if valid_mask is not None and np.asarray(valid_mask).shape == shape:
-        valid &= np.broadcast_to(np.asarray(valid_mask, dtype=bool), shape)
+    if valid_mask is not None:
+        valid_arr = np.asarray(valid_mask)
+        if valid_arr.ndim > 0:
+            if valid_arr.shape != shape:
+                raise ValueError(
+                    f"frame valid_mask shape {valid_arr.shape!r} does not match image shape {shape!r}"
+                )
+            valid &= np.asarray(valid_arr, dtype=bool)
     q_valid_mask = _array_field(qmap, ("valid_mask", "valid"))
-    if q_valid_mask is not None and np.asarray(q_valid_mask).shape == shape:
-        valid &= np.broadcast_to(np.asarray(q_valid_mask, dtype=bool), shape)
+    if q_valid_mask is not None:
+        q_valid_arr = np.asarray(q_valid_mask)
+        if q_valid_arr.ndim > 0:
+            if q_valid_arr.shape != shape:
+                raise ValueError(
+                    f"qmap valid_mask shape {q_valid_arr.shape!r} does not match image shape {shape!r}"
+                )
+            valid &= np.asarray(q_valid_arr, dtype=bool)
     if extra_mask is not None:
         valid &= ~np.broadcast_to(np.asarray(extra_mask, dtype=bool), shape)
 
@@ -765,15 +777,12 @@ def measure_angular_spectrum(
     n_bins = int(n_bins)
     edges = np.linspace(-np.pi, np.pi, n_bins + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
-    idx_all = np.digitize(angle[candidate], edges, right=False) - 1
-    idx_valid = np.digitize(angle[selected], edges, right=False) - 1
-    candidate_counts = np.bincount(np.clip(idx_all, 0, n_bins - 1), minlength=n_bins).astype(int)
+    idx_all = np.clip(np.digitize(angle[candidate], edges, right=False) - 1, 0, n_bins - 1)
+    idx_valid = np.clip(np.digitize(angle[selected], edges, right=False) - 1, 0, n_bins - 1)
+    candidate_counts = np.bincount(idx_all, minlength=n_bins).astype(int)
     profile, counts = _bin_mean(values[selected], idx_valid, n_bins, statistic)
-    if smooth_sigma and gaussian_filter1d is not None:
-        finite_profile = np.where(np.isfinite(profile), profile, 0.0)
-        normalizer = gaussian_filter1d((counts > 0).astype(float), float(smooth_sigma), mode="wrap")
-        smoothed = gaussian_filter1d(finite_profile, float(smooth_sigma), mode="wrap")
-        profile = np.divide(smoothed, normalizer, out=np.full_like(smoothed, np.nan), where=normalizer > 1e-9)
+    if smooth_sigma:
+        profile = _smooth_supported_angular_profile(profile, counts > 0, sigma=float(smooth_sigma))
     coverage = np.divide(counts, candidate_counts, out=np.zeros(n_bins, dtype=float), where=candidate_counts > 0)
     return AngularSpectrum(
         angle=centres,
@@ -917,13 +926,6 @@ def _supported_angular_noise(
                 "difference_count": int(diff_values.size),
                 "detrended_residual_count": int(residual_values.size),
             }
-    if residual_values.size >= 2:
-        noise = _robust_noise(residual_values) / np.sqrt(6.0)
-        if np.isfinite(noise) and noise > np.finfo(float).eps:
-            return float(noise), "local_detrended_residual_mad", {
-                "difference_count": int(diff_values.size),
-                "detrended_residual_count": int(residual_values.size),
-            }
     # Preserve a finite floor for the peak detector without falling back to
     # the full profile MAD: that would re-introduce the physical lobe contrast
     # as detector noise.  A constant or locally linear profile has no local
@@ -941,20 +943,42 @@ def _wrap_distance(angle: np.ndarray | float, centre: float) -> np.ndarray:
 def _quadratic_peak(x: np.ndarray, y: np.ndarray, index: int, period: float | None = None) -> tuple[float, float]:
     """Sub-bin parabolic peak estimate; returns x and y."""
 
+    n = len(y)
     index = int(index)
-    if len(y) < 3 or index <= 0 or index >= len(y) - 1:
+    if n < 3:
         return float(x[index]), float(y[index])
-    ym, y0, yp = float(y[index - 1]), float(y[index]), float(y[index + 1])
+    if period is not None:
+        period_val = float(period)
+        if not np.isfinite(period_val) or period_val <= 0.0:
+            raise ValueError("period must be finite and positive")
+        im = (index - 1) % n
+        ip = (index + 1) % n
+        ym, y0, yp = float(y[im]), float(y[index]), float(y[ip])
+        dx = float((float(x[index]) - float(x[im])) % period_val)
+        if not np.isfinite(dx) or dx <= 0.0 or dx >= 0.5 * period_val:
+            dx = period_val / float(n)
+    else:
+        if index <= 0 or index >= n - 1:
+            return float(x[index]), float(y[index])
+        ym, y0, yp = float(y[index - 1]), float(y[index]), float(y[index + 1])
+        dx = float(x[index] - x[index - 1])
+    if not (np.isfinite(ym) and np.isfinite(y0) and np.isfinite(yp)):
+        return float(x[index]), y0
     denom = ym - 2.0 * y0 + yp
     if not np.isfinite(denom) or abs(denom) <= np.finfo(float).eps:
         return float(x[index]), y0
     offset = 0.5 * (ym - yp) / denom
     offset = float(np.clip(offset, -0.5, 0.5))
-    dx = float(x[index] - x[index - 1])
     xp = float(x[index] + offset * dx)
     ypval = float(y0 - 0.25 * (ym - yp) * offset)
     if period is not None:
-        xp = float(np.angle(np.exp(1j * xp)))
+        period_val = float(period)
+        if abs(period_val - 2.0 * np.pi) <= 1e-9:
+            xp = float(np.angle(np.exp(1j * xp)))
+        elif float(np.nanmin(x)) < 0.0:
+            xp = float((xp + 0.5 * period_val) % period_val - 0.5 * period_val)
+        else:
+            xp = float(xp % period_val)
     return xp, ypval
 
 
@@ -1767,10 +1791,15 @@ def _radial_peak_candidates(
 
 
 def _reject_ridge_point(point: RidgePoint, reason: str) -> RidgePoint:
+    candidate_q = float(point.q_star) if np.isfinite(point.q_star) else (float(point.q) if np.isfinite(point.q) else float("nan"))
     point.valid = False
     point.accepted = False
+    point.q_star = float("nan")
+    point.lamellar_spacing = float("nan")
     point.reason = str(reason)
     point.flags = tuple(dict.fromkeys(point.flags + (point.reason,)))
+    if np.isfinite(candidate_q):
+        point.metadata.setdefault("candidate_q", candidate_q)
     point.metadata.update(
         flags=point.flags,
         accepted=False,
@@ -2514,16 +2543,25 @@ def _azimuthal_peak_ridges(
         & (q <= q_max)
     )
     selected = candidate & valid & np.isfinite(values)
+    selected_positions = np.flatnonzero(selected)
     flat_candidate = q_index[candidate] * n_angle_bins + angle_index[candidate]
-    flat_selected = q_index[selected] * n_angle_bins + angle_index[selected]
+    flat_selected = q_index[selected_positions] * n_angle_bins + angle_index[selected_positions]
     total = n_annuli * n_angle_bins
     candidate_counts = np.bincount(flat_candidate, minlength=total).reshape(n_annuli, n_angle_bins)
     counts = np.bincount(flat_selected, minlength=total).reshape(n_annuli, n_angle_bins)
     sums = np.bincount(
         flat_selected,
-        weights=values[selected],
+        weights=values[selected_positions],
         minlength=total,
     ).reshape(n_annuli, n_angle_bins)
+    if selected_positions.size:
+        bin_order = np.argsort(flat_selected, kind="stable")
+        sorted_selected_positions = selected_positions[bin_order]
+    else:
+        sorted_selected_positions = np.empty(0, dtype=np.intp)
+    flat_counts = counts.ravel()
+    bin_ends = np.cumsum(flat_counts)
+    bin_starts = bin_ends - flat_counts
     profile = np.divide(
         sums,
         counts,
@@ -2675,8 +2713,9 @@ def _azimuthal_peak_ridges(
             if not np.isfinite(snr) or snr < float(snr_threshold):
                 candidate_diag["reason"] = "below_snr_threshold"
                 continue
-            bin_selected = selected & (q_index == annulus) & (angle_index == index)
-            bin_values = np.asarray(values[bin_selected], dtype=float)
+            flat_bin = annulus * n_angle_bins + index
+            support_positions = sorted_selected_positions[bin_starts[flat_bin] : bin_ends[flat_bin]]
+            bin_values = np.asarray(values[support_positions], dtype=float)
             bin_values = bin_values[np.isfinite(bin_values)]
             excess = np.maximum(bin_values - baseline, 0.0)
             excess_sum = float(np.sum(excess))
@@ -2710,7 +2749,6 @@ def _azimuthal_peak_ridges(
                 rejected_support = True
                 candidate_diag["reason"] = "hot_pixel_dominated"
                 continue
-            support_positions = np.flatnonzero(bin_selected)
             representative_x = representative_y = float("nan")
             if support_positions.size:
                 xs, ys = pixel_x[support_positions], pixel_y[support_positions]
@@ -2949,6 +2987,7 @@ def measure_radial_ridges(
             min_peak_fraction=ridge_min_peak_fraction,
             min_coverage=ridge_min_coverage,
             mask=mask,
+            cancel_event=cancel_event,
         )
         valid = np.asarray([point.valid for point in points], dtype=bool)
         coverage = np.asarray([point.coverage for point in points], dtype=float)
@@ -3549,7 +3588,13 @@ def _symmetry_diagnostics(
         np.arctan2(relative[:, 1], relative[:, 0]) - np.deg2rad(reference_axis_deg),
         2.0 * np.pi,
     )
-    radius_scale = max(float(np.nanmedian(radius[valid_labels])), np.finfo(float).eps)
+    valid_radii = radius[valid_labels]
+    finite_valid_radii = valid_radii[np.isfinite(valid_radii)]
+    radius_scale = (
+        max(float(np.median(finite_valid_radii)), np.finfo(float).eps)
+        if finite_valid_radii.size
+        else np.finfo(float).eps
+    )
     angle_tolerance = np.deg2rad(20.0)
     q_tolerance = max(0.05 * radius_scale, 1.0e-8)
     pair_specs = (("QI", "QIII", 0, 2), ("QII", "QIV", 1, 3))
@@ -3567,36 +3612,30 @@ def _symmetry_diagnostics(
         for first_index in first:
             if not unused:
                 break
-            candidates = sorted(
-                (
-                    (
-                        float(
-                            np.hypot(
-                                angle[int(second_index)]
-                                - angle[int(first_index)]
-                                - np.pi,
-                                0.0,
-                            )
-                        ),
-                        int(second_index),
-                    )
-                    for second_index in unused
-                ),
-                key=lambda value: (abs((value[0] + np.pi) % (2.0 * np.pi) - np.pi), value[1]),
-            )
-            _, second_index = candidates[0]
-            angular_error = abs(
-                (angle[second_index] - angle[first_index] - np.pi + np.pi)
-                % (2.0 * np.pi)
-                - np.pi
-            )
-            q_difference = abs(float(radius[first_index] - radius[second_index]))
-            if angular_error <= angle_tolerance and q_difference <= max(
-                q_tolerance, 0.25 * max(radius[first_index], radius[second_index])
-            ):
+            best_match: tuple[float, float, float, int] | None = None
+            r1 = float(radius[first_index])
+            a1 = float(angle[first_index])
+            for second_index in unused:
+                angular_error = abs(
+                    (float(angle[second_index]) - a1 - np.pi + np.pi)
+                    % (2.0 * np.pi)
+                    - np.pi
+                )
+                if angular_error > angle_tolerance:
+                    continue
+                r2 = float(radius[second_index])
+                q_difference = abs(r1 - r2)
+                if q_difference > max(q_tolerance, 0.25 * max(r1, r2)):
+                    continue
+                vector_deviation = float(np.linalg.norm(relative[first_index] + relative[second_index]))
+                candidate_key = (vector_deviation, angular_error, q_difference, int(second_index))
+                if best_match is None or candidate_key < best_match:
+                    best_match = candidate_key
+            if best_match is not None:
+                vector_deviation, angular_error, q_difference, second_index = best_match
                 pairs.append((int(first_index), second_index))
                 unused.remove(second_index)
-                all_distance.append(float(np.linalg.norm(relative[first_index] + relative[second_index])))
+                all_distance.append(vector_deviation)
                 all_angle_error.append(float(np.degrees(angular_error)))
                 all_q_difference.append(q_difference)
         missing = int(len(first) + len(second) - 2 * len(pairs))
@@ -3803,6 +3842,8 @@ def fit_symmetric_double_ellipse(
             and np.array_equal(selected_label_option, label_options[1])
         )
         inferred_labels = selected_label_option
+    except AnalysisCancelled:
+        raise
     except Exception as exc:
         # Invalid editable configurations should be visible to a caller, but
         # a numerical failure for measured data remains a structured result

@@ -672,11 +672,13 @@ ellipse_geometric_residual = ellipse_geometric_residuals
 def _canonical_parameter_mapping(parameters: Mapping[str, Any] | ParameterSet) -> dict[str, Any]:
     source = parameters._parameters if isinstance(parameters, ParameterSet) else parameters
     result: dict[str, Any] = {}
+    seen_sources: dict[str, str] = {}
     aliases = {"center_x": "cx", "center_y": "cy", "x0": "cx", "y0": "cy", "ratio": "axis_ratio"}
     for key, value in source.items():
         canonical = aliases.get(key, key)
-        if canonical in result and key != canonical:
+        if canonical in seen_sources:
             raise ValueError(f"duplicate ellipse parameter aliases for {canonical!r}")
+        seen_sources[canonical] = key
         result[canonical] = value
     # Keep theta in radians internally, but accept a degree-valued editor
     # field as a first-class input.  Bounds and tied expressions are converted
@@ -851,6 +853,7 @@ def _connected_angular_support(angles: np.ndarray) -> tuple[
 def _coverage(points: np.ndarray, residuals: np.ndarray, parameters: ParameterSet,
               *, components: int = 1, labels: np.ndarray | None = None,
               reference_axis: float = 0.0,
+              residual: ResidualKind = "sampson",
               radial_rms_definition: str = "fit_residual_units",
               radial_rms_units: str = "unknown") -> CoverageMetrics:
     values = parameters.resolve()
@@ -875,8 +878,9 @@ def _coverage(points: np.ndarray, residuals: np.ndarray, parameters: ParameterSe
         if points.shape[0] == 0:
             selected = np.empty((0,), dtype=bool)
         else:
-            r_plus = ellipse_sampson_residuals(points, plus_geometry)
-            r_minus = ellipse_sampson_residuals(points, minus_geometry)
+            residual_function = _residual_function(residual)
+            r_plus = residual_function(points, plus_geometry)
+            r_minus = residual_function(points, minus_geometry)
             selected = np.abs(r_plus) <= np.abs(r_minus) if labels is None else labels == 0
         for sign, selected_mask in ((1.0, selected), (-1.0, ~selected)):
             g = EllipseGeometry(
@@ -1001,16 +1005,19 @@ def _make_result(parameters: ParameterSet, scipy_result: OptimizeResult | None, 
     covariance: np.ndarray | None = None
     condition = float("inf")
     stderr = {name: float("nan") for name in parameters.names}
-    if jacobian is not None and jacobian.shape[1]:
-        singular_values = np.linalg.svd(jacobian, compute_uv=False)
-        if singular_values.size and singular_values[-1] > 0:
-            condition = float(singular_values[0] / singular_values[-1])
-        dof = max(residuals.size - jacobian.shape[1], 1)
-        scale = float(2 * (scipy_result.cost if scipy_result is not None else np.sum(residuals ** 2) / 2) / dof)
-        covariance = np.linalg.pinv(jacobian.T @ jacobian) * scale
-        diagonal = np.diag(covariance)
-        for name, variance in zip(free_names, diagonal):
-            stderr[name] = float(math.sqrt(variance)) if variance >= 0 and np.isfinite(variance) else float("nan")
+    if jacobian is not None and jacobian.shape[1] and np.all(np.isfinite(jacobian)):
+        try:
+            singular_values = np.linalg.svd(jacobian, compute_uv=False)
+            if singular_values.size and singular_values[-1] > 0:
+                condition = float(singular_values[0] / singular_values[-1])
+            dof = max(residuals.size - jacobian.shape[1], 1)
+            scale = float(2 * (scipy_result.cost if scipy_result is not None else np.sum(residuals ** 2) / 2) / dof)
+            covariance = np.linalg.pinv(jacobian.T @ jacobian) * scale
+            diagonal = np.diag(covariance)
+            for name, variance in zip(free_names, diagonal):
+                stderr[name] = float(math.sqrt(variance)) if variance >= 0 and np.isfinite(variance) else float("nan")
+        except np.linalg.LinAlgError:
+            covariance = None
     flags, status = _bound_diagnostics(parameters, values)
     coverage = _coverage(
         points,
@@ -1019,6 +1026,7 @@ def _make_result(parameters: ParameterSet, scipy_result: OptimizeResult | None, 
         components=components,
         labels=labels,
         reference_axis=reference_axis,
+        residual=residual,
     )
     if scipy_result is None:
         success, message, cost, optimality, nfev = True, "no free parameters", float(np.sum(residuals ** 2) / 2), 0.0, 0
@@ -1097,8 +1105,9 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
         def residual_at(vector: np.ndarray) -> np.ndarray:
             raise_if_cancelled(cancel_event, f"ellipse:{model}:residual")
             candidate = parameters.copy()
-            candidate.set_free_vector(vector)
+            clipped = np.clip(np.asarray(vector, dtype=float), lower, upper)
             try:
+                candidate.set_free_vector(clipped)
                 return np.asarray(objective(candidate), dtype=float)
             except (ValueError, FloatingPointError, OverflowError):
                 # Physical constraints expressed through a tied expression can
@@ -1133,8 +1142,14 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
             max_nfev=max_nfev,
         )
         raise_if_cancelled(cancel_event, f"ellipse:{model}:complete")
-        fitted = parameters.copy().set_free_vector(result.x)
-        residuals = np.asarray(objective(fitted), dtype=float)
+        fitted = parameters.copy().set_free_vector(np.clip(np.asarray(result.x, dtype=float), lower, upper))
+        try:
+            residuals = np.asarray(objective(fitted), dtype=float)
+        except (ValueError, FloatingPointError, OverflowError):
+            residuals = np.asarray(result.fun, dtype=float)
+            fitted = parameters.copy()
+            result.success = False
+            result.message = f"fitted parameters violated tied parameter bounds: {result.message}"
         return _make_result(
             fitted,
             result,
@@ -1189,6 +1204,7 @@ def fit_ellipse(points: Any, parameters: ParameterSet | Mapping[str, Any] | None
         return residual_function(points, candidate, weights=weights)
     return _run_fit(points, parameter_set, objective, loss=loss, f_scale=f_scale, max_nfev=max_nfev,
                     model="ellipse", components=1, labels=None,
+                    residual=residual,
                     cancel_event=cancel_event)
 
 
@@ -1256,11 +1272,15 @@ def _multistart_parameter_sets(parameters: ParameterSet, count: int) -> tuple[Pa
     # remains exactly the caller's editable initial value.
     fractions = (0.20, 0.80, 0.35, 0.65, 0.50, 0.10, 0.90)
     offsets = (-1.5, 1.5, -0.75, 0.75, 0.0, -2.0, 2.0)
+    positive_factors = (0.50, 1.50, 0.75, 1.25, 1.00, 0.35, 2.00)
+    a_spec = parameters._parameters.get("a")
+    a_scale = abs(float(a_spec.value)) if a_spec is not None and np.isfinite(float(a_spec.value)) and float(a_spec.value) > 0.0 else 0.0
     starts: list[ParameterSet] = [parameters.copy()]
     for start_index in range(1, count):
         vector = base.copy()
         fraction = fractions[(start_index - 1) % len(fractions)]
         offset = offsets[(start_index - 1) % len(offsets)]
+        factor = positive_factors[(start_index - 1) % len(positive_factors)]
         for index, (name, value, lo, hi) in enumerate(zip(parameters.free_names, base, lower, upper)):
             if np.isfinite(lo) and np.isfinite(hi):
                 if name == "axis_ratio" and lo > 0.0 and hi > 0.0 and lo < 0.05:
@@ -1273,19 +1293,32 @@ def _multistart_parameter_sets(parameters: ParameterSet, count: int) -> tuple[Pa
                     vector[index] = math.exp(log_lo + fraction * (log_hi - log_lo))
                 else:
                     vector[index] = lo + fraction * (hi - lo)
+            elif np.isfinite(lo) and lo > 0.0 and not np.isfinite(hi) and float(value) > 0.0:
+                # Positive scale parameters (such as ``a``) are scaled
+                # multiplicatively so sub-unit q scales never collapse to eps.
+                vector[index] = max(float(value) * factor, float(lo))
             else:
-                scale = max(abs(float(value)), abs(float(lo)) if np.isfinite(lo) else 0.0,
-                            abs(float(hi)) if np.isfinite(hi) else 0.0, 1.0)
+                if name in {"cx", "cy"} and a_scale > 0.0:
+                    scale = max(abs(float(value)), 0.25 * a_scale)
+                else:
+                    scale = abs(float(value)) if abs(float(value)) > 0.0 else max(
+                        abs(float(lo)) if np.isfinite(lo) else 0.0,
+                        abs(float(hi)) if np.isfinite(hi) else 0.0,
+                        1.0,
+                    )
                 vector[index] = float(value) + offset * scale
                 if np.isfinite(lo):
                     vector[index] = max(vector[index], lo)
                 if np.isfinite(hi):
                     vector[index] = min(vector[index], hi)
         candidate = parameters.copy()
-        candidate.set_free_vector(vector)
-        # Resolving here makes a tied-expression failure belong to the
-        # offending deterministic start, before scipy is invoked.
-        candidate.resolve()
+        try:
+            candidate.set_free_vector(vector)
+            # Resolving here makes a tied-expression failure belong to the
+            # offending deterministic start, before scipy is invoked.
+            candidate.resolve()
+        except ValueError:
+            continue
         starts.append(candidate)
     return tuple(starts)
 

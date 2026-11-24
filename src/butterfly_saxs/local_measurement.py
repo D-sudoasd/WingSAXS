@@ -12,7 +12,9 @@ import csv
 from dataclasses import dataclass, field
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Iterable, Mapping
 
 import numpy as np
@@ -151,6 +153,8 @@ def measure_point(
     iy, ix = _pixel(row, col, observed.shape)
     if not usable[iy, ix]:
         raise ValueError("selected pixel is masked or has non-finite intensity/q coordinates")
+    if isinstance(patch_radius, (bool, np.bool_)):
+        raise ValueError("patch_radius must be a non-negative integer")
     try:
         radius = int(patch_radius)
     except (TypeError, ValueError) as exc:
@@ -402,8 +406,9 @@ def extract_line_profile(
 
     Pixel coordinates are supplied as ``(column, row)``.  When calibrated q
     coordinates are finite at every sampled detector pixel, the profile axis
-    is cumulative path length in that q unit.  Otherwise the axis is detector
-    path length in pixels.  Invalid observed pixels keep a ``NaN`` intensity.
+    is projected chord distance in that q unit (falling back to cumulative path
+    length if non-monotonic).  Otherwise the axis is projected chord distance
+    in detector pixels.  Invalid observed pixels keep a ``NaN`` intensity.
     """
 
     observed, qx_values, qy_values, usable = _usable_arrays(data, qx, qy, valid_mask)
@@ -412,15 +417,34 @@ def extract_line_profile(
     start_row, start_col = _pixel(start[1], start[0], observed.shape)
     end_row, end_col = _pixel(end[1], end[0], observed.shape)
     rows, cols = _bresenham((start_col, start_row), (end_col, end_row))
-    pixel_steps = np.hypot(np.diff(cols), np.diff(rows))
-    pixel_distance = np.r_[0.0, np.cumsum(pixel_steps)]
+    if rows.size <= 1:
+        pixel_distance = np.zeros(rows.shape, dtype=float)
+    else:
+        vx = float(end_col - start_col)
+        vy = float(end_row - start_row)
+        chord = math.hypot(vx, vy)
+        pixel_distance = ((cols - start_col) * vx + (rows - start_row) * vy) / chord
     intensities = observed[rows, cols].astype(float, copy=True)
     valid = usable[rows, cols].copy()
     intensities[~valid] = np.nan
     sample_qx = qx_values[rows, cols].astype(float, copy=True)
     sample_qy = qy_values[rows, cols].astype(float, copy=True)
-    q_step = np.hypot(np.diff(sample_qx), np.diff(sample_qy))
-    q_distance = np.r_[0.0, np.cumsum(q_step)]
+    if rows.size <= 1:
+        q_distance = np.zeros(rows.shape, dtype=float)
+    else:
+        dqx_end = float(sample_qx[-1] - sample_qx[0])
+        dqy_end = float(sample_qy[-1] - sample_qy[0])
+        q_chord = math.hypot(dqx_end, dqy_end)
+        q_proj = (
+            ((sample_qx - sample_qx[0]) * dqx_end + (sample_qy - sample_qy[0]) * dqy_end) / q_chord
+            if math.isfinite(q_chord) and q_chord > 0.0
+            else None
+        )
+        if q_proj is not None and np.all(np.isfinite(q_proj)) and np.all(np.diff(q_proj) > 0.0):
+            q_distance = q_proj
+        else:
+            q_step = np.hypot(np.diff(sample_qx), np.diff(sample_qy))
+            q_distance = np.r_[0.0, np.cumsum(q_step)]
     canonical_unit = _canonical_unit(q_unit)
     if (
         canonical_unit in {"nm⁻¹", "Å⁻¹", "pixel-q"}
@@ -568,6 +592,11 @@ def measure_roi_orientation(
     center = np.sum(coordinates * weights[:, None], axis=0)
     centered = coordinates - center
     covariance = (centered * weights[:, None]).T @ centered
+    if not np.all(np.isfinite(covariance)):
+        return ROIOrientation((sx, sy), (ex, ey), half_width, count, canonical_unit,
+                              None, float(center[0]), float(center[1]), None, None, None,
+                              "unavailable", "covariance_decomposition_failed",
+                              source=str(source) if source is not None else None)
     try:
         eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     except np.linalg.LinAlgError:
@@ -577,6 +606,15 @@ def measure_roi_orientation(
                               source=str(source) if source is not None else None)
     order = np.argsort(eigenvalues)[::-1]
     eigenvalues = np.maximum(eigenvalues[order], 0.0)
+    coord_scale_sq = max(float(np.sum(np.square(center))), 1.0)
+    if not math.isfinite(float(eigenvalues[0])) or float(eigenvalues[0]) <= np.finfo(float).eps * coord_scale_sq:
+        return ROIOrientation(
+            (sx, sy), (ex, ey), half_width, count, canonical_unit,
+            None, float(center[0]), float(center[1]), None,
+            (float(eigenvalues[0]), float(eigenvalues[1])), None,
+            "unavailable", "zero_spatial_variance",
+            source=str(source) if source is not None else None,
+        )
     vector = eigenvectors[:, int(order[0])]
     angle = (math.degrees(math.atan2(float(vector[1]), float(vector[0]))) + 90.0) % 180.0 - 90.0
     ratio = float(eigenvalues[0] / max(float(eigenvalues[1]), np.finfo(float).eps))
@@ -630,10 +668,48 @@ def export_local_measurements_json(
     document = measurement_document(records)
     if target.exists() and not overwrite:
         raise FileExistsError(f"refusing to overwrite existing measurement export: {target}")
+    if target.exists() and target.is_dir():
+        raise IsADirectoryError(f"export output path is a directory: {target}")
+    serialized = json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8", newline="\n") as stream:
-        json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
+    tmp_path: Path | None = None
+    reserved = False
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            delete=False,
+            dir=target.parent,
+            prefix=f".{target.stem}.",
+            suffix=".tmp",
+        ) as stream:
+            tmp_path = Path(stream.name)
+            stream.write(serialized)
+        if overwrite:
+            os.replace(tmp_path, target)
+            tmp_path = None
+        else:
+            try:
+                descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+                os.close(descriptor)
+                reserved = True
+            except FileExistsError:
+                raise FileExistsError(f"refusing to overwrite existing measurement export: {target}") from None
+            os.replace(tmp_path, target)
+            tmp_path = None
+            reserved = False
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if reserved:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
     return target
 
 

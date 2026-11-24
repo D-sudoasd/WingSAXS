@@ -477,7 +477,7 @@ def legacy_fusion_geometry_map(
     )
     qx = q_nm_inv * dx * inverse_radius
     qy = q_nm_inv * dy * inverse_radius
-    chi = np.arctan2(qy, qx)
+    chi = np.mod(np.arctan2(qy, qx), 2.0 * np.pi)
     finite = np.isfinite(q_nm_inv) & np.isfinite(qx) & np.isfinite(qy) & np.isfinite(chi)
     payload = {"shape": [rows, cols], "geometry": values, "formula": "saxsanalyzer-fusion-v2-flat-q-v1"}
     fingerprint = hashlib.sha256(
@@ -542,7 +542,7 @@ def _receipt_file_records(inspection: LegacySaxsInspection) -> list[LegacyFileEv
     elif inspection.path.is_file():
         records = [
             _record_file(item.path, role=item.role, relative_path=item.relative_path)
-            if item.present
+            if item.present and item.sha256 is None
             else item
             for item in records
         ]
@@ -557,7 +557,7 @@ def _receipt_file_records(inspection: LegacySaxsInspection) -> list[LegacyFileEv
         else:
             records = [
                 _record_file(item.path, role=item.role, relative_path=item.relative_path)
-                if item.path == inspection.session.data_path and item.present
+                if item.path == inspection.session.data_path and item.present and item.sha256 is None
                 else item
                 for item in records
             ]

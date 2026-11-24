@@ -225,7 +225,25 @@ def evaluate_density2d_model(
     if model == "ornstein_zernike":
         amplitude = float(parameters["I0"])
         background = float(parameters["background"])
-        xi = float(parameters["_xi_q_inverse"])
+        if "_xi_q_inverse" in parameters and parameters["_xi_q_inverse"] is not None:
+            xi = float(parameters["_xi_q_inverse"])
+        elif (
+            "q_reference_times_xi" in parameters
+            and "q_reference" in parameters
+            and parameters["q_reference_times_xi"] is not None
+            and parameters["q_reference"] is not None
+            and float(parameters["q_reference"]) > 0.0
+        ):
+            xi = float(parameters["q_reference_times_xi"]) / float(parameters["q_reference"])
+        elif "xi" in parameters and parameters["xi"] is not None:
+            xi = float(parameters["xi"])
+        elif "xi_candidate" in parameters and parameters["xi_candidate"] is not None:
+            xi = float(parameters["xi_candidate"])
+        else:
+            raise KeyError(
+                "ornstein_zernike parameters must include '_xi_q_inverse', "
+                "'q_reference_times_xi' with 'q_reference', 'xi', or 'xi_candidate'"
+            )
         return amplitude / (1.0 + np.square(q_values * xi)) + background
     raise ValueError("model must be 'power_law' or 'ornstein_zernike'")
 
@@ -302,9 +320,9 @@ def _fit_power_law(profile: Density2DProfile, minimum: int) -> Density2DFit:
         "intercept_log": float(intercept),
     }
     fitted_valid = evaluate_density2d_model(q, "power_law", parameters)
-    if not np.all(np.isfinite(fitted_valid)):
+    if not np.all(np.isfinite(fitted_valid)) or not np.all(fitted_valid > 0.0):
         return _empty_fit(
-            profile, "power_law", "power-law predictions are non-finite",
+            profile, "power_law", "power-law predictions are non-finite or non-positive",
             tuple(flags + ["fit_failed"]), n_points=int(q.size), q=q,
         )
     fitted = np.full(q_all.shape, np.nan, dtype=float)
@@ -406,8 +424,13 @@ def _fit_ornstein_zernike(profile: Density2DProfile, minimum: int) -> Density2DF
         diagnostics.append("oz_turnover_not_bracketed_at_lower_q")
 
     jacobian = np.asarray(fit.jac, dtype=float)
-    singular_values = np.linalg.svd(jacobian, compute_uv=False)
-    if singular_values.size:
+    singular_values = np.asarray([], dtype=float)
+    if jacobian.size and np.all(np.isfinite(jacobian)):
+        try:
+            singular_values = np.linalg.svd(jacobian, compute_uv=False)
+        except np.linalg.LinAlgError:
+            singular_values = np.asarray([], dtype=float)
+    if singular_values.size and np.all(np.isfinite(singular_values)):
         tolerance = float(np.max(singular_values)) * max(jacobian.shape) * np.finfo(float).eps
         jacobian_rank = int(np.count_nonzero(singular_values > tolerance))
         condition = (
@@ -644,7 +667,7 @@ def export_density2d_bundle(
         ],
     }
 
-    target.parent.mkdir(parents=False, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths: list[Path] = []
     reservations: list[Path] = []
     try:
