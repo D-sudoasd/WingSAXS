@@ -209,6 +209,8 @@ if QT_AVAILABLE:
             self.canvas.draw_idle()
 
         def _export(self) -> None:
+            from ._common import confirm_save_path
+
             if self._result is None:
                 return
             chosen, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -219,29 +221,19 @@ if QT_AVAILABLE:
             )
             if not chosen:
                 return
-            target = Path(chosen)
-            if target.suffix.lower() != ".npz":
-                target = target.with_suffix(".npz")
-            existing = [
-                candidate
-                for candidate in (target, target.with_suffix(".json"), target.with_suffix(".png"))
-                if candidate.exists()
-            ]
-            overwrite = False
-            if existing:
-                answer = QtWidgets.QMessageBox.question(
-                    self,
-                    _t("notice_title", self._language),
-                    _t("overwrite_prompt", self._language).format(
-                        paths="\n".join(str(path) for path in existing)
-                    ),
-                    QtWidgets.QMessageBox.StandardButton.Yes
-                    | QtWidgets.QMessageBox.StandardButton.No,
-                    QtWidgets.QMessageBox.StandardButton.No,
-                )
-                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                    return
-                overwrite = True
+            confirmed = confirm_save_path(
+                self,
+                chosen,
+                suffix=".npz",
+                extra_targets=lambda p: (p.with_suffix(".json"), p.with_suffix(".png")),
+                title=_t("notice_title", self._language),
+                prompt=lambda _p, existing: _t("overwrite_prompt", self._language).format(
+                    paths="\n".join(str(path) for path in existing)
+                ),
+            )
+            if confirmed is None:
+                return
+            target, overwrite = confirmed
             try:
                 paths = export_lamellar_scattering(
                     self._result,

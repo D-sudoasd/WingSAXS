@@ -9,7 +9,6 @@ the mesh contract and its geometry hash remain in the original coordinates.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,13 +17,8 @@ try:
 except Exception:  # pragma: no cover - NumPy is a project dependency
     np = None  # type: ignore[assignment]
 
+from ._common import _read
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui
-
-
-def _read(source: Any, name: str, default: Any = None) -> Any:
-    if isinstance(source, Mapping):
-        return source.get(name, default)
-    return getattr(source, name, default)
 
 
 @dataclass

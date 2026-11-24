@@ -19,18 +19,6 @@ from .i18n import translate
 from .qt_compat import QT_AVAILABLE, QtWidgets, require_qt
 
 
-def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
-    if isinstance(source, Mapping):
-        for name in names:
-            if name in source:
-                return source[name]
-    else:
-        for name in names:
-            if hasattr(source, name):
-                return getattr(source, name)
-    return default
-
-
 def _finite(value: Any) -> float | None:
     try:
         number = float(value)

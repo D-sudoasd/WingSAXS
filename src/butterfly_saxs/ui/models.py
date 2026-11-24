@@ -15,6 +15,7 @@ import math
 from numbers import Real
 from typing import Any, Callable
 
+from ._common import _read as _read_value
 from .i18n import translate, validate_language
 from .qt_compat import QT_AVAILABLE, QtCore
 
@@ -85,18 +86,6 @@ _PARAMETER_TOOLTIP_KEYS = {
         "ridge_width",
     )
 }
-
-
-def _read_value(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
-    if isinstance(source, Mapping):
-        for name in names:
-            if name in source:
-                return source[name]
-        return default
-    for name in names:
-        if hasattr(source, name):
-            return getattr(source, name)
-    return default
 
 
 def _number(value: Any, default: float | None = None) -> float | None:

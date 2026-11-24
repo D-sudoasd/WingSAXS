@@ -315,20 +315,18 @@ if QT_AVAILABLE:
                 self._tr("receipt_filter"),
             )
             if path:
+                from ._common import confirm_save_path
+
                 try:
-                    overwrite = False
-                    if Path(path).exists():
-                        answer = QtWidgets.QMessageBox.question(
-                            self,
-                            self._tr("overwrite_title"),
-                            self._tr("overwrite_prompt"),
-                            QtWidgets.QMessageBox.StandardButton.Yes
-                            | QtWidgets.QMessageBox.StandardButton.No,
-                            QtWidgets.QMessageBox.StandardButton.No,
-                        )
-                        overwrite = answer == QtWidgets.QMessageBox.StandardButton.Yes
-                    if overwrite or not Path(path).exists():
-                        self.export_receipt(path, overwrite=overwrite)
+                    confirmed = confirm_save_path(
+                        self,
+                        path,
+                        title=self._tr("overwrite_title"),
+                        prompt=self._tr("overwrite_prompt"),
+                    )
+                    if confirmed is not None:
+                        target, overwrite = confirmed
+                        self.export_receipt(target, overwrite=overwrite)
                 except (LegacySaxsError, OSError, ValueError):
                     pass
 

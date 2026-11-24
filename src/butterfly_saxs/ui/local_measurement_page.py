@@ -886,23 +886,20 @@ if QT_AVAILABLE:
             if not path:
                 return
             use_json = path.lower().endswith(".json") or "JSON" in selected_filter.upper()
-            target = Path(path)
-            expected_suffix = ".json" if use_json else ".csv"
-            if target.suffix.lower() != expected_suffix:
-                target = target.with_suffix(expected_suffix)
-            overwrite = False
-            if target.exists():
-                answer = QtWidgets.QMessageBox.question(
-                    self,
-                    title,
-                    _tr("export_exists", self.language).format(path=target),
-                    QtWidgets.QMessageBox.StandardButton.Yes
-                    | QtWidgets.QMessageBox.StandardButton.No,
-                    QtWidgets.QMessageBox.StandardButton.No,
-                )
-                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                    return
-                overwrite = True
+            from ._common import confirm_save_path
+
+            confirmed = confirm_save_path(
+                self,
+                path,
+                suffix=".json" if use_json else ".csv",
+                title=title,
+                prompt=lambda target, _existing: _tr("export_exists", self.language).format(
+                    path=target
+                ),
+            )
+            if confirmed is None:
+                return
+            target, overwrite = confirmed
             try:
                 if use_json:
                     export_local_measurements_json(target, self._records, overwrite=overwrite)

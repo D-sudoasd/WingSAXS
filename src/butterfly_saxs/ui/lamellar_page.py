@@ -905,15 +905,13 @@ if QT_AVAILABLE:
             self._start_job("import", _load)
 
         def _choose_export(self, sequence: bool) -> None:
+            from ._common import unique_export_dir
+
             parent = QtWidgets.QFileDialog.getExistingDirectory(self, tr("export", self.language))
             if not parent:
                 return
-            target = Path(parent) / ("lamellar-sequence" if sequence else "lamellar-schematic")
-            count = 2
-            while target.exists():
-                target = Path(parent) / f"lamellar-{'sequence' if sequence else 'schematic'}-{count}"
-                count += 1
-            self.export_to(target, sequence=sequence)
+            stem = "lamellar-sequence" if sequence else "lamellar-schematic"
+            self.export_to(unique_export_dir(parent, stem), sequence=sequence)
 
         def export_to(self, path: str | Path, *, sequence: bool = False) -> None:
             if self.current_scene is None or not self.current_scene.metadata.get("available"):

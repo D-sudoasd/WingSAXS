@@ -28,6 +28,7 @@ try:  # NumPy is a normal project dependency, but keep module import defensive.
 except Exception:  # pragma: no cover - exercised only by unusual minimal hosts
     np = None  # type: ignore[assignment]
 
+from ._common import _read
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets
 
 try:
@@ -45,20 +46,6 @@ _STANDARD_VIEWS: dict[str, tuple[float, float]] = {
     "side": (90.0, 0.0),
     "top": (0.0, 90.0),
 }
-
-
-def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
-    """Read a field from a mapping or a small dataclass-like object."""
-
-    if isinstance(source, Mapping):
-        for name in names:
-            if name in source:
-                return source[name]
-    else:
-        for name in names:
-            if hasattr(source, name):
-                return getattr(source, name)
-    return default
 
 
 def _as_float_array(value: Any, *, ndim: int | None = None) -> Any:

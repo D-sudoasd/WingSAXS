@@ -9,12 +9,13 @@ from __future__ import annotations
 import csv
 from collections.abc import Mapping, Sequence
 import json
-import math
 import os
 from pathlib import Path
 import shutil
 import tempfile
 from typing import Any
+
+from ._common import json_safe
 
 try:
     import numpy as _np
@@ -22,27 +23,8 @@ except Exception:  # pragma: no cover
     _np = None
 
 
-def _jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    if _np is not None:
-        if isinstance(value, _np.ndarray):
-            return _jsonable(value.tolist())
-        if isinstance(value, _np.generic):
-            return _jsonable(value.item())
-    return str(value)
-
-
 def _csv_value(value: Any) -> str:
-    value = _jsonable(value)
+    value = json_safe(value)
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
@@ -52,7 +34,7 @@ def _csv_value(value: Any) -> str:
 
 def _safe_write_json(path: Path, payload: Any) -> None:
     path.write_text(
-        json.dumps(_jsonable(payload), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        json.dumps(json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
 
@@ -152,8 +134,8 @@ def export_butterfly_analysis(
         analysis = {
             "schema_version": 1,
             "method": "butterfly_curvature",
-            "analysis": _jsonable(getattr(workbench, "butterfly_settings", {})),
-            "butterfly": _jsonable(result),
+            "analysis": json_safe(getattr(workbench, "butterfly_settings", {})),
+            "butterfly": json_safe(result),
             **review,
         }
         _safe_write_json(temporary / "butterfly_analysis.json", analysis)
@@ -181,10 +163,10 @@ def export_butterfly_analysis(
         provenance = {
             "schema_version": 1,
             **review,
-            "source": _jsonable(dict(context or getattr(workbench, "export_context", {}) or {})),
-            "display": _jsonable(getattr(workbench, "display_settings", {})),
+            "source": json_safe(dict(context or getattr(workbench, "export_context", {}) or {})),
+            "display": json_safe(getattr(workbench, "display_settings", {})),
             "frame_data": {
-                "q_unit": _jsonable(getattr(workbench, "_frame_data", {}).get("q_unit")),
+                "q_unit": json_safe(getattr(workbench, "_frame_data", {}).get("q_unit")),
                 "shape": list(getattr(getattr(workbench, "qspace", None), "observed", _np.empty((0,))).shape)
                 if _np is not None and getattr(getattr(workbench, "qspace", None), "observed", None) is not None
                 else None,

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from math import cos, isfinite, pi, sin
 from typing import Any
 
+from ._common import _read
 from .i18n import translate, validate_language
 from .qspace import QSpaceView
 from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets
@@ -62,18 +63,6 @@ def _as_array(data: Any) -> Any:
     if result.ndim != 2 or result.size == 0:
         return None
     return result
-
-
-def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
-    if isinstance(source, Mapping):
-        for name in names:
-            if name in source:
-                return source[name]
-    else:
-        for name in names:
-            if hasattr(source, name):
-                return getattr(source, name)
-    return default
 
 
 def _display_array(data: Any, *, valid_mask: Any = None, external_mask: Any = None) -> Any:

@@ -531,15 +531,12 @@ if QT_AVAILABLE:
             self.documentChanged.emit(self.document())
 
         def _choose_export(self):
+            from ._common import unique_export_dir
+
             directory = QtWidgets.QFileDialog.getExistingDirectory(self, self._t("export_dir_title"))
             if not directory:
                 return
-            target = Path(directory) / "publication-figure"
-            index = 2
-            while target.exists():
-                target = Path(directory) / f"publication-figure-{index}"
-                index += 1
-            self.export_to(target)
+            self.export_to(unique_export_dir(directory, "publication-figure"))
 
         def export_to(self, destination):
             if self._rendering or self._worker:

@@ -24,6 +24,7 @@ try:
 except Exception:  # pragma: no cover - numpy is a core dependency normally
     _np = None
 
+from ._common import _read
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 
 
@@ -33,18 +34,6 @@ def _axis_tick_text(value: float, lower: float, upper: float) -> str:
     if abs(value) <= scale * 1e-12:
         value = 0.0
     return f"{value:.3g}"
-
-
-def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
-    if isinstance(source, Mapping):
-        for name in names:
-            if name in source:
-                return source[name]
-    else:
-        for name in names:
-            if hasattr(source, name):
-                return getattr(source, name)
-    return default
 
 
 def _point_is_accepted(point: Any, *, default: bool = True) -> bool:
