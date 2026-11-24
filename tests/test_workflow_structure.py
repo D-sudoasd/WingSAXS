@@ -349,6 +349,41 @@ def test_shared_infrastructure_helpers_atomic_and_strict(tmp_path: Path) -> None
     figure_support.save_agg_figure(fig, png_path, clear=True, format="png", dpi=72)
     assert png_path.is_file() and png_path.stat().st_size > 0
 
+    # atomic_stage_dir(overwrite=True) refuses to clobber non-directory targets or strand backups.
+    existing_file = tmp_path / "not_a_directory"
+    existing_file.write_text("keep-me\n", encoding="utf-8")
+    with pytest.raises(NotADirectoryError):
+        with path_utils.atomic_stage_dir(existing_file, overwrite=True) as stage:
+            (stage / "marker.txt").write_text("v1\n", encoding="utf-8")
+    assert existing_file.is_file()
+    assert existing_file.read_text(encoding="utf-8") == "keep-me\n"
+    assert not list(tmp_path.glob(".not_a_directory*"))
+
+
+def test_q_unit_and_enum_serialization_contracts() -> None:
+    from enum import Enum, IntEnum
+    from butterfly_saxs import manual_evidence, p4_quality
+
+    for phys in ("nm^-1", "nm⁻¹", "1/nm", "A^-1", "Å⁻¹", "angstrom-1", "nm⁻1", b"nm^-1"):
+        assert p4_quality._physical_q_unit(phys) is True, f"expected physical for {phys!r}"
+    for non_phys in ("pixel-q", "pixel", "unknown", "", None):
+        assert p4_quality._physical_q_unit(non_phys) is False, f"expected non-physical for {non_phys!r}"
+
+    class StatusEnum(Enum):
+        READY = "ready"
+        WEIGHTED = (1, float("nan"))
+
+    class CodeEnum(IntEnum):
+        OK = 2
+
+    assert serialization.json_safe(StatusEnum.READY) == "ready"
+    assert serialization.json_safe(StatusEnum.WEIGHTED) == [1, None]
+    assert serialization.json_safe(CodeEnum.OK) == 2
+    assert manual_evidence._json_safe({"status": StatusEnum.READY, "code": CodeEnum.OK}) == {
+        "status": "ready",
+        "code": 2,
+    }
+
 
 def test_scripts_readme_and_validate_arcs_recursive_hashes() -> None:
     repo_root = Path(cli.__file__).resolve().parents[2]

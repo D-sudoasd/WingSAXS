@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
+from enum import Enum
 import json
 import math
 import os
@@ -27,6 +28,8 @@ def json_safe(value: Any) -> Any:
     NumPy values without introducing an import cycle.
     """
 
+    if isinstance(value, Enum):
+        return json_safe(value.value)
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):

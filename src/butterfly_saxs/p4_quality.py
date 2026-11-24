@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from .settings import canonical_q_unit
+from ._primitives import q_scale_to_nm_inv
 
 
 ENGINEERING_THRESHOLDS_VERSION = "p4-engineering-provisional-v1"
@@ -58,8 +58,7 @@ def _finite(value: Any) -> float | None:
 
 
 def _physical_q_unit(value: Any) -> bool:
-    cleaned = str(value or "unknown").replace("**-1", "^-1")
-    return canonical_q_unit(cleaned) in {"nm⁻¹", "Å⁻¹"}
+    return q_scale_to_nm_inv(value) is not None
 
 
 def _point_rows(ridge: Any) -> list[Any]:

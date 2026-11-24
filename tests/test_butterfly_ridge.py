@@ -635,6 +635,41 @@ def test_radial_population_selection_requires_a_valid_q_hint() -> None:
     assert max(math.hypot(point["qx"], point["qy"]) for point in continuum) > 3.5 * 0.092
     assert retained["keep"] is None
 
+    finite_width_harmonic = []
+    for index, radius in enumerate(
+        list(np.linspace(0.22, 0.29, 8))
+        + [0.385, 0.412]  # isolated 2-point noise speck inside the radial valley
+        + list(np.linspace(0.50, 0.56, 10))
+    ):
+        angle = 0.35 + 0.04 * (index % 4)
+        finite_width_harmonic.append(
+            {
+                "qx": float(radius * math.cos(angle)),
+                "qy": float(radius * math.sin(angle)),
+                "branch_id": index % 2,
+                "side": "upper" if index % 2 == 0 else "lower",
+                "accepted": True,
+            }
+        )
+    split_finite = _demote_secondary_radial_population(finite_width_harmonic)
+    assert split_finite["split"] is True
+    assert split_finite["selection_status"] == "ambiguous"
+    assert split_finite["demoted"] == 0
+    assert split_finite["low_q_population"]["n_points"] == 8
+    assert split_finite["high_q_population"]["n_points"] == 10
+
+    sparse_continuum = [
+        {
+            "qx": float(r * math.cos(0.35)),
+            "qy": float(r * math.sin(0.35)),
+            "branch_id": idx % 2,
+            "side": "upper" if idx % 2 == 0 else "lower",
+            "accepted": True,
+        }
+        for idx, r in enumerate(np.linspace(0.09, 0.55, 12))
+    ]
+    assert _demote_secondary_radial_population(sparse_continuum)["split"] is False
+
 
 def test_first_order_q_hint_selects_inner_ring_not_brighter_harmonic() -> None:
     axis = np.linspace(-0.8, 0.8, 81)

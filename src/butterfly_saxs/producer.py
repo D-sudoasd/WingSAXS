@@ -29,12 +29,13 @@ _PREVIOUS_COMPACT_CHECKPOINT_SOURCES = frozenset({
     ("591075a8af41bc7a8147b96af6c1303e4ff85418b9d866eaf0cf4a6b04eac315", "8189d6c90654e5cb6777e8407b91c448a525bf10137c3bf0c4449cd891490cb7"),
     ("245a4d97c55ad028a69b8690422078465c6bd2153b2dffbddeedb85f211f01de", "6df7f1ba052cfef67b5a0bec027a78ed71c178ca55bfc2adc3dda3feea7987be"),
     ("2af9e72a526ee7a888f174a4ec83bcf66b5c16a3b3126e8751ddbe61bb9fc841", "dcdeb736798d129fed063d5dfd87e5e8146587904f8d9bd0bd03bae83168017d"),
+    ("2af9e72a526ee7a888f174a4ec83bcf66b5c16a3b3126e8751ddbe61bb9fc841", "b6cf64dddd948a365865fda92db167895a3aa441c828b04e3c01650079c0c3c1"),
 })
 _PRETTY_CHECKPOINT_SOURCES = frozenset({
     ("9d2451115cdd219bf26118b62f930a9ba350dc6237ee408d6fd81fa0c7a3c0fa", "e87ce353aaf1b07ef85c13243a9e1ffc7fd60f0034d03582a160c787fa891544"),
     ("bb12be937d5b105fd81714923ae9413f3388ab45d97c1b7578461b489cb7c9e3", "ff5cc51d19ca4438b0073b83e0741cc43791ded7656556b70259e515fc713049"),
 })
-_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "94ad84e61ef1c6eb82a9402830e998721f91c147c0dc9340f4b811643d2aa8c2"
+_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "762b6aaed95cbf86bfd05f84e7879d9060a4bacdfb8992f6a10fad00f73d4964"
 
 # Subpackages that never participate in detector/reciprocal-space calculation.
 _NON_CALCULATION_PACKAGES = frozenset({
@@ -57,7 +58,7 @@ _PRESENTATION_EXCLUDED_PACKAGES = frozenset({
 
 # Top-level presentation, export, CLI-contract, validation-gate, and I/O utility
 # modules excluded from calculation identity (unknown/new core modules and
-# calculation subpackages such as physics/, tracing/, observables/ remain included).
+# calculation subpackages such as physics/ and tracing/ remain included).
 _NON_CALCULATION_MODULES = frozenset({
     "__init__.py",
     "__main__.py",
@@ -202,7 +203,7 @@ def producer_identity(*, presentation: bool = False) -> dict:
     """Bind reuse to installed source bytes and relevant dependency versions.
 
     Presentation-only edits must not invalidate calculated detector results.
-    Calculation subpackages (e.g. ``physics/``, ``tracing/``, ``observables/``)
+    Calculation subpackages (e.g. ``physics/``, ``tracing/``)
     and unknown/new modules are included conservatively in the calculation set.
     No identity is reused between calls or stored outside the existing receipts.
     """

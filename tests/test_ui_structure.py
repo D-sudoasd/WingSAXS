@@ -83,6 +83,27 @@ def test_batch_records_module_is_pure_python_and_headless_safe() -> None:
     )
     assert proc.returncode == 0, proc.stderr
 
+    lazy_probe = (
+        "import sys; "
+        "import butterfly_saxs.ui as ui; "
+        "import butterfly_saxs.ui._common as cm; "
+        "import butterfly_saxs.ui._batch_records as br; "
+        "import butterfly_saxs.ui.project_document as pd; "
+        "loaded_qt = [m for m in sorted(sys.modules) if m.startswith(('PySide6', 'shiboken6', 'pyqtgraph'))]; "
+        "assert not loaded_qt, f'unexpected eager Qt imports: {loaded_qt}'; "
+        "assert callable(cm._read) and callable(br._batch_record_geometry) and callable(pd.ProjectDocumentController)"
+    )
+    proc_lazy = subprocess.run(
+        [sys.executable, "-c", lazy_probe],
+        cwd=ROOT,
+        env={"PYTHONPATH": str(ROOT / "src")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc_lazy.returncode == 0, proc_lazy.stderr
+
 
 def test_common_helpers_read_units_json_and_export_dirs(tmp_path: Path) -> None:
     mapping = {"zero": 0, "empty": "", "flag": False, "nested": "ok"}

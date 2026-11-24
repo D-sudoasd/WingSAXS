@@ -16,7 +16,7 @@
 | 图像/NPZ、帧和数据集选择、掩膜 | `io.py`、`pipeline._read_frame_bundle` | `tests/test_io_geometry.py`、`tests/test_npz_frame_maps.py`、`tests/test_p2_io_batch_contracts.py` |
 | batch、哈希、checkpoint、resume | `batch.py`、`file_identity.py`，相应 CLI/service 调用者 | `tests/test_batch_export.py`、`tests/test_unattended_batch.py`；元数据问题加对应 time-metadata 测试 |
 | 轨迹或椭圆拟合 | 出问题的算法模块及其调用者 | 对应算法测试；按需要增加 CLI/service 数值用例、掩膜/弱信号/边界解回归 |
-| 已有结果的报告或打包 | `report.py`、`delivery.py`、`delivery_pairs.py`，具体绘图模块 | `tests/test_report_cli.py`、`tests/test_analysis_report.py` 或对应 delivery/绘图测试 |
+| 已有结果的报告或打包 | `report.py`、`delivery/`（及 `delivery_*.py` 兼容垫片），具体绘图模块 | `tests/test_report_cli.py`、`tests/test_analysis_report.py` 或对应 delivery/绘图测试 |
 | service 或 GUI 交互 | `service.py`、相关 `ui/` 控件/worker | 对应 service/UI 测试；只涉及控件时不重新拟合实验数据 |
 | 文档或说明修改 | 目标文档及相关接口定义 | 检查链接、命令/字段是否与实现一致；无需全套数值测试 |
 

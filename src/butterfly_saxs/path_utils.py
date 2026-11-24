@@ -88,23 +88,27 @@ def atomic_stage_dir(
             committed = True
         else:
             backup = target.with_name(f".{target.name}-previous")
-            if backup.exists():
+            if os.path.lexists(backup):
                 raise FileExistsError(
                     f"Previous backup exists: {backup}; recover it before replacing {target}."
                 )
-            if target.exists():
+            if os.path.lexists(raw) or os.path.lexists(target):
+                if os.path.islink(raw) or os.path.islink(target) or not target.is_dir():
+                    raise NotADirectoryError(
+                        f"export target exists and is not a directory: {target}"
+                    )
                 os.replace(target, backup)
             try:
                 os.replace(stage, target)
                 committed = True
             except BaseException:
-                if backup.exists():
+                if os.path.lexists(backup):
                     try:
                         os.replace(backup, target)
                     except OSError:
                         pass
                 raise
-            if backup.exists():
+            if os.path.lexists(backup):
                 shutil.rmtree(backup, ignore_errors=True)
     except BaseException:
         if stage.exists():

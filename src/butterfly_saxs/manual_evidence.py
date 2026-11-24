@@ -15,6 +15,7 @@ import platform
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,8 @@ def _safe_float(value: Any, field_name: str, *, allow_none: bool = True) -> floa
 def _json_safe(value: Any) -> Any:
     """Convert metadata to strict JSON without embedding detector-sized arrays."""
 
+    if isinstance(value, Enum):
+        return _json_safe(value.value)
     if isinstance(value, np.ndarray):
         if value.ndim == 0:
             return json_safe(value.item())

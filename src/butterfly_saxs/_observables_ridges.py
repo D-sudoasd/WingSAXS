@@ -44,6 +44,13 @@ def _resolve_radial_profile():
     return measure_radial_profile
 
 
+def _resolve_radial_ridges():
+    obs_mod = sys.modules.get("butterfly_saxs.observables")
+    if obs_mod is not None:
+        return getattr(obs_mod, "measure_radial_ridges", measure_radial_ridges)
+    return measure_radial_ridges
+
+
 def measure_radial_profile(
     frame: Any,
     qmap: Any,
@@ -1759,12 +1766,13 @@ def measure_radial_ridges(
             curvature_percentile=curvature_percentile,
             normal_step=curvature_normal_step,
         )
+    profile_fn = _resolve_radial_profile()
     points: list[RidgePoint]
     if continuity_mode:
         profiles: list[RadialProfile] = []
         for angle in angle_array:
             raise_if_cancelled(cancel_event, "ridges:continuity-sector")
-            profiles.append(measure_radial_profile(
+            profiles.append(profile_fn(
                 frame,
                 qmap,
                 float(angle),
@@ -1803,7 +1811,7 @@ def measure_radial_ridges(
                     min_coverage=float(ridge_min_coverage),
                 )
             else:
-                radial = measure_radial_profile(
+                radial = profile_fn(
                     frame,
                     qmap,
                     float(angle),
@@ -1860,7 +1868,7 @@ def extract_surface_curvature_ridges(*args: Any, **kwargs: Any) -> RidgeTrack:
     """Explicit public entry point for the principal-curvature ridge mode."""
 
     kwargs["ridge_method"] = "surface_curvature"
-    return measure_radial_ridges(*args, **kwargs)
+    return _resolve_radial_ridges()(*args, **kwargs)
 
 
 def _measure_lobe_radial_observables(

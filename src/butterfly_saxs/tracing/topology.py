@@ -301,11 +301,12 @@ def _graph_arcs(candidates: list[dict[str, Any]], options: Mapping[str, Any], q_
                     dot_tangent = abs(float(point["tangent_qx"]) * float(other["tangent_qx"]) + float(point["tangent_qy"]) * float(other["tangent_qy"]))
                     if not np.isfinite(dot_tangent) or dot_tangent < tangent_cos:
                         continue
-                    normal_projection = min(
-                        abs(dx * float(point["normal_qx"]) + dy * float(point["normal_qy"])),
-                        abs(dx * float(other["normal_qx"]) + dy * float(other["normal_qy"])),
-                    )
-                    if normal_projection > float(options["graph_normal_factor"]) * max(scale, other_scale_raw * q_step):
+                    other_scale = max(other_scale_raw * q_step, q_step)
+                    normal_factor = float(options["graph_normal_factor"])
+                    if (
+                        abs(dx * float(point["normal_qx"]) + dy * float(point["normal_qy"])) > normal_factor * scale
+                        or abs(dx * float(other["normal_qx"]) + dy * float(other["normal_qy"])) > normal_factor * other_scale
+                    ):
                         continue
                     union.union(index, other_index)
                     edges.append((index, other_index))

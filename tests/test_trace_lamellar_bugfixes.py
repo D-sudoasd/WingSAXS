@@ -224,6 +224,48 @@ def test_butterfly_ridge_nms_and_graph_arcs_handle_nonfinite_and_multiscale() ->
     assert len(groups) == 1
     assert len(groups[0]) == 3
 
+    # Asymmetric parallel-track ("echelon") jump where a coarse endpoint's scale
+    # would excuse an offset exceeding the fine endpoint's own normal corridor
+    # must NOT stitch unrelated radial populations together.
+    echelon_opts = butterfly_ridge._normalise_options(
+        {
+            "graph_radius_factor": 3.5,
+            "graph_tangent_angle_deg": 65.0,
+            "graph_normal_factor": 1.8,
+        }
+    )
+    echelon = [
+        {
+            "point_id": "outer",
+            "qx": -0.4542,
+            "qy": 0.2221,
+            "scale": 3.6,
+            "accepted": True,
+            "branch_id": 1,
+            "tangent_qx": 0.9955,
+            "tangent_qy": 0.0952,
+            "normal_qx": 0.0952,
+            "normal_qy": -0.9955,
+        },
+        {
+            "point_id": "spur",
+            "qx": -0.3811,
+            "qy": 0.1578,
+            "scale": 1.2,
+            "accepted": True,
+            "branch_id": 1,
+            "tangent_qx": 0.9292,
+            "tangent_qy": -0.3697,
+            "normal_qx": -0.3697,
+            "normal_qy": -0.9292,
+        },
+    ]
+    echelon_groups, echelon_edges = butterfly_ridge._graph_arcs(
+        echelon, echelon_opts, 0.01227
+    )
+    assert echelon_edges == []
+    assert len(echelon_groups) == 2
+
 
 def test_butterfly_ridge_ordered_component_avoids_chord_leaps_and_uturns() -> None:
     pts = [

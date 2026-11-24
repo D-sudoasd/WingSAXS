@@ -43,7 +43,7 @@ src/butterfly_saxs/
 ├── delivery/ (+ delivery_*.py 兼容薄垫片)
 │   └── package, dependencies, bindings, pairs
 ├── _primitives.py              # 跨模块共享的无重依赖数值/角度/安全转换基础原语
-├── observables.py (+ _observables_{types,angular,ridges,ellipse}.py / observables/)
+├── observables.py (+ _observables_{types,angular,ridges,ellipse}.py)
 ├── tracing/ (+ butterfly*.py)  # 蝴蝶弧段追踪（annular_peak / radial_sector / curvature）、法向剖面与不确定度评估
 ├── physics/ (+ saxs_physics.py)# 方位谐波、直接/Kratky 分列径向粗化、标定强度 Q_win、条纹展宽与动力学拟合
 ├── lamellar/ (+ lamellar_*.py 兼容薄垫片)
@@ -69,7 +69,7 @@ src/butterfly_saxs/
 - `ellipse.py`：只拟合倒易空间曲线，返回残差、协方差和可辨识性；圆环 `q*` / `L = 2π/q*` 与椭圆半轴 `a`、`b/a`、轴角及条件 `Ln/Lz` 严格分离。
 - `intensity.py`：生成和拟合经验二维强度场；当前 `full2d` 是共享双椭圆、角向包络、径向线形和背景的经验模型，不是 Grubb 2016 的完整 3D 取向正演。
 - `sequence_diagnostics.py`：只读序列级异常与质量诊断，计算解码像素数组 SHA-256 哈希以检测重复/冻结帧，并标记时间间隔异常、轴比塌缩、q 窗口边界命中、正交翻转和覆盖率跌落；保留全部源帧序号，从不插值或替换失败帧。
-- `batch.py`、`export.py` + `_export_schema.py` 与 `producer.py`：FrameRef 的容器 selector 与序列 selector 分开；输入、PONI、mask、beamstop 与不确定度文件内容参与 checkpoint 身份。`export_batch` 与 `StreamingBatchExporter` 共用 `_export_schema.py` 的列契约与行构建器，`--stream` 逐帧写 NPZ 并在 resume 时保留已验证的旧数组。`producer.py` 按 POSIX 相对路径递归哈希核心计算模块与计算子包（`physics/`、`tracing/`、`observables/` 等），同时将 `ui/`、`lamellar/`、`preflight/`、`delivery/`、`_cli/` 及纯展示/导出模块排除在检测器计算身份之外，避免展示层重构使有效计算检查点失效。
+- `batch.py`、`export.py` + `_export_schema.py` 与 `producer.py`：FrameRef 的容器 selector 与序列 selector 分开；输入、PONI、mask、beamstop 与不确定度文件内容参与 checkpoint 身份。`export_batch` 与 `StreamingBatchExporter` 共用 `_export_schema.py` 的列契约与行构建器，`--stream` 逐帧写 NPZ 并在 resume 时保留已验证的旧数组。`producer.py` 按 POSIX 相对路径递归哈希核心计算模块与计算子包（`physics/`、`tracing/` 等），同时将 `ui/`、`lamellar/`、`preflight/`、`delivery/`、`_cli/` 及纯展示/导出模块排除在检测器计算身份之外，避免展示层重构使有效计算检查点失效。
 - `campaign.py`：工作流预设（`annular`/`curvature`/`sector`/`butterfly_pub`）、自然排序清单发现（`bsaxs init-manifest`，缺失时间戳留空不捏造），以及多样品活动编排（`bsaxs campaign`，支持单样品失败隔离、可选 `--workers` 并行与 `--beamstop-radius-px` / `--deduplicate-frames`）。
 - `serialization.py`、`file_identity.py`、`path_utils.py`、`figure_support.py`：统一提供 `write_json_atomic` / `write_text_atomic`（`allow_nan=False`、同目录临时文件 + `os.replace`、`BaseException` 清理）、`sha256_bytes` / `sha256_file`、`atomic_stage_dir`（原子目录发布与覆盖备份回滚）以及无 `pyplot` / 无全局后端切换的 `save_agg_figure`，供报告、图包、盲标包与 P3/P4 门禁复用。
 - `report.py`、`lamellar/`、`journal_style.py`、`composite_figures.py`、`comparison_report.py`、`butterfly_figure.py`、`publication_export.py` 与 `delivery/`：严格无 `matplotlib.pyplot` 的报告、出版级复合图与可离线浏览交付打包层；`delivery/`（`package`、`dependencies`、`bindings`、`pairs`）仅索引和核验既有导出证据，不重跑拟合也不赋予科学验收状态。

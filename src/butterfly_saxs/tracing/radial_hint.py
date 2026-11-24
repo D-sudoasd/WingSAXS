@@ -6,10 +6,15 @@ from collections.abc import Mapping, Sequence
 import math
 import sys
 from typing import Any
+import warnings
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
+try:
+    from scipy.signal import PeakPropertyWarning
+except ImportError:  # pragma: no cover
+    PeakPropertyWarning = Warning
 
 from .topology import (
     _assign_point_ids,
@@ -410,7 +415,11 @@ def _first_order_q_hint(
     for start, stop in supported_runs:
         segment = profile[start:stop]
         local_peaks, properties = find_peaks(segment, prominence=(None, None))
-        widths = peak_widths(segment, local_peaks, rel_height=0.5)[0]
+        if local_peaks.size == 0:
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", PeakPropertyWarning)
+            widths = peak_widths(segment, local_peaks, rel_height=0.5)[0]
         for local_peak, prominence, width in zip(
             local_peaks, properties["prominences"], widths
         ):
@@ -1384,17 +1393,40 @@ def _demote_secondary_radial_population(
         ordered = np.sort(np.asarray(radii, dtype=float))
         gaps = np.diff(ordered)
         if gaps.size > 0:
-            split_at = int(np.argmax(gaps))
-            low = ordered[: split_at + 1]
-            high = ordered[split_at + 1 :]
-            gap = float(gaps[split_at])
             median = float(np.median(ordered))
+            # Prevent 1-3 isolated noise specks (<4 points) inside an empty
+            # radial valley from masking a genuine gap between supported
+            # populations, while leaving continuous wings intact.
+            cluster_break = max(0.10 * median, 4.0 * float(np.median(gaps)))
+            breaks = [0, *(int(idx + 1) for idx in np.flatnonzero(gaps > cluster_break)), int(ordered.size)]
+            supported_clusters = [
+                ordered[start:stop]
+                for start, stop in zip(breaks[:-1], breaks[1:])
+                if stop - start >= 4
+            ]
+            core = (
+                np.concatenate(supported_clusters)
+                if supported_clusters
+                else np.asarray([], dtype=float)
+            )
+            core_gaps = np.diff(core)
+            if core_gaps.size > 0:
+                split_at = int(np.argmax(core_gaps))
+                low = core[: split_at + 1]
+                high = core[split_at + 1 :]
+                gap = float(core_gaps[split_at])
+            else:
+                low = np.asarray([], dtype=float)
+                high = np.asarray([], dtype=float)
+                gap = 0.0
+            eps = float(np.finfo(float).eps)
             can_split = (
                 low.size >= 4
                 and high.size >= 4
                 and median > 0.0
                 and gap >= 0.35 * median
-                and float(high[0] / max(float(low[-1]), np.finfo(float).eps)) >= 1.8
+                and float(high[0] / max(float(low[-1]), eps)) >= FIRST_ORDER_PEAK_FAMILY_SPAN
+                and float(np.median(high) / max(float(np.median(low)), eps)) >= 1.8
             )
             if can_split:
                 try:

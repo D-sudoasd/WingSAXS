@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..serialization import json_safe
 from ..settings import canonical_q_unit
-from .qt_compat import QT_AVAILABLE, QtWidgets, is_qt_valid, require_qt, safe_single_shot
+
+if TYPE_CHECKING:
+    from .qt_compat import QT_AVAILABLE
 
 _SUPERSCRIPT_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     ("⁻¹", "^-1"),
@@ -94,6 +96,8 @@ def confirm_save_path(
     existing = [candidate for candidate in seen if candidate.exists()]
     needs_prompt = bool(existing) and (confirm_if_unchanged or target != raw_path)
     if needs_prompt:
+        from .qt_compat import QtWidgets, require_qt
+
         require_qt()
         message = (
             prompt(target, existing)
@@ -111,6 +115,34 @@ def confirm_save_path(
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return None
     return target, bool(existing)
+
+
+def is_qt_valid(obj: Any) -> bool:
+    """Return True when ``obj`` is non-None and its underlying C++ QObject is alive."""
+
+    if obj is None:
+        return False
+    from .qt_compat import is_qt_valid as _is_qt_valid
+
+    return _is_qt_valid(obj)
+
+
+def safe_single_shot(delay_ms: int, receiver: Any, callback: Callable[[], None]) -> None:
+    """Schedule a single-shot timer that skips invocation if ``receiver`` is deleted."""
+
+    if receiver is None:
+        return
+    from .qt_compat import safe_single_shot as _safe_single_shot
+
+    _safe_single_shot(delay_ms, receiver, callback)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "QT_AVAILABLE":
+        from .qt_compat import QT_AVAILABLE
+
+        return QT_AVAILABLE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def display_q_unit(value: Any) -> str:

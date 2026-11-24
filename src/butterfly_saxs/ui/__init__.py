@@ -6,8 +6,6 @@ No Qt module is imported until a UI symbol is requested.  This keeps
 
 from __future__ import annotations
 
-from .qt_compat import QT_AVAILABLE, QT_IMPORT_ERROR
-
 __all__ = [
     "QT_AVAILABLE",
     "QT_IMPORT_ERROR",
@@ -35,6 +33,13 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    if name in {"QT_AVAILABLE", "QT_IMPORT_ERROR"}:
+        from .qt_compat import QT_AVAILABLE, QT_IMPORT_ERROR
+
+        return {
+            "QT_AVAILABLE": QT_AVAILABLE,
+            "QT_IMPORT_ERROR": QT_IMPORT_ERROR,
+        }[name]
     if name in {"AnalysisService", "ButterflyAnalysisService"}:
         from ..service import AnalysisService, ButterflyAnalysisService
 
