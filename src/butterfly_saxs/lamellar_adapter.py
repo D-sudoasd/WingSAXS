@@ -121,7 +121,11 @@ def _q_unit_from_source(
         return str(direct)
     for peak in peaks:
         direct = _read(peak, ("q_unit", "source_q_unit"), None)
-        if direct not in (None, ""):
+        if direct not in (None, "") and _normalise_q_unit(direct) not in {
+            "unknown",
+            "none",
+            "",
+        }:
             return str(direct)
     return "unknown"
 
@@ -300,10 +304,11 @@ def _radial_peaks(root: Mapping[str, Any]) -> list[dict[str, Any]]:
             or any("annulus" in item for item in flags)
         ):
             continue
-        valid_value = _read(
-            peak, ("valid", "accepted"), _read(metadata, ("valid", "accepted"), True)
-        )
+        valid_value = _read(peak, ("valid",), _read(metadata, ("valid",), None))
         if valid_value is not None and not bool(valid_value):
+            continue
+        accepted_value = _read(peak, ("accepted",), _read(metadata, ("accepted",), None))
+        if accepted_value is not None and not bool(accepted_value):
             continue
         angle = _angle_deg(peak)
         if angle is None and radial_evidence:
@@ -336,6 +341,8 @@ def _radial_peaks(root: Mapping[str, Any]) -> list[dict[str, Any]]:
                 peak, ("q_star_nm_inv",), _read(metadata, ("q_star_nm_inv",), _MISSING)
             )
         )
+        if q_star_nm is not None and q_star_nm <= 0.0:
+            q_star_nm = None
         q_star_a = _finite(
             _read(
                 peak,
@@ -343,9 +350,8 @@ def _radial_peaks(root: Mapping[str, Any]) -> list[dict[str, Any]]:
                 _read(metadata, ("q_star_Ainv", "q_star_A_inv"), _MISSING),
             )
         )
-        if q_star_nm is None and q_star_a is not None and q_star_a > 0.0:
-            q_star_nm = q_star_a * 10.0
-            q_unit = "Å^-1"
+        if q_star_a is not None and q_star_a <= 0.0:
+            q_star_a = None
         raw_q = _read(
             peak,
             ("q_star", "q_position", "q"),
@@ -361,10 +367,15 @@ def _radial_peaks(root: Mapping[str, Any]) -> list[dict[str, Any]]:
             if qx is not None and qy is not None:
                 raw_q = float(np.hypot(qx, qy))
         q_value = _finite(raw_q)
-        if q_star_nm is None and (q_value is None or q_value <= 0.0):
+        if q_value is not None and q_value <= 0.0:
+            q_value = None
+        if q_star_nm is None and q_star_a is not None:
+            q_star_nm = q_star_a * 10.0
+            if q_value is None:
+                q_value = q_star_a
+                q_unit = "Å^-1"
+        if q_star_nm is None and q_value is None:
             continue
-        if q_star_nm is not None and q_star_nm <= 0.0:
-            q_star_nm = None
         scale = _q_scale_to_nm(q_unit)
         q_nm = (
             q_star_nm
@@ -375,6 +386,8 @@ def _radial_peaks(root: Mapping[str, Any]) -> list[dict[str, Any]]:
         )
         if q_value is None and q_star_nm is not None:
             q_value = q_star_nm if scale in (None, 1.0) else q_star_nm / scale
+            if scale is None:
+                q_unit = "nm^-1"
         if q_value is None or q_value <= 0.0:
             continue
         status = str(
@@ -434,18 +447,16 @@ def _group_populations(
 
 def _direction_for_group(group: Sequence[Mapping[str, Any]]) -> tuple[float, bool]:
     reference = float(group[0]["angle_deg"])
-    doubled = np.radians([float(item["angle_deg"]) * 2.0 for item in group])
+    angles = [float(item["angle_deg"]) for item in group]
+    doubled = np.radians([angle * 2.0 for angle in angles])
     mean = 0.5 * float(
         np.degrees(np.arctan2(np.mean(np.sin(doubled)), np.mean(np.cos(doubled))))
     )
-    candidate = mean
-    while candidate - reference >= 90.0:
-        candidate -= 180.0
-    while candidate - reference < -90.0:
-        candidate += 180.0
+    candidate = reference + (((mean - reference + 90.0) % 180.0) - 90.0)
     inconsistent = any(
-        _axial_distance_deg(reference, float(item["angle_deg"])) > 15.0
-        for item in group[1:]
+        _axial_distance_deg(first, second) > 15.0
+        for index, first in enumerate(angles)
+        for second in angles[index + 1 :]
     )
     return float(candidate), inconsistent
 
@@ -849,13 +860,10 @@ def _ellipse_parameter_records(ellipse: Any) -> list[dict[str, Any]]:
                 "center_qy",
             }:
                 unit = ellipse_unit
-            elif label.endswith("_deg") or label in {
-                "theta",
-                "reference_axis",
-                "reference_axis_deg",
-                "angle",
-            }:
+            elif label.endswith("_deg") or label == "reference_axis_deg":
                 unit = "degree"
+            elif label in {"theta", "reference_axis", "angle"}:
+                unit = "rad"
             else:
                 unit = "dimensionless"
             interval = (

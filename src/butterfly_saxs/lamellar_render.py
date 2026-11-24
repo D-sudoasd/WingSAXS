@@ -196,6 +196,8 @@ def _coerce_bounds(bounds: Any, scene: Any, vertices: np.ndarray) -> np.ndarray:
 
 
 def _colors(scene: Any, count: int) -> np.ndarray:
+    if count <= 0:
+        return np.empty((0, 4), dtype=float)
     raw = _get(scene, "colors")
     try:
         colors = np.asarray(raw, dtype=float)
@@ -206,6 +208,8 @@ def _colors(scene: Any, count: int) -> np.ndarray:
         try:
             branch_array = np.asarray(branches, dtype=int).reshape(-1)
         except (TypeError, ValueError):
+            branch_array = np.arange(count, dtype=int)
+        if branch_array.size < count:
             branch_array = np.arange(count, dtype=int)
         colors = np.vstack([_PALETTE[int(branch_array[i]) % len(_PALETTE)] for i in range(count)])
     elif np.nanmax(np.abs(colors)) > 1.001:
@@ -227,9 +231,21 @@ def _style_axes(ax: Any, *, title: str, font: FontProperties) -> None:
         spine.set_color(_GRID)
 
 
-def _draw_banner(fig: Figure, scene: Any, language: str, *, y: float = 0.985) -> None:
+def _clear_owned_figure_artists(fig: Figure, ax: Any) -> None:
+    owner = id(ax)
+    for artist in list(getattr(fig, "legends", ())):
+        if getattr(artist, "_lamellar_render_owner", None) == owner:
+            artist.remove()
+    for artist in list(getattr(fig, "texts", ())):
+        if getattr(artist, "_lamellar_render_owner", None) == owner:
+            artist.remove()
+
+
+def _draw_banner(
+    fig: Figure, scene: Any, language: str, *, y: float = 0.985, owner: int | None = None
+) -> None:
     font = _font()
-    fig.text(
+    text = fig.text(
         0.02,
         y,
         _title_suffix(scene, language),
@@ -240,6 +256,8 @@ def _draw_banner(fig: Figure, scene: Any, language: str, *, y: float = 0.985) ->
         fontsize=11,
         weight="semibold",
     )
+    if owner is not None:
+        text._lamellar_render_owner = owner
 
 
 def _draw_blank(
@@ -381,7 +399,7 @@ def _draw_scale_bar(ax: Any, bounds: np.ndarray, scene: Any, language: str) -> N
     target = x_span * 0.22
     exponent = int(np.floor(np.log10(target)))
     scale = 10.0**exponent
-    length = max(value for value in (5.0, 2.0, 1.0) if value * scale <= target)
+    length = max((value for value in (5.0, 2.0, 1.0) if value * scale <= target), default=1.0)
     length *= scale
     width_fraction = length / x_span
     x1 = 0.965
@@ -442,6 +460,7 @@ def render_lamellar_2d(
         ax = fig.add_subplot(111)
     else:
         fig = ax.figure
+        _clear_owned_figure_artists(fig, ax)
         ax.clear()
         fig.patch.set_facecolor(_OFFWHITE)
     font = _font()
@@ -462,10 +481,10 @@ def render_lamellar_2d(
     _draw_axis_arrow(ax, limits, language, compact=not decorate)
     ax.set_axis_off()
     if decorate:
-        _draw_banner(fig, scene, language)
+        _draw_banner(fig, scene, language, owner=id(ax))
     if legend_handles:
         font.set_size(8)
-        fig.legend(
+        legend = fig.legend(
             legend_handles,
             legend_labels,
             loc="upper right",
@@ -480,6 +499,7 @@ def render_lamellar_2d(
             handletextpad=0.45,
             prop=font,
         )
+        legend._lamellar_render_owner = id(ax)
     if not supplied_ax and decorate:
         # Reserve an annotation footer and keep the source legend outside the
         # geometry panel instead of overlaying the top or bottom layer.
@@ -624,6 +644,7 @@ def render_lamellar_3d(
         ax = fig.add_subplot(111, projection="3d")
     else:
         fig = ax.figure
+        _clear_owned_figure_artists(fig, ax)
         ax.clear()
         fig.patch.set_facecolor(_OFFWHITE)
     font = _font()
@@ -695,7 +716,7 @@ def render_lamellar_3d(
         ax.text2D(*text_point, "+" + label, transform=ax.transAxes, color=_MUTED,
                   fontsize=8, ha="center", va="center")
     if decorate:
-        _draw_banner(fig, scene, language)
+        _draw_banner(fig, scene, language, owner=id(ax))
     if not supplied_ax and decorate:
         fig.subplots_adjust(top=0.88)
     return fig
@@ -709,14 +730,17 @@ def _image_extent(qx: Any, qy: Any, shape: tuple[int, int]) -> tuple[float, floa
         y = np.asarray(qy, dtype=float)
     except (TypeError, ValueError):
         return None
-    try:
-        x_values = x if x.ndim == 1 else x[0, :]
-        y_values = y if y.ndim == 1 else y[:, 0]
-        if x_values.size == 0 or y_values.size == 0:
-            return None
-        return (float(np.nanmin(x_values)), float(np.nanmax(x_values)), float(np.nanmin(y_values)), float(np.nanmax(y_values)))
-    except (TypeError, ValueError):
+    if x.ndim not in {1, 2} or y.ndim not in {1, 2}:
         return None
+    x_finite = x[np.isfinite(x)]
+    y_finite = y[np.isfinite(y)]
+    if x_finite.size == 0 or y_finite.size == 0:
+        return None
+    x0, x1 = float(np.min(x_finite)), float(np.max(x_finite))
+    y0, y1 = float(np.min(y_finite)), float(np.max(y_finite))
+    if not all(np.isfinite(val) for val in (x0, x1, y0, y1)):
+        return None
+    return (x0, x1, y0, y1)
 
 
 def _display_q_window(scene: Any) -> tuple[float, float] | None:
@@ -891,11 +915,13 @@ def _image_to_array(value: Any) -> np.ndarray | None:
             return None
     if array is None or array.ndim not in {2, 3} or array.size == 0:
         return None
-    if array.dtype.kind in "fc":
+    if array.ndim == 3 and array.shape[-1] not in {3, 4}:
+        return None
+    if array.dtype.kind not in "fuib":
+        return None
+    if array.dtype.kind == "f":
         finite = np.isfinite(array)
         if not np.any(finite):
-            return None
-        if array.ndim == 3 and array.shape[-1] not in {3, 4}:
             return None
     return np.asarray(array)
 

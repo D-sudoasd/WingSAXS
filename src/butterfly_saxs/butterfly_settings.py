@@ -5,8 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 import math
+from numbers import Integral
 
 from .settings import strict_int
+
+
+def _is_bool(value) -> bool:
+    return isinstance(value, bool) or (
+        type(value).__module__ == "numpy" and type(value).__name__ in {"bool", "bool_"}
+    )
 
 
 # v2 records all-arc holdout and per-arc support diagnostics; v2.1 preserves
@@ -35,13 +42,15 @@ def normalize_butterfly_settings(settings=None) -> dict:
         raise ValueError("butterfly trace_method must be curvature, radial_sector or annular_peak")
     for name, minimum, maximum in (("annular_radial_bins", 4, 192), ("annular_angle_bins", 16, 720)):
         if name in result:
+            if _is_bool(result[name]):
+                raise ValueError(f"{name} must be an integer")
             result[name] = strict_int(result[name], name, minimum=minimum)
             if result[name] > maximum:
                 raise ValueError(f"{name} must be <= {maximum}")
     for name in ("sector_width_deg", "sector_step_deg"):
         if name in result:
             value = result[name]
-            if isinstance(value, bool):
+            if _is_bool(value):
                 raise ValueError(f"{name} must be a positive finite angle")
             value = float(value)
             if not math.isfinite(value) or not 0 < value <= 180:
@@ -50,13 +59,18 @@ def normalize_butterfly_settings(settings=None) -> dict:
     if result["stage"] not in {"trace", "evaluate"}:
         raise ValueError("butterfly stage must be trace or evaluate")
     for key in ("resamples", "seed"):
+        if _is_bool(result[key]):
+            raise ValueError(f"butterfly {key} must be an integer")
         result[key] = strict_int(result[key], f"butterfly {key}", minimum=0)
     if "max_nfev" in result:
+        if _is_bool(result["max_nfev"]):
+            raise ValueError("butterfly max_nfev must be an integer")
         result["max_nfev"] = strict_int(result["max_nfev"], "butterfly max_nfev", minimum=1)
     if result["resamples"] > MAX_RESAMPLES:
         raise ValueError(f"butterfly resamples must be <= {MAX_RESAMPLES}")
-    if not isinstance(result["sensitivity"], bool):
+    if not _is_bool(result["sensitivity"]):
         raise ValueError("butterfly sensitivity must be boolean")
+    result["sensitivity"] = bool(result["sensitivity"])
     edits = result["edits"]
     if not isinstance(edits, list):
         raise ValueError("butterfly edits must be a list")
@@ -76,8 +90,11 @@ def normalize_butterfly_settings(settings=None) -> dict:
                 raise ValueError("polygon requires a nonzero area")
         elif kind == "seed":
             _pair([edit.get("qx"), edit.get("qy")])
-            if isinstance(edit.get("branch_id", 0), bool) or edit.get("branch_id", 0) not in (0, 1):
-                raise ValueError("seed branch_id must be 0 or 1")
+            branch = edit.get("branch_id", None) if "branch_id" in edit else 0
+            if branch is not None and (
+                _is_bool(branch) or not isinstance(branch, Integral) or int(branch) not in (-1, 0, 1)
+            ):
+                raise ValueError("seed branch_id must be 0, 1, -1 or None")
             if edit.get("side", "unknown") not in ("upper", "lower", "unknown"):
                 raise ValueError("seed side must be upper, lower or unknown")
         elif kind == "exclude_point":
@@ -92,7 +109,7 @@ def _pair(value):
     try:
         if len(value) != 2:
             raise ValueError
-        if any(isinstance(item, bool) for item in value):
+        if any(_is_bool(item) for item in value):
             raise ValueError
         pair = tuple(float(item) for item in value)
     except (TypeError, ValueError) as exc:

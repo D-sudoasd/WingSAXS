@@ -20,6 +20,7 @@ from .ridge_inputs import (
     as_qmap as _shared_as_qmap,
     coordinate_derivatives as _coordinate_derivatives,
     field as _field,
+    representative_q_step as _representative_q_step,
     robust_noise as _robust_noise,
     sample as _sample,
 )
@@ -116,6 +117,8 @@ def build_profile_context(image: Any, qmap: Any, *, mask: Any = None) -> dict[st
     determinant = derivatives["determinant"]
     return {
         "data": data,
+        "safe_data": np.where(valid, data, 0.0),
+        "valid_float": valid.astype(float),
         "qx": qx,
         "qy": qy,
         "q": q,
@@ -208,8 +211,9 @@ def _fit_profile_models(
         centres = [float(xx[index]) for index in centre_indices[:count]]
         heights = [max(float(yy[index] - baseline), 0.25 * amplitude) for index in centre_indices[:count]]
         initial = [baseline, 0.0]
-        lower = [float(np.nanmin(yy) - amplitude), -amplitude / max(sigma_max, 1.0)]
-        upper = [float(np.nanmax(yy) + amplitude), amplitude / max(sigma_min, np.finfo(float).eps)]
+        slope_bound = amplitude / max(sigma_min, np.finfo(float).eps)
+        lower = [float(np.nanmin(yy) - amplitude), -slope_bound]
+        upper = [float(np.nanmax(yy) + amplitude), slope_bound]
         for height, centre in zip(heights, centres):
             initial.extend((height, centre, max(1.5 * sigma_min, min(0.35 * sigma_max, sigma_max))))
             lower.extend((0.0, float(np.nanmin(xx)), sigma_min))
@@ -417,9 +421,23 @@ def extract_normal_profile(
     else:
         sample_x = np.full_like(offsets_requested, px)
         sample_y = np.full_like(offsets_requested, py)
-    raw = _sample(data, sample_y, sample_x, order=1)
-    support = _sample(valid.astype(float), sample_y, sample_x, order=1)
-    raw[(support < 0.5) | (sample_y < 0) | (sample_y > data.shape[0] - 1) | (sample_x < 0) | (sample_x > data.shape[1] - 1)] = np.nan
+    safe_data = context.get("safe_data") if isinstance(context, Mapping) else None
+    if safe_data is None:
+        safe_data = np.where(valid, data, 0.0)
+    valid_float = context.get("valid_float") if isinstance(context, Mapping) else None
+    if valid_float is None:
+        valid_float = valid.astype(float)
+    weighted_raw = _sample(safe_data, sample_y, sample_x, order=1)
+    support = _sample(valid_float, sample_y, sample_x, order=1)
+    in_bounds = (
+        (support >= 0.5)
+        & (sample_y >= 0)
+        & (sample_y <= data.shape[0] - 1)
+        & (sample_x >= 0)
+        & (sample_x <= data.shape[1] - 1)
+    )
+    raw = np.full_like(weighted_raw, np.nan, dtype=float)
+    np.divide(weighted_raw, support, out=raw, where=in_bounds)
     sampled_qx = _sample(qx, sample_y, sample_x, order=1)
     sampled_qy = _sample(qy, sample_y, sample_x, order=1)
     if np.isfinite(qx0) and np.isfinite(qy0):
@@ -624,9 +642,8 @@ def wang2007_vertical_slice_check(
     rel_x, rel_y = qx - center_x, qy - center_y
     along = rel_x * vertical_x + rel_y * vertical_y
     across = rel_x * axis_x + rel_y * axis_y
-    finite_steps = np.r_[np.abs(np.diff(np.nanmedian(qx, axis=0))), np.abs(np.diff(np.nanmedian(qy, axis=1)))]
-    finite_steps = finite_steps[np.isfinite(finite_steps) & (finite_steps > np.finfo(float).eps)]
-    step = float(np.median(finite_steps)) if finite_steps.size else 1.0
+    rep_step = _representative_q_step(qx, qy)
+    step = float(rep_step) if rep_step is not None and np.isfinite(rep_step) and rep_step > 0.0 else 1.0
     strip_half = float(opts.get("wang_strip_half_width_q", 2.0 * step))
     n_bins = max(17, int(opts.get("wang_slice_bins", 96)))
     domain = valid & (q >= q_min) & (q <= q_max) & (np.abs(across) <= strip_half)
@@ -657,7 +674,7 @@ def wang2007_vertical_slice_check(
     centres = 0.5 * (edges[:-1] + edges[1:])
     sums = np.zeros(n_bins, dtype=float)
     counts = np.zeros(n_bins, dtype=int)
-    indices = np.searchsorted(edges, along[domain], side="right") - 1
+    indices = np.clip(np.searchsorted(edges, along[domain], side="right") - 1, 0, n_bins - 1)
     values = data[domain]
     for index, value in zip(indices.tolist(), values.tolist()):
         if 0 <= int(index) < n_bins and np.isfinite(value):
@@ -665,7 +682,9 @@ def wang2007_vertical_slice_check(
             counts[int(index)] += 1
     profile = np.divide(sums, counts, out=np.full(n_bins, np.nan, dtype=float), where=counts > 0)
     geometry_domain = np.isfinite(q) & np.isfinite(qx) & np.isfinite(qy) & (q >= q_min) & (q <= q_max) & (np.abs(across) <= strip_half)
-    geometry_indices = np.searchsorted(edges, along[geometry_domain], side="right") - 1
+    geometry_along = along[geometry_domain]
+    geometry_indices = np.searchsorted(edges, geometry_along, side="right") - 1
+    geometry_indices = np.where(geometry_along == edges[-1], n_bins - 1, geometry_indices)
     geometry_counts = np.bincount(geometry_indices[(geometry_indices >= 0) & (geometry_indices < n_bins)], minlength=n_bins)
     noise = _robust_noise(profile[counts > 0])
     if not np.isfinite(noise) or noise <= np.finfo(float).eps:
@@ -686,15 +705,17 @@ def wang2007_vertical_slice_check(
         interior_gap_fraction = 1.0
     mask_gap_bins = (geometry_counts > 0) & (counts == 0)
     mask_gap_fraction = float(np.count_nonzero(mask_gap_bins) / max(1, np.count_nonzero(geometry_counts > 0)))
-    if mask_gap_fraction > float(opts.get("wang_max_gap_fraction", 0.15)):
+    max_gap_fraction = float(opts.get("wang_max_gap_fraction", 0.15))
+    enough_bins = int(np.count_nonzero(np.isfinite(profile))) >= 5
+    if not enough_bins:
+        reasons.append("insufficient_binned_profile")
+    if mask_gap_fraction > max_gap_fraction:
         reasons.append("reference_slice_support_gap")
     if cancel_event is not None:
         from .cancellation import raise_if_cancelled
 
         raise_if_cancelled(cancel_event, "wang2007-slice:complete")
-    applicable = bool(np.count_nonzero(np.isfinite(profile)) >= 5 and mask_gap_fraction <= float(opts.get("wang_max_gap_fraction", 0.15)))
-    if not applicable:
-        reasons.append("insufficient_binned_profile")
+    applicable = bool(enough_bins and mask_gap_fraction <= max_gap_fraction)
     return {
         "method": "wang2007_vertical_reference_slice",
         "method_version": METHOD_VERSION,

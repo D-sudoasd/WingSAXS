@@ -449,18 +449,6 @@ def _detect_candidates(
                 "status": "candidate",
                 "reason": None,
             }
-            _source_record(
-                candidate=record,
-                q_edges=q_edges,
-                q_values=q_values,
-                intensity_values=intensity_values,
-                qx_values=qx_values,
-                qy_values=qy_values,
-                original_indices=original_indices,
-                image_shape=image_shape,
-                baseline=baseline,
-                neighbourhood_bins=effective_support_neighbourhood,
-            )
             if local_pos < min_side_bins or local_pos >= segment.size - min_side_bins:
                 record["status"] = "rejected"
                 record["reason"] = "insufficient_two_sided_support"
@@ -505,6 +493,19 @@ def _detect_candidates(
                 record["smoothed_intensity"] = float(smooth_peak)
                 record["height"] = float(smooth_peak - baseline)
                 record["height_snr"] = float((smooth_peak - baseline) / max(noise, _EPS))
+            _source_record(
+                candidate=record,
+                q_edges=q_edges,
+                q_values=q_values,
+                intensity_values=intensity_values,
+                qx_values=qx_values,
+                qy_values=qy_values,
+                original_indices=original_indices,
+                image_shape=image_shape,
+                baseline=baseline,
+                neighbourhood_bins=effective_support_neighbourhood,
+            )
+            if record["status"] == "candidate":
                 if not record.get("source_pixel_count"):
                     record["status"] = "rejected"
                     record["reason"] = "no_source_pixels_in_peak_bin"

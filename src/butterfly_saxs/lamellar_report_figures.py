@@ -110,6 +110,11 @@ def _q_radius_in_unit(value: Any, source_unit: Any, target_unit: Any) -> tuple[f
 
 def _curve_has_observed_support(rows: Sequence[Mapping[str, Any]]) -> bool:
     for row in rows:
+        supported_flag = row.get("supported")
+        if isinstance(supported_flag, (bool, np.bool_)) and bool(supported_flag):
+            return True
+        if _float(row.get("observed_support_count")) > 0:
+            return True
         value = row.get("observed_support")
         if isinstance(value, Mapping):
             value = value.get("support_count", value.get("count", value.get("supported")))
@@ -269,13 +274,31 @@ def _analysis_text(analysis: Mapping[str, Any]) -> list[str]:
 
     geometry = analysis.get("ellipse")
     ellipse = geometry if isinstance(geometry, Mapping) else {}
+    ellipse_status = ellipse.get("status")
+    if ellipse_status in (None, "") or _status_kind(analysis.get("status")) == "candidate":
+        ellipse_status = analysis.get("status", ellipse_status or "candidate")
     for name in ("a", "b", "axis_ratio", "ellipse_axis_tilt_deg", "theta_deg"):
         if by_name.get(name):
             continue
         fallback_names = ("theta_deg", "ellipse_axis_tilt_deg") if name in {"theta_deg", "ellipse_axis_tilt_deg"} else (name,)
         for fallback in fallback_names:
             if fallback in ellipse:
-                by_name[name].append({"parameter": name, "value": ellipse[fallback], "unit": ellipse.get("q_unit" if name in {"a", "b"} else "unit", "")})
+                if name in {"a", "b"}:
+                    fallback_unit = ellipse.get("q_unit", analysis.get("q_unit", ""))
+                elif name in {"ellipse_axis_tilt_deg", "theta_deg"}:
+                    fallback_unit = "degree"
+                else:
+                    fallback_unit = ""
+                row_entry: dict[str, Any] = {
+                    "parameter": name,
+                    "unit": fallback_unit,
+                    "status": ellipse_status,
+                }
+                if _status_kind(ellipse_status) == "candidate":
+                    row_entry["candidate_value"] = ellipse[fallback]
+                else:
+                    row_entry["value"] = ellipse[fallback]
+                by_name[name].append(row_entry)
                 break
 
     lines: list[str] = []
@@ -640,6 +663,17 @@ def _sequence_figure(frames: Sequence[Mapping[str, Any]], *, title: str) -> Figu
         ("Ellipse axis ratio b/a", {"axis_ratio"}, ""),
         ("Geometric q-ellipse axis angle theta", {"ellipse_axis_tilt_deg", "theta_deg"}, "degree"),
     )
+    def _frame_q_unit(frame_item: Mapping[str, Any], analysis_item: Mapping[str, Any]) -> Any:
+        raw_unit = frame_item.get("q_unit")
+        if raw_unit not in (None, "") and str(raw_unit).strip().casefold() not in {
+            "unknown",
+            "none",
+            "null",
+            "unspecified",
+        }:
+            return raw_unit
+        return analysis_item.get("q_unit", raw_unit)
+
     for label, names, unit in shared_series:
         y = np.full(len(frames), np.nan, dtype=float)
         candidate = np.zeros(len(frames), dtype=bool)
@@ -650,7 +684,7 @@ def _sequence_figure(frames: Sequence[Mapping[str, Any]], *, title: str) -> Figu
             value, is_candidate, _status = _sequence_parameter_value(analysis, names)
             # Physical directional periods are meaningful only when this frame's
             # source q coordinate was calibrated to inverse length.
-            if unit == "nm" and _q_scale_to_nm(frame.get("q_unit", analysis.get("q_unit"))) is None:
+            if unit == "nm" and _q_scale_to_nm(_frame_q_unit(frame, analysis)) is None:
                 continue
             y[index] = value
             candidate[index] = is_candidate
@@ -662,7 +696,7 @@ def _sequence_figure(frames: Sequence[Mapping[str, Any]], *, title: str) -> Figu
         analysis = frame.get("lamellar_analysis")
         if not isinstance(analysis, Mapping):
             continue
-        if _q_scale_to_nm(frame.get("q_unit", analysis.get("q_unit"))) is None:
+        if _q_scale_to_nm(_frame_q_unit(frame, analysis)) is None:
             continue
         for row in _parameter_rows(analysis):
             if str(row.get("parameter", "")) != "Lz_from_draw_axis_nm":
@@ -754,8 +788,14 @@ def _sequence_figure(frames: Sequence[Mapping[str, Any]], *, title: str) -> Figu
                     if np.isfinite(low) and np.isfinite(high):
                         # q directions are axial: 0 and 180 degrees represent
                         # the same unoriented line, so ranges may cross 0/180.
-                        lower_error = (value["mean"] - low) % 180.0
-                        upper_error = (high - value["mean"]) % 180.0
+                        raw_lower = value["mean"] - low
+                        raw_upper = high - value["mean"]
+                        lower_error = 0.0 if -1e-9 < raw_lower < 0.0 else (raw_lower % 180.0)
+                        upper_error = 0.0 if -1e-9 < raw_upper < 0.0 else (raw_upper % 180.0)
+                        if 180.0 - lower_error < 1e-9:
+                            lower_error = 0.0
+                        if 180.0 - upper_error < 1e-9:
+                            upper_error = 0.0
                         errors = np.asarray([[lower_error], [upper_error]])
                         ax.errorbar(
                             [value["time"]],

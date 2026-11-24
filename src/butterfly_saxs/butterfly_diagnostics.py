@@ -27,13 +27,13 @@ def arc_diagnostic_rows(trace: Mapping | Sequence | None, candidate: Mapping | N
     """
 
     candidates = []
+    if isinstance(candidate, Mapping):
+        candidates.extend((candidate.get("arc_diagnostics"), candidate.get("arc_support")))
     if isinstance(trace, Mapping):
         candidates.extend((trace.get("arc_diagnostics"), trace.get("arc_support")))
         diagnostics = trace.get("diagnostics")
         if isinstance(diagnostics, Mapping):
             candidates.extend((diagnostics.get("arc_diagnostics"), diagnostics.get("arc_support")))
-    if isinstance(candidate, Mapping):
-        candidates.extend((candidate.get("arc_diagnostics"), candidate.get("arc_support")))
     elif isinstance(trace, Sequence) and not isinstance(trace, (str, bytes)):
         candidates.append(trace)
     rows = []

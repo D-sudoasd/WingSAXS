@@ -19,7 +19,7 @@ from .butterfly_ridge import (
     _refresh_arc_identity,
 )
 from .cancellation import raise_if_cancelled
-from .ridge_inputs import canonical_inputs
+from .ridge_inputs import Q_ALIASES, array_field, canonical_inputs
 from .sector_peaks import _local_representative_q_step
 from .settings import strict_int
 
@@ -347,8 +347,9 @@ def trace_butterfly_annuli(image, qmap, q_window, *, mask=None, reference_axis_d
     finite = np.isfinite(qx) & np.isfinite(qy) & np.isfinite(q)
     geometry = finite & (q >= window[0]) & (q <= window[1])
     valid, applied, seeds = _apply_edits(geometry & ~invalid & np.isfinite(data), qx, qy, edits)
+    q_is_supplied = array_field(qmap, Q_ALIASES) is not None
     step, step_source, step_details = _local_representative_q_step(
-        qx, qy, q, finite, *window, q_is_supplied=True)
+        qx, qy, q, finite, *window, q_is_supplied=q_is_supplied)
     requested = strict_int(options.get("annular_radial_bins", 40), "annular_radial_bins", minimum=4)
     requested_angles = strict_int(options.get("annular_angle_bins", 72), "annular_angle_bins", minimum=16)
     angle_bins = requested_angles
@@ -412,9 +413,19 @@ def trace_butterfly_annuli(image, qmap, q_window, *, mask=None, reference_axis_d
             "topology_flags": ["annular_angular_maximum", "prescribed_q_not_radial_peak"],
         })
     topology = _normalise_options(options)
-    topology.update(reference_axis_deg=float(reference_axis_deg), min_arc_points=3)
+    raw_min_arc = options.get("annular_min_arc_points", options.get("min_arc_points", 3))
+    if isinstance(raw_min_arc, (bool, np.bool_)):
+        raise ValueError("min_arc_points must be an integer")
+    min_arc_points = strict_int(
+        raw_min_arc,
+        "min_arc_points",
+        minimum=2,
+    )
+    topology.update(reference_axis_deg=float(reference_axis_deg), min_arc_points=min_arc_points)
     _assign_reference_branches(points, topology)
-    groups, graph_edges, trajectory_selection = _select_and_connect(points, angle_step_deg=angle_step)
+    groups, graph_edges, trajectory_selection = _select_and_connect(
+        points, angle_step_deg=angle_step, min_track_points=min_arc_points
+    )
     arcs = _arc_topology(groups, graph_edges, points, topology, dq)
     seed_records = _apply_seeds(points, arcs, seeds, topology, dq)
     _refresh_arc_identity(arcs, points)
@@ -505,7 +516,8 @@ def trace_butterfly_annuli(image, qmap, q_window, *, mask=None, reference_axis_d
                         "trajectory_selection": trajectory_selection,
                         "outer_window_accepted_sides": outer_sides,
                         "outer_window_truncated": len(outer_sides) >= 2,
-                        "observed_support": support, "applied_edits": applied, "seed_actions": seed_records,
+                        "observed_support": support, "applied_edits": applied,
+                        "seed_matches": seed_records, "seed_actions": seed_records,
                         "first_order_q_hint": {"selection_status": "not_used", "q_star": None,
                                                "reason": "annuli_are_sampling_coordinates_not_radial_peaks"},
                         "elapsed_s": time.perf_counter() - started},

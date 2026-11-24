@@ -251,6 +251,24 @@ def _origin_centered(
     return float(np.hypot(*center)) <= tolerance
 
 
+def _prefer_q_unit(primary: Any, fallback: Any) -> str:
+    """Choose the primary q unit unless it is missing or unknown."""
+
+    if primary not in (None, "") and _normalise_q_unit(primary) not in {
+        "unknown",
+        "none",
+        "",
+    }:
+        return str(primary)
+    if fallback not in (None, "") and _normalise_q_unit(fallback) not in {
+        "unknown",
+        "none",
+        "",
+    }:
+        return str(fallback)
+    return str(primary or fallback or "unknown")
+
+
 def _ellipse_direction_members(
     ellipse: Any, draw_axis_deg: float, source_q_unit: str
 ) -> list[dict[str, Any]]:
@@ -279,8 +297,8 @@ def _ellipse_direction_members(
     if reference_axis is None:
         reference_axis = float(draw_axis_deg) - 90.0
     center = _ellipse_center(ellipse)
-    global_q_unit = str(
-        _read(ellipse, ("q_unit", "source_q_unit"), source_q_unit) or source_q_unit
+    global_q_unit = _prefer_q_unit(
+        _read(ellipse, ("q_unit", "source_q_unit"), None), source_q_unit
     )
     raw_members = _read(ellipse, ("ellipses", "ellipse_pair"), _MISSING)
     if isinstance(raw_members, Sequence) and not isinstance(raw_members, (str, bytes)):
@@ -324,8 +342,9 @@ def _ellipse_direction_members(
         local_center = _ellipse_center(raw) if raw is not None else None
         if local_center is None:
             local_center = center
-        local_unit = str(
-            _read(raw, ("q_unit", "source_q_unit"), global_q_unit) if raw is not None else global_q_unit
+        local_unit = _prefer_q_unit(
+            _read(raw, ("q_unit", "source_q_unit"), None) if raw is not None else None,
+            global_q_unit,
         )
         source_branch = _read(raw, ("branch_id", "fit_branch_id"), _MISSING) if raw is not None else _MISSING
         branch_id = _exact_integer(source_branch) if source_branch is not _MISSING else None
@@ -407,10 +426,9 @@ def _apply_ellipse_directional_periods(
 
     ellipse = _ellipse_payload(root)
     b, candidate_b, _, _, ellipse_unit, existing_period = _ellipse_components(ellipse)
-    unit_value = str(
-        _read(ellipse, ("q_unit", "source_q_unit"), source_q_unit or ellipse_unit)
-        or source_q_unit
-        or ellipse_unit
+    unit_value = _prefer_q_unit(
+        _read(ellipse, ("q_unit", "source_q_unit"), None),
+        _prefer_q_unit(source_q_unit, ellipse_unit),
     )
     unit_scale = _q_scale_to_nm(unit_value)
     support_units = {_normalise_q_unit(row.get("q_unit")) for row in support}
@@ -528,7 +546,7 @@ def _apply_ellipse_directional_periods(
                 first_error = first_error or reason
                 continue
         member, radius = finite_candidates[0]
-        member_unit = str(member.get("q_unit") or unit_value)
+        member_unit = _prefer_q_unit(member.get("q_unit"), unit_value)
         scale = _q_scale_to_nm(member_unit)
         if scale is not None:
             # Reuse the canonical physical-spacing calculation and its origin
@@ -546,13 +564,18 @@ def _apply_ellipse_directional_periods(
             flags.extend(flag for flag in spacing_flags if flag not in flags)
             unit = "nm"
         else:
-            if not support_unit_match or reference_q is None:
+            member_unit_match = (
+                len(support_units) == 1
+                and next(iter(support_units), "unknown") == _normalise_q_unit(member_unit)
+            )
+            if not member_unit_match or reference_q is None:
                 reason = "relative ellipse spacing requires one retained observed q unit matching the fitted ellipse"
                 population.update(period=None, status="unavailable", period_reason=reason)
                 first_error = first_error or reason
                 continue
             period = float(base * reference_q / float(radius))
             unit = "relative"
+            population["relative_q_unit"] = _normalise_q_unit(member_unit)
             flags.append("spacing_unavailable_unknown_q_unit")
             assumptions.append(
                 "Ellipse directional periods with pixel-q or unknown q units use an explicit relative scale; no nm value is assigned."
@@ -854,12 +877,11 @@ def build_lamellar_scene(
         )
     else:
         groups = _group_populations(raw_peaks)
-        reference_q_native = float(
-            next(
-                (item["q"] for item in raw_peaks if item["q_nm_inv"] is None),
-                raw_peaks[0]["q"],
-            )
-        )
+        reference_by_unit: dict[str, float] = {}
+        for item in raw_peaks:
+            if item["q_nm_inv"] is None:
+                unit_key = _normalise_q_unit(item["q_unit"])
+                reference_by_unit.setdefault(unit_key, float(item["q"]))
         for branch, group in groups:
             angle, inconsistent_angle = _direction_for_group(group)
             first = group[0]
@@ -884,6 +906,7 @@ def build_lamellar_scene(
                     )
                 else:
                     uncertain_q = len(group) > 1
+            relative_q_unit: str | None = None
             if q_nm is not None:
                 period = float(2.0 * np.pi / q_nm)
                 unit = "nm"
@@ -902,6 +925,8 @@ def build_lamellar_scene(
                 length_unit = "nm"
             else:
                 q_value = float(first["q"])
+                relative_q_unit = _normalise_q_unit(first["q_unit"])
+                reference_q_native = reference_by_unit.get(relative_q_unit, q_value)
                 base = (
                     float(resolved.reference_period)
                     if resolved.reference_period is not None
@@ -944,6 +969,7 @@ def build_lamellar_scene(
                     "branch_id": int(branch),
                     "period": period,
                     "length_unit": unit,
+                    "relative_q_unit": relative_q_unit,
                     "angle_deg": angle,
                     "status": "candidate"
                     if period_status == "candidate"
@@ -1051,6 +1077,40 @@ def build_lamellar_scene(
         )
         metadata["length_unit"] = "relative"
         metadata["mixed_length_units"] = mixed_units
+        if direction_support is not None:
+            metadata["direction_support"] = direction_support
+            metadata["direction_diagnostics"] = direction_diagnostics
+        return _empty_scene(resolved, metadata)
+    selected_relative_q_units = {
+        str(population["relative_q_unit"])
+        for population in selected
+        if population.get("length_unit") == "relative"
+        and population.get("relative_q_unit") not in (None, "")
+        and _finite_positive(population.get("period")) is not None
+    }
+    if len(selected_relative_q_units) > 1:
+        mixed_q_units = sorted(selected_relative_q_units)
+        message = (
+            "Selected populations use incompatible non-physical q units ("
+            + " and ".join(mixed_q_units)
+            + "); select one branch before generating a scene."
+        )
+        metadata = _metadata_base(
+            resolved,
+            identity,
+            status="unavailable",
+            available=False,
+            message=message,
+            draw_axis_deg=draw_axis,
+            reference_period=resolved.reference_period or 1.0,
+            assumptions=assumptions,
+            parameter_sources=parameter_sources,
+            populations=populations,
+            q_unit=q_unit,
+            flags=(*flags, "mixed_q_unit_support"),
+        )
+        metadata["length_unit"] = "relative"
+        metadata["mixed_q_units"] = mixed_q_units
         if direction_support is not None:
             metadata["direction_support"] = direction_support
             metadata["direction_diagnostics"] = direction_diagnostics
@@ -1224,7 +1284,13 @@ def build_lamellar_scene(
         period = float(population["period"])
         angle = float(population["angle_deg"])
         branch_slot = branch if branch in {0, 1} else population_index
-        rng = np.random.default_rng(_stable_seed(resolved.seed, 0, slot))
+        rng = np.random.default_rng(
+            _stable_seed(
+                resolved.seed,
+                branch_slot if resolved.mode == "single" else 0,
+                slot,
+            )
+        )
         deviation = (
             float(rng.uniform(-float(resolved.spread_deg), float(resolved.spread_deg)))
             if resolved.spread_deg

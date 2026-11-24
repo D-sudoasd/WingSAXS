@@ -455,6 +455,7 @@ def _readonly_qmap_alias(qmap: Any, shape: tuple[int, int]) -> Any:
             "chi": _readonly_view(chi),
             "angle": _readonly_view(chi),
             "azimuth": _readonly_view(chi),
+            "chi_deg": _readonly_view(np.degrees(chi) % 360.0),
             "mask": detector_mask,
             "bad_mask": detector_mask,
             "valid_mask": valid_mask,
@@ -515,24 +516,30 @@ def _copy_qmap_with_perturbation(
         valid_mask = np.asarray(np.broadcast_to(raw_valid, shape), dtype=bool).copy()
         detector_mask = ~valid_mask
     else:
-        detector_mask = np.asarray(np.broadcast_to(raw_mask, shape), dtype=bool).copy()
-        valid_mask = np.asarray(np.broadcast_to(raw_valid, shape), dtype=bool).copy()
+        detector_mask = (
+            np.asarray(np.broadcast_to(raw_mask, shape), dtype=bool)
+            | ~np.asarray(np.broadcast_to(raw_valid, shape), dtype=bool)
+        ).copy()
+        valid_mask = ~detector_mask
 
     metadata_value = _field(qmap, ("metadata",), {})
     metadata = copy.deepcopy(dict(metadata_value)) if isinstance(metadata_value, Mapping) else {}
     q_unit = _field(qmap, ("q_unit", "unit"), metadata.get("q_unit", "unknown"))
     q_unit = str(q_unit or "unknown")
     fingerprint = _field(qmap, ("fingerprint", "geometry_fingerprint"), "")
+    perturbed_q_array = np.asarray(perturbed_q, dtype=float)
     return _CanonicalPerturbedQMap(
         {
             "qx": np.asarray(perturbed_qx, dtype=float),
             "qy": np.asarray(perturbed_qy, dtype=float),
-            "q": np.asarray(perturbed_q, dtype=float),
+            "q": perturbed_q_array,
+            "q_map": perturbed_q_array,
             "chi": np.asarray(chi, dtype=float),
             "angle": np.asarray(chi, dtype=float),
             "azimuth": np.asarray(chi, dtype=float),
             "chi_deg": np.degrees(chi) % 360.0,
             "mask": detector_mask,
+            "bad_mask": detector_mask,
             "valid_mask": valid_mask,
             "valid": valid_mask,
             "q_unit": q_unit,
@@ -789,6 +796,29 @@ def _interval(values: Sequence[float]) -> list[float | None]:
     return [float(low), float(high)]
 
 
+def _axial_interval_deg(values: Sequence[float]) -> list[float | None]:
+    """Central 95% interval for 180-degree periodic orientation angles."""
+
+    if not values:
+        return [None, None]
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return [None, None]
+    doubled = np.deg2rad(2.0 * arr)
+    mean_sin = float(np.mean(np.sin(doubled)))
+    mean_cos = float(np.mean(np.cos(doubled)))
+    if math.hypot(mean_sin, mean_cos) <= np.finfo(float).eps:
+        center = float(np.median(arr))
+    else:
+        center = 0.5 * math.degrees(math.atan2(mean_sin, mean_cos))
+    unwrapped = center + (((arr - center + 90.0) % 180.0) - 90.0)
+    median_angle = float(np.median(unwrapped))
+    unwrapped = median_angle + (((arr - median_angle + 90.0) % 180.0) - 90.0)
+    low, high = np.percentile(unwrapped, [2.5, 97.5], method="linear")
+    return [float(low), float(high)]
+
+
 def _declared_qmap_uncertainty(options: Mapping[str, Any]) -> tuple[tuple[float, float], float, dict[str, Any]]:
     center_value = options.get(
         "center_sigma_px",
@@ -1040,7 +1070,10 @@ def resample_butterfly(
                 "qcal_scale": float(perturbation["qcal_scale"]),
             })
 
-    intervals = {key: _interval(values) for key, values in successful_values.items()}
+    intervals = {
+        key: (_axial_interval_deg(values) if key == "theta_deg" else _interval(values))
+        for key, values in successful_values.items()
+    }
     success_count = int(sum(1 for draw in draws if draw["success"]))
     settings: dict[str, Any] = {
         "requested_resamples": int(requested),
@@ -1117,6 +1150,7 @@ def resample_butterfly(
             mask=callback_mask,
             q_window=q_limits,
             options=base_options,
+            cancel_event=cancel_event,
         )
     return result
 
@@ -1129,6 +1163,7 @@ def evaluate_refit_sensitivity(
     mask: Any = None,
     q_window: Any = None,
     options: Mapping[str, Any] | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """Evaluate deterministic image-scale, smoothing and mask sensitivity.
 
@@ -1148,6 +1183,7 @@ def evaluate_refit_sensitivity(
     base_mask = _validate_mask(mask, shape)
     base_mask |= _extract_image_mask(image, shape)
     base_mask |= ~np.isfinite(image_array)
+    base_mask |= _extract_qmap_mask(qmap, shape)
     sensitivity = base.get("sensitivity", {})
     # The shared butterfly recipe uses a boolean ``sensitivity`` switch;
     # treat that as the helper's default variant set.  A mapping customises
@@ -1170,6 +1206,7 @@ def evaluate_refit_sensitivity(
     callback_qmap = _readonly_qmap_alias(qmap, shape) if qmap is not None else None
 
     def run_variant(label: str, variant: str, variant_image: np.ndarray, variant_mask: np.ndarray) -> None:
+        raise_if_cancelled(cancel_event, f"uncertainty:sensitivity:{label}")
         callback_options = _call_options(
             base,
             stage="sensitivity",
@@ -1188,6 +1225,10 @@ def evaluate_refit_sensitivity(
             else:
                 records.append({"label": label, "type": variant, "success": True, "fit": candidate, "error": None, "failure_kind": None})
         except Exception as exc:
+            from .cancellation import AnalysisCancelled
+
+            if isinstance(exc, AnalysisCancelled):
+                raise
             failure = _failure_record(len(records), error=exc)
             records.append({"label": label, "type": variant, "success": False, "fit": None, "error": failure["error"], "failure_kind": failure["failure_kind"], "failure_code": failure["failure_code"]})
 

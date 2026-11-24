@@ -479,7 +479,9 @@ def _scaled_surface_field(
         normal_y = np.divide(normal_y, normal_norm, out=np.full_like(normal_y, np.nan), where=normal_norm > 1e-10)
     tangent_x, tangent_y = -normal_y, normal_x
     with np.errstate(divide="ignore", invalid="ignore"):
-        axis_separation = (lambda_max - lambda_min) / np.maximum(np.abs(lambda_max), np.finfo(float).eps)
+        axis_separation = (lambda_max - lambda_min) / np.maximum(
+            np.maximum(np.abs(lambda_min), np.abs(lambda_max)), np.finfo(float).eps
+        )
         # One q step along the local principal normal, expressed in detector
         # pixels using the physical q-map Jacobian.
         displacement_x = q_step * (inv00 * normal_x + inv01 * normal_y)
@@ -497,12 +499,19 @@ def _scaled_surface_field(
     step_factor = float(options.get("normal_step_factor", 1.0))
     sample_dx = displacement_x * step_factor
     sample_dy = displacement_y * step_factor
-    slope_minus = _offset_nearest(normal_slope, sample_dy, sample_dx)
-    slope_plus = _offset_nearest(normal_slope, -sample_dy, -sample_dx)
+    # Project neighbour gradients onto the centre pixel's normal vector so
+    # arbitrary +/-1 eigenvector sign flips at adjacent pixels cannot invert
+    # the directional slope derivative.
+    grad_x_minus = _offset_nearest(gradient_x, sample_dy, sample_dx)
+    grad_y_minus = _offset_nearest(gradient_y, sample_dy, sample_dx)
+    grad_x_plus = _offset_nearest(gradient_x, -sample_dy, -sample_dx)
+    grad_y_plus = _offset_nearest(gradient_y, -sample_dy, -sample_dx)
+    slope_minus = grad_x_minus * normal_x + grad_y_minus * normal_y
+    slope_plus = grad_x_plus * normal_x + grad_y_plus * normal_y
     intensity_minus = _offset_nearest(z, sample_dy, sample_dx)
     intensity_plus = _offset_nearest(z, -sample_dy, -sample_dx)
     slope_derivative = (slope_plus - slope_minus) / np.maximum(2.0 * q_step * step_factor, np.finfo(float).eps)
-    offset_q = np.divide(-normal_slope, slope_derivative, out=np.full_like(normal_slope, np.nan), where=np.abs(slope_derivative) > 1e-10)
+    offset_q = np.divide(-normal_slope, slope_derivative, out=np.full_like(normal_slope, np.nan), where=slope_derivative < -1e-10)
     offset_fraction = np.divide(offset_q, max(q_step * step_factor, np.finfo(float).eps))
     max_offset = float(options.get("max_offset_fraction", 0.75))
     offset_fraction = np.clip(offset_fraction, -max_offset, max_offset)
@@ -606,8 +615,9 @@ def _raw_candidates(
     inv11 = derivatives["inv11"]
     displacement_x = field.q_step * (inv00[rows, cols] * field.normal_x[rows, cols] + inv01[rows, cols] * field.normal_y[rows, cols])
     displacement_y = field.q_step * (inv10[rows, cols] * field.normal_x[rows, cols] + inv11[rows, cols] * field.normal_y[rows, cols])
-    sub_x = cols.astype(float) + fraction * displacement_x
-    sub_y = rows.astype(float) + fraction * displacement_y
+    step_factor = float(options.get("normal_step_factor", 1.0))
+    sub_x = cols.astype(float) + fraction * step_factor * displacement_x
+    sub_y = rows.astype(float) + fraction * step_factor * displacement_y
     qx_sub = _sample(field.qx, sub_y, sub_x)
     qy_sub = _sample(field.qy, sub_y, sub_x)
     intensity = _sample(field.smooth, sub_y, sub_x)
@@ -710,20 +720,34 @@ def _nms(candidates: list[dict[str, Any]], options: Mapping[str, Any], q_step: f
             float(point["scale"]),
         ),
     )
-    base = max(0.25 * q_step, float(options["nms_radius_factor"]) * q_step)
+    nms_factor = float(options["nms_radius_factor"])
+    base = max(0.25 * q_step, nms_factor * q_step, np.finfo(float).eps)
+    finite_scales = [
+        float(point["scale"])
+        for point in ordered
+        if math.isfinite(float(point.get("scale", 1.0)))
+    ]
+    max_scale = max(finite_scales, default=1.0)
+    max_radius = max(base, nms_factor * max_scale * q_step)
+    cell_reach = max(2, int(math.ceil(max_radius / base)))
     bins: dict[tuple[int, int], list[int]] = defaultdict(list)
     kept: list[dict[str, Any]] = []
     for point in ordered:
         px, py = float(point["qx"]), float(point["qy"])
-        radius = max(base, float(options["nms_radius_factor"]) * float(point["scale"]) * q_step)
+        if not (math.isfinite(px) and math.isfinite(py)):
+            continue
+        point_scale = float(point.get("scale", 1.0))
+        if not math.isfinite(point_scale):
+            point_scale = 1.0
+        radius = max(base, nms_factor * point_scale * q_step)
         bx, by = int(math.floor(px / base)), int(math.floor(py / base))
         blocked = False
-        for ix in range(bx - 2, bx + 3):
-            for iy in range(by - 2, by + 3):
+        for ix in range(bx - cell_reach, bx + cell_reach + 1):
+            for iy in range(by - cell_reach, by + cell_reach + 1):
                 for kept_index in bins.get((ix, iy), []):
                     other = kept[kept_index]
                     distance = math.hypot(px - float(other["qx"]), py - float(other["qy"]))
-                    if distance >= max(radius, float(options["nms_radius_factor"]) * float(other["scale"]) * q_step):
+                    if distance >= max(radius, nms_factor * float(other["scale"]) * q_step):
                         continue
                     tangent_dot = abs(float(point["tangent_qx"]) * float(other["tangent_qx"]) + float(point["tangent_qy"]) * float(other["tangent_qy"]))
                     if tangent_dot >= 0.35:
@@ -826,20 +850,37 @@ class _UnionFind:
 def _graph_arcs(candidates: list[dict[str, Any]], options: Mapping[str, Any], q_step: float) -> tuple[list[list[int]], list[tuple[int, int]]]:
     if not candidates:
         return [], []
-    radius = float(options["graph_radius_factor"]) * max(q_step, np.finfo(float).eps)
+    graph_factor = float(options["graph_radius_factor"])
+    radius = graph_factor * max(q_step, np.finfo(float).eps)
     base = max(radius / 2.0, np.finfo(float).eps)
+    finite_scales = [
+        float(point["scale"])
+        for point in candidates
+        if math.isfinite(float(point.get("scale", 1.0)))
+    ]
+    max_scale = max(finite_scales, default=1.0)
+    max_search_radius = max(radius, max_scale * q_step * graph_factor)
+    cell_reach = max(2, int(math.ceil(max_search_radius / base)))
     bins: dict[tuple[int, int], list[int]] = defaultdict(list)
     for index, point in enumerate(candidates):
-        bins[(int(math.floor(float(point["qx"]) / base)), int(math.floor(float(point["qy"]) / base)))].append(index)
+        px, py = float(point["qx"]), float(point["qy"])
+        if not (math.isfinite(px) and math.isfinite(py)):
+            continue
+        bins[(int(math.floor(px / base)), int(math.floor(py / base)))].append(index)
     union = _UnionFind(len(candidates))
     edges: list[tuple[int, int]] = []
     tangent_cos = math.cos(math.radians(float(options["graph_tangent_angle_deg"])))
     for index, point in enumerate(candidates):
         px, py = float(point["qx"]), float(point["qy"])
+        if not (math.isfinite(px) and math.isfinite(py)):
+            continue
         bx, by = int(math.floor(px / base)), int(math.floor(py / base))
-        scale = max(float(point["scale"]) * q_step, q_step)
-        for ix in range(bx - 2, bx + 3):
-            for iy in range(by - 2, by + 3):
+        point_scale_raw = float(point.get("scale", 1.0))
+        if not math.isfinite(point_scale_raw):
+            point_scale_raw = 1.0
+        scale = max(point_scale_raw * q_step, q_step)
+        for ix in range(bx - cell_reach, bx + cell_reach + 1):
+            for iy in range(by - cell_reach, by + cell_reach + 1):
                 for other_index in bins.get((ix, iy), []):
                     if other_index <= index:
                         continue
@@ -859,7 +900,13 @@ def _graph_arcs(candidates: list[dict[str, Any]], options: Mapping[str, Any], q_
                         continue
                     dx, dy = float(other["qx"]) - px, float(other["qy"]) - py
                     distance = math.hypot(dx, dy)
-                    max_distance = max(radius, float(other["scale"]) * q_step * float(options["graph_radius_factor"]))
+                    other_scale_raw = float(other.get("scale", 1.0))
+                    if not math.isfinite(other_scale_raw):
+                        other_scale_raw = 1.0
+                    max_distance = max(
+                        radius,
+                        max(point_scale_raw, other_scale_raw) * q_step * graph_factor,
+                    )
                     if distance <= np.finfo(float).eps or distance > max_distance:
                         continue
                     dot_tangent = abs(float(point["tangent_qx"]) * float(other["tangent_qx"]) + float(point["tangent_qy"]) * float(other["tangent_qy"]))
@@ -869,7 +916,7 @@ def _graph_arcs(candidates: list[dict[str, Any]], options: Mapping[str, Any], q_
                         abs(dx * float(point["normal_qx"]) + dy * float(point["normal_qy"])),
                         abs(dx * float(other["normal_qx"]) + dy * float(other["normal_qy"])),
                     )
-                    if normal_projection > float(options["graph_normal_factor"]) * max(scale, float(other["scale"]) * q_step):
+                    if normal_projection > float(options["graph_normal_factor"]) * max(scale, other_scale_raw * q_step):
                         continue
                     union.union(index, other_index)
                     edges.append((index, other_index))
@@ -901,21 +948,58 @@ def _ordered_component(component: list[int], edges: list[tuple[int, int]], candi
         neighbours = [value for value in adjacency[current] if value != previous and value not in ordered]
         if not neighbours:
             break
+        cx = float(candidates[current]["qx"])
+        cy = float(candidates[current]["qy"])
         if previous >= 0:
-            vx = float(candidates[current]["qx"]) - float(candidates[previous]["qx"])
-            vy = float(candidates[current]["qy"]) - float(candidates[previous]["qy"])
+            vx = cx - float(candidates[previous]["qx"])
+            vy = cy - float(candidates[previous]["qy"])
             norm = math.hypot(vx, vy) or 1.0
             vx, vy = vx / norm, vy / norm
-            current = max(neighbours, key=lambda index: abs(vx * (float(candidates[index]["qx"]) - float(candidates[current]["qx"])) + vy * (float(candidates[index]["qy"]) - float(candidates[current]["qy"]))))
+            forward: list[tuple[float, float, int]] = []
+            fallback: list[tuple[float, float, int]] = []
+            for index in neighbours:
+                nx = float(candidates[index]["qx"]) - cx
+                ny = float(candidates[index]["qy"]) - cy
+                n_norm = math.hypot(nx, ny)
+                if n_norm <= np.finfo(float).eps:
+                    cosine = -2.0
+                else:
+                    cosine = (vx * nx + vy * ny) / n_norm
+                if cosine >= 0.0:
+                    forward.append((n_norm, -cosine, index))
+                else:
+                    fallback.append((-cosine, n_norm, index))
+            if forward:
+                # Step to the nearest forward-continuing neighbour so multi-scale
+                # chord edges do not leap over intermediate arc points.
+                current = min(forward)[2]
+            else:
+                current = min(fallback)[2]
         else:
-            current = neighbours[0]
+            current = min(
+                neighbours,
+                key=lambda index: (
+                    math.hypot(float(candidates[index]["qx"]) - cx, float(candidates[index]["qy"]) - cy),
+                    index,
+                ),
+            )
         ordered.append(current)
         previous, current = ordered[-2], ordered[-1]
         if len(ordered) == len(component):
             break
     if len(ordered) != len(component):
         remaining = [index for index in component if index not in ordered]
-        ordered.extend(sorted(remaining))
+        for index in sorted(remaining):
+            px = float(candidates[index]["qx"])
+            py = float(candidates[index]["qy"])
+            nearest_pos = min(
+                range(len(ordered)),
+                key=lambda pos: math.hypot(
+                    float(candidates[ordered[pos]]["qx"]) - px,
+                    float(candidates[ordered[pos]]["qy"]) - py,
+                ),
+            )
+            ordered.insert(nearest_pos + 1, index)
     return ordered
 
 
@@ -1311,6 +1395,23 @@ def _first_order_q_hint(
                     support_counts,
                     out=np.zeros_like(smooth_summed, dtype=float),
                     where=support_counts > 0.0,
+                )
+                # Compute exact Kish N_eff for the Gaussian-smoothed bin sums so
+                # lattice-empty bins between valid neighbours remain eligible
+                # while single-pixel outliers still yield N_eff ~ 1.
+                summed_sq = np.bincount(
+                    bin_indices, weights=np.square(weights), minlength=int(n_bins)
+                )
+                kernel_radius = max(1, int(4.0 * smoothing_sigma_bins + 0.5))
+                kernel_x = np.arange(-kernel_radius, kernel_radius + 1, dtype=float)
+                kernel = np.exp(-0.5 * np.square(kernel_x / smoothing_sigma_bins))
+                kernel /= float(np.sum(kernel))
+                smooth_sum_w2 = np.convolve(summed_sq, np.square(kernel), mode="same")
+                effective_samples = np.divide(
+                    np.square(smooth_summed),
+                    smooth_sum_w2,
+                    out=np.zeros_like(smooth_summed, dtype=float),
+                    where=smooth_sum_w2 > 0.0,
                 )
                 summary["profile_support_method"] = (
                     "q_pixel_resolution_smoothed_annular_bin_counts"
@@ -1887,16 +1988,16 @@ def _refine_radial_peak_q(
     index = int(np.argmin(np.abs(centres - centre)))
     if not usable[index]:
         return centre
-    if 0 < index < intensity_q.size - 1 and (
-        intensity_q[index] < intensity_q[index - 1]
-        or intensity_q[index] < intensity_q[index + 1]
-    ):
-        # One step toward the higher neighbour keeps the interpolate on
-        # this ring without a second argmax over the whole window.
-        index = index - 1 if intensity_q[index - 1] > intensity_q[index + 1] else index + 1
-        if not usable[index]:
-            return centre
-    if index <= 0 or index >= intensity_q.size - 1:
+    if 0 < index < intensity_q.size - 1:
+        left_val = float(intensity_q[index - 1]) if usable[index - 1] else -np.inf
+        right_val = float(intensity_q[index + 1]) if usable[index + 1] else -np.inf
+        if intensity_q[index] < left_val or intensity_q[index] < right_val:
+            # One step toward the higher usable neighbour keeps the interpolate
+            # on this ring without a second argmax over the whole window.
+            index = index - 1 if left_val > right_val else index + 1
+            if not usable[index]:
+                return centre
+    if index <= 0 or index >= intensity_q.size - 1 or not (usable[index - 1] and usable[index] and usable[index + 1]):
         return float(centres[index])
     y0, y1, y2 = float(intensity_q[index - 1]), float(intensity_q[index]), float(intensity_q[index + 1])
     denom = y0 - 2.0 * y1 + y2
@@ -2008,13 +2109,21 @@ def _prepare_sparse_first_order_samples(
     valid: np.ndarray,
     *,
     hint: float,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
 ) -> dict[str, np.ndarray | float]:
     """Pack finite first-order-band pixels for reuse across azimuth sectors."""
 
     q_lo, q_hi = 0.70 * hint, 1.45 * hint
     qx_array = np.asarray(qx)
     qy_array = np.asarray(qy)
-    q_array = np.asarray(q)
+    rel_x = qx_array - float(center_x)
+    rel_y = qy_array - float(center_y)
+    q_array = (
+        np.hypot(rel_x, rel_y)
+        if (center_x != 0.0 or center_y != 0.0)
+        else np.asarray(q)
+    )
     intensity_array = np.asarray(intensity)
     band = (
         np.asarray(valid, dtype=bool)
@@ -2029,7 +2138,7 @@ def _prepare_sparse_first_order_samples(
         "qy": qy_array[band],
         "q": q_array[band],
         "intensity": intensity_array[band],
-        "angle_deg": np.degrees(np.arctan2(qy_array[band], qx_array[band])),
+        "angle_deg": np.degrees(np.arctan2(rel_y[band], rel_x[band])),
         "rows": rows,
         "cols": cols,
         "q_lo": float(q_lo),
@@ -2173,7 +2282,9 @@ def _fill_sparse_first_order_ring(
     for point in points:
         if not bool(point.get("accepted", False)):
             continue
-        existing_angles.append(math.degrees(math.atan2(float(point["qy"]), float(point["qx"]))))
+        existing_angles.append(
+            math.degrees(math.atan2(float(point["qy"]) - center_y, float(point["qx"]) - center_x))
+        )
     added: list[dict[str, Any]] = []
     prepared = _prepare_sparse_first_order_samples(
         qx,
@@ -2182,6 +2293,8 @@ def _fill_sparse_first_order_ring(
         intensity,
         valid,
         hint=hint_q,
+        center_x=center_x,
+        center_y=center_y,
     )
     for quadrant in (0.0, 90.0, 180.0, 270.0):
         for offset in (30.0, 45.0, 60.0, 75.0):
@@ -2201,6 +2314,9 @@ def _fill_sparse_first_order_ring(
             )
             if peak is None:
                 continue
+            dx_peak = float(peak["qx"]) - center_x
+            dy_peak = float(peak["qy"]) - center_y
+            peak_norm = max(math.hypot(dx_peak, dy_peak), 1e-12)
             point = {
                 "qx": peak["qx"],
                 "qy": peak["qy"],
@@ -2208,10 +2324,10 @@ def _fill_sparse_first_order_ring(
                 "pixel_y": peak["pixel_y"],
                 "intensity": peak["intensity"],
                 "snr": peak["contrast"],
-                "normal_qx": peak["qx"] / max(hint_q, 1e-12),
-                "normal_qy": peak["qy"] / max(hint_q, 1e-12),
-                "tangent_qx": -peak["qy"] / max(hint_q, 1e-12),
-                "tangent_qy": peak["qx"] / max(hint_q, 1e-12),
+                "normal_qx": dx_peak / peak_norm,
+                "normal_qy": dy_peak / peak_norm,
+                "tangent_qx": -dy_peak / peak_norm,
+                "tangent_qy": dx_peak / peak_norm,
                 "curvature": float("nan"),
                 "scale": 1.0,
                 "scale_stability": float("nan"),
@@ -2241,7 +2357,9 @@ def _fill_sparse_first_order_ring(
             if _point_identity_key(point) is None:
                 continue
             added.append(point)
-            existing_angles.append(math.degrees(math.atan2(float(point["qy"]), float(point["qx"]))))
+            existing_angles.append(
+                math.degrees(math.atan2(float(point["qy"]) - center_y, float(point["qx"]) - center_x))
+            )
             summary["sectors"].append(
                 {
                     "sector_deg": peak["sector_deg"],
@@ -3427,18 +3545,27 @@ def trace_butterfly_ridges(
             point["reason"] = "no_normal_peak"
             point["topology_flags"] = list(dict.fromkeys(point["topology_flags"] + ["no_normal_peak"]))
         _apply_profile_refinement(point, profile, arcs_by_id, opts, q_step)
-    seed_records = _apply_seeds(candidates, arcs, seed_actions, opts, q_step)
     excluded_ids: set[str] = set()
     for action in list(edits or [] if not isinstance(edits, Mapping) else edits.get("actions", edits.get("edits", []))):
         if isinstance(action, Mapping) and str(action.get("type", "")).lower().replace("-", "_") == "exclude_point":
             point_id = str(action.get("point_id", ""))
             if point_id:
                 excluded_ids.add(point_id)
-    for point in candidates:
-        if str(point["point_id"]) in excluded_ids:
-            point["accepted"] = False
-            point["reason"] = "excluded_point_edit"
-            point["topology_flags"] = list(dict.fromkeys(point["topology_flags"] + ["excluded_point_edit"]))
+
+    def _apply_excluded_points() -> None:
+        if not excluded_ids:
+            return
+        for point in candidates:
+            if str(point.get("point_id", "")) in excluded_ids:
+                point["accepted"] = False
+                if "valid" in point:
+                    point["valid"] = False
+                point["reason"] = "excluded_point_edit"
+                point["topology_flags"] = list(dict.fromkeys(point.get("topology_flags", []) + ["excluded_point_edit"]))
+
+    _apply_excluded_points()
+    seed_records = _apply_seeds(candidates, arcs, seed_actions, opts, q_step)
+    _apply_excluded_points()
     _refresh_arc_identity(arcs, candidates)
     radial_split = _demote_secondary_radial_population(
         candidates, prefer_radius=first_order.get("q_star")
@@ -3456,6 +3583,8 @@ def trace_butterfly_ridges(
         signature=signature,
         arcs=arcs,
     )
+    _apply_excluded_points()
+    _refresh_arc_identity(arcs, candidates)
     for point in candidates:
         point_id = str(point.get("point_id", ""))
         if point_id and point_id not in profiles:

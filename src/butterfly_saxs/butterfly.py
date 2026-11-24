@@ -873,9 +873,34 @@ def _holdout_prediction(
     }
 
 
+def _recipe_hashable(value: Any) -> Any:
+    """Convert settings into a deterministic strict-JSON structure for hashing."""
+
+    if isinstance(value, np.ndarray):
+        contiguous = np.ascontiguousarray(value)
+        return {
+            "__ndarray__": True,
+            "shape": list(contiguous.shape),
+            "dtype": str(contiguous.dtype),
+            "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _recipe_hashable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_recipe_hashable(item) for item in value]
+    return strict_jsonable(value)
+
+
 def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
                  multistart, cancel_event, trace):
     """Rerun image-to-arcs after choices change; never bootstrap point labels."""
+    from .butterfly_ridge import _parse_q_window
+
+    if not (isinstance(window, (list, tuple)) and len(window) == 2):
+        _img, _qx, _qy, _q, _inv = canonical_inputs(image, qmap, mask=mask)
+        window = list(_parse_q_window(window, _q))
+    else:
+        window = [float(window[0]), float(window[1])]
     variants = []
     qstep = _q_step(qmap)
     if qstep is not None and window[1] - window[0] > 4 * qstep:
@@ -886,6 +911,20 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
                          {"annular_radial_bins": min(192, max(4, round(options.get("annular_radial_bins", 40) * factor))),
                           "annular_angle_bins": min(720, max(16, round(options.get("annular_angle_bins", 72) * factor)))})
                         for factor in (.75, 1.25))
+    elif options.get("trace_method") == "radial_sector":
+        sigma = float(options.get("smoothing_sigma_bins", 1.0))
+        sector_width = float(options.get("sector_width_deg", 10.0))
+        variants.extend(
+            (
+                f"sector_{factor}",
+                window,
+                {
+                    "smoothing_sigma_bins": max(0.0, sigma * factor),
+                    "sector_width_deg": min(180.0, max(1e-3, sector_width * factor)),
+                },
+            )
+            for factor in (0.75, 1.25)
+        )
     else:
         scales = options.get("smoothing_scales", options.get("scales_px", [1.2, 2.2, 3.6]))
         variants.extend((f"smoothing_{factor}", window,
@@ -922,12 +961,17 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
             for qname, pname in (("center_qx", "cx"), ("center_qy", "cy")):
                 if qname in changed:
                     shifted_parameters[pname] = {"value": changed[qname], "vary": False}
-        result = analyze_butterfly(image, qmap, domain, mask=variant_mask, options=setting,
-                                   parameters=shifted_parameters, reference_axis_deg=reference,
-                                   multistart=multistart, cancel_event=cancel_event)
-        fit = result["candidate_fit"]
-        records.append({"variant": name, "success": bool(fit.get("success")),
-                        "parameters": {key: fit.get(key) for key in PARAMETERS}})
+        try:
+            result = analyze_butterfly(image, qmap, domain, mask=variant_mask, options=setting,
+                                       parameters=shifted_parameters, reference_axis_deg=reference,
+                                       multistart=multistart, cancel_event=cancel_event)
+            fit = result["candidate_fit"]
+            records.append({"variant": name, "success": bool(fit.get("success")),
+                            "parameters": {key: fit.get(key) for key in PARAMETERS}})
+        except ValueError as exc:
+            records.append({"variant": name, "success": False,
+                            "parameters": {key: None for key in PARAMETERS},
+                            "error": str(exc)})
 
     prior_records = []
     for prior in prior_variants:
@@ -970,7 +1014,11 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
     held_out = []
     points = trace.get("points", [])
     reference_center = _trace_reference_center(trace)
-    arc_ids = sorted({p.get("arc_id") for p in points if p.get("accepted") and p.get("arc_id") is not None})
+    arc_ids = sorted({
+        int(p["arc_id"])
+        for p in points
+        if p.get("accepted") and p.get("arc_id") is not None and int(p["arc_id"]) >= 0
+    })
     # Every observed arc is part of the identifiability check.  A previous
     # first-eight shortcut silently converted untested arcs into apparent
     # sensitivity coverage, which made the evidence status depend on point
@@ -1133,13 +1181,14 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
                       parameters=None, reference_axis_deg=0., multistart=7, cancel_event=None,
                       _radial_hint_cache=None):
     """Return serializable observed arcs, candidate geometry and evidence."""
-    from .butterfly_ridge import _RadialHintGeometryCache, trace_butterfly_ridges
+    from .butterfly_ridge import _RadialHintGeometryCache, _parse_q_window, trace_butterfly_ridges
     from .analysis_config import DEFAULT_ANALYSIS_SETTINGS
 
     settings = normalize_butterfly_settings(options)
     settings.setdefault("snr_threshold", DEFAULT_ANALYSIS_SETTINGS["ridge_snr_threshold"])
     settings.setdefault("max_nfev", DEFAULT_ANALYSIS_SETTINGS["max_nfev"])
     image, _qx, _qy, _q, input_invalid = canonical_inputs(image, qmap, mask=mask)
+    parsed_q_window = list(_parse_q_window(q_window, _q))
     mask = input_invalid
     base_invalid = np.asarray(input_invalid, dtype=bool)
     q_unit = _qmap_unit(qmap)
@@ -1191,6 +1240,18 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
         if candidate.get("success") and settings["resamples"] > 0:
             from .butterfly_uncertainty import resample_butterfly
 
+            baseline_sides = {
+                (p.get("branch_id"), p.get("side"))
+                for p in trace.get("points", [])
+                if p.get("accepted") and p.get("side") in ("upper", "lower")
+                and p.get("branch_id") in (0, 1)
+            }
+            expected_sides = (
+                baseline_sides
+                if len(baseline_sides) >= 3
+                else {(0, "upper"), (0, "lower"), (1, "upper"), (1, "lower")}
+            )
+
             def refit(perturbed, overrides):
                 overrides = dict(overrides)
                 perturbed_qmap = overrides.pop("qmap", qmap)
@@ -1221,7 +1282,7 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
                 groups = {(p.get("branch_id"), p.get("side")) for p in replicate.get("points", [])
                           if p.get("accepted") and p.get("side") in ("upper", "lower")
                           and p.get("branch_id") in (0, 1)}
-                missing = {(0, "upper"), (0, "lower"), (1, "upper"), (1, "lower")} - groups
+                missing = expected_sides - groups
                 replicate["topology_failed"] = bool(missing)
                 if missing:
                     replicate["message"] = "resampling lost observed sides: " + repr(sorted(missing))
@@ -1230,7 +1291,7 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
             uncertainty = resample_butterfly(image, qmap, mask=mask, q_window=q_window,
                 refit=refit, options=settings, cancel_event=cancel_event)
         if candidate.get("success") and settings["sensitivity"]:
-            sensitivity = _sensitivity(image, qmap, q_window, mask=mask, options=settings,
+            sensitivity = _sensitivity(image, qmap, parsed_q_window, mask=mask, options=settings,
                 parameters=parameters, reference=reference_axis_deg, multistart=1,
                 cancel_event=cancel_event, trace=trace)
     evidence = evaluate_arc_evidence(trace, candidate, uncertainty=uncertainty, sensitivity=sensitivity)
@@ -1297,7 +1358,7 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
 
         payload["measurement_summary"] = summarize_annular_measurements(trace)
     payload["ellipse_local"] = ellipse_local_views(trace.get("points", []), candidate)
-    payload["recipe_sha256"] = hashlib.sha256(json.dumps(settings, sort_keys=True,
+    payload["recipe_sha256"] = hashlib.sha256(json.dumps(_recipe_hashable(settings), sort_keys=True,
         ensure_ascii=True, allow_nan=False).encode()).hexdigest()
     candidate.update({**evidence, "method_version": method_version,
                       "uncertainty": uncertainty, "sensitivity": sensitivity})

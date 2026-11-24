@@ -98,11 +98,33 @@ def unpublished_ellipse_shape(*, quality_status=None, axis_ratio=None, flags=Non
 
 
 def _finite(value):
+    if isinstance(value, (bool, np.bool_)):
+        return None
     try:
         result = float(value)
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _first_present(mapping, *keys, default=None):
+    if not isinstance(mapping, Mapping):
+        return default
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _component_count(row):
+    explicit = _finite(row.get("support_component_count"))
+    if explicit is not None:
+        return max(0, int(explicit))
+    components = row.get("support_components")
+    if isinstance(components, Sequence) and not isinstance(components, (str, bytes)):
+        return len(components)
+    return 0
 
 
 def _arc_rows(trace, candidate):
@@ -142,20 +164,20 @@ def _arc_support_quality(arc_rows):
     support_frozen = sum(status in {"frozen", "manual_only"} for status in support_statuses)
     support_missing = sum(status not in {"frozen", "manual_only"} for status in support_statuses)
     manual_only = sum(status == "manual_only" for status in support_statuses)
-    invalid = [_finite(row.get("infeasible_projection_count", row.get("support_infeasible_count"))) or 0.0 for row in arc_rows]
-    endpoint = [value for row in arc_rows if (value := _finite(row.get("support_endpoint_fraction", row.get("endpoint_fraction")))) is not None]
+    invalid = [_finite(_first_present(row, "infeasible_projection_count", "support_infeasible_count")) or 0.0 for row in arc_rows]
+    endpoint = [value for row in arc_rows if (value := _finite(_first_present(row, "support_endpoint_fraction", "endpoint_fraction"))) is not None]
     manual = [value for row in arc_rows if (value := _finite(row.get("manual_endpoint_fraction"))) is not None]
     normal = [value for row in arc_rows if (value := _finite(row.get("normal_residual_q_rms"))) is not None]
     normal_ratio = [value for row in arc_rows if (value := _finite(row.get("normal_residual_localization_ratio_rms"))) is not None]
     coverage = [value for row in arc_rows if (value := _finite(row.get("projection_rmse_q"))) is not None]
     gaps = [_finite(row.get("support_gap_count")) or 0.0 for row in arc_rows]
-    short = sum(bool(row.get("short_arc")) or "short_arc" in row.get("topology_flags", ()) for row in arc_rows)
+    short = sum(bool(row.get("short_arc")) or "short_arc" in (row.get("topology_flags") or ()) for row in arc_rows)
     return {
         "arc_count": len(arc_rows),
         "support_frozen_count": int(support_frozen),
         "support_unavailable_count": int(support_missing),
         "manual_only_arc_count": int(manual_only),
-        "support_component_count": int(sum(int(row.get("support_component_count", len(row.get("support_components", ())))) for row in arc_rows)),
+        "support_component_count": int(sum(_component_count(row) for row in arc_rows)),
         "support_gap_count": int(sum(int(value) for value in gaps)),
         "short_arc_count": int(short),
         "infeasible_projection_count": int(sum(int(value) for value in invalid)),
@@ -273,7 +295,7 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
         if arc_metrics["support_gap_count"]:
             common.append("disconnected_observed_support")
         endpoint_dependence = any(
-            (_finite(row.get("support_endpoint_fraction", row.get("endpoint_fraction"))) or 0.0) > 0.0
+            (_finite(_first_present(row, "support_endpoint_fraction", "endpoint_fraction")) or 0.0) > 0.0
             or (_finite(row.get("manual_endpoint_fraction")) or 0.0) > 0.0
             or bool(row.get("support_endpoint_clipped"))
             or bool(row.get("manual_bound_clipped"))
@@ -281,8 +303,8 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
         )
         if endpoint_dependence:
             common.append("arc_endpoint_or_manual_bound_dependent")
-        mirror_available = [row for row in arc_rows if row.get("mirror_symmetry_status", row.get("mirror_status")) in {"available", "observed", "supported"}]
-        mirror_missing = [row for row in arc_rows if row.get("mirror_symmetry_status", row.get("mirror_status")) in {None, "unavailable", "ambiguous", "unpaired"}]
+        mirror_available = [row for row in arc_rows if _first_present(row, "mirror_symmetry_status", "mirror_status") in {"available", "observed", "supported"}]
+        mirror_missing = [row for row in arc_rows if _first_present(row, "mirror_symmetry_status", "mirror_status") in {None, "unavailable", "ambiguous", "unpaired"}]
         if mirror_missing or (arc_rows and not mirror_available):
             common.append("mirror_symmetry_evidence_unavailable_or_ambiguous")
         normal_missing = [row for row in arc_rows if _finite(row.get("normal_residual_q_rms")) is None and _finite(row.get("normal_residual_q_p95")) is None]
@@ -290,19 +312,23 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
             common.append("per_arc_normal_residual_evidence_unavailable")
         normal_screen = []
         for row in arc_rows:
-            value = _finite(row.get("normal_residual_q_rms", row.get("normal_residual_q_p95")))
-            scale = _finite(row.get("median_localization_sigma_q", row.get("localization_sigma_q")))
+            value = _finite(_first_present(row, "normal_residual_q_rms", "normal_residual_q_p95"))
+            scale = _finite(_first_present(row, "median_localization_sigma_q", "localization_sigma_q"))
             if value is not None and scale is not None and scale > 0:
                 normal_screen.append(value > 3.0 * scale)
         if any(normal_screen):
             common.append("per_arc_normal_residual_exceeds_localization_scale")
     trace_diagnostics = trace.get("diagnostics")
-    seed_matches = trace_diagnostics.get("seed_matches", []) if isinstance(trace_diagnostics, Mapping) else []
+    seed_matches = (
+        _first_present(trace_diagnostics, "seed_matches", "seed_actions", default=[])
+        if isinstance(trace_diagnostics, Mapping)
+        else []
+    ) or []
     if any(not match.get("matched", False) for match in seed_matches if isinstance(match, Mapping)):
         common.append("seed_not_supported_by_observed_arc")
     if median_sigma is not None:
         if any(
-            (value := _finite(row.get("normal_residual_q_rms", row.get("normal_residual_q_p95")))) is not None
+            (value := _finite(_first_present(row, "normal_residual_q_rms", "normal_residual_q_p95"))) is not None
             and value > 3.0 * median_sigma
             for row in arc_rows
         ):
@@ -335,7 +361,9 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     )
     width_scales = [v for p in points if (v := _finite(p.get("normal_fwhm_q")))
                     is not None and v > 0]
-    bound_flags = candidate.get("bound_flags", {})
+    bound_flags = candidate.get("bound_flags") or {}
+    if not isinstance(bound_flags, Mapping):
+        bound_flags = {}
     for name in PARAMETERS:
         reasons = list(common)
         value = _finite(candidate.get(name))
@@ -363,10 +391,13 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
         success_fraction = _finite(uncertainty.get("success_fraction"))
         if success_fraction is not None and success_fraction < 0.9:
             reasons.append("resampling_topology_or_fit_unstable")
-        shifts = sensitivity.get("parameter_ranges", {}).get(name)
-        if shifts is not None and finite_interval is not None:
-            if shifts[0] < finite_interval[0] or shifts[1] > finite_interval[1]:
-                reasons.append("analysis_choices_exceed_resampling_interval")
+        parameter_ranges = sensitivity.get("parameter_ranges")
+        shifts = parameter_ranges.get(name) if isinstance(parameter_ranges, Mapping) else None
+        if isinstance(shifts, (list, tuple)) and len(shifts) == 2 and finite_interval is not None:
+            shift_lo, shift_hi = _finite(shifts[0]), _finite(shifts[1])
+            if shift_lo is not None and shift_hi is not None:
+                if shift_lo < finite_interval[0] or shift_hi > finite_interval[1]:
+                    reasons.append("analysis_choices_exceed_resampling_interval")
         if sensitivity.get("failed_variants"):
             reasons.append("analysis_choice_topology_unstable")
         if not sensitivity.get("completed", False):

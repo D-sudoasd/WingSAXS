@@ -55,6 +55,8 @@ def _as_mapping(value: Any) -> Mapping[str, Any] | None:
 
 
 def _finite(value: Any, default: float | None = None) -> float | None:
+    if isinstance(value, (bool, np.bool_)):
+        return default
     try:
         result = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -72,7 +74,7 @@ def _normalise_q_unit(unit: Any) -> str:
     return (
         text.replace(" ", "")
         .replace("⁻¹", "^-1")
-        .replace("⁻", "^")
+        .replace("⁻", "^-")
         .replace("−", "-")
         .replace("å", "a")
         .replace("Å", "a")

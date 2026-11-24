@@ -107,6 +107,7 @@ def summarize_annular_measurements(trace: Mapping[str, Any]) -> dict[str, Any]:
     trajectories = []
     for quadrant in QUADRANTS:
         points = [row for row in rows if row["quadrant"] == quadrant and row["status"] == "observed"]
+        q_observed = [row["q_annulus"] for row in points if row["q_annulus"] is not None]
         angles = np.asarray([row["chi_deg"] for row in points], dtype=float)
         unwrapped = np.degrees(np.unwrap(np.radians(angles)))
         trajectories.append({
@@ -114,8 +115,8 @@ def summarize_annular_measurements(trace: Mapping[str, Any]) -> dict[str, Any]:
             "status": "observed" if points else "missing",
             "n_observed_annuli": len(points),
             "n_missing_annuli": len(annular.get("annuli", ())) - len(points),
-            "q_min_observed": min((row["q_annulus"] for row in points), default=None),
-            "q_max_observed": max((row["q_annulus"] for row in points), default=None),
+            "q_min_observed": min(q_observed, default=None),
+            "q_max_observed": max(q_observed, default=None),
             "chi_median_deg": float(np.median(unwrapped) % 360.0) if points else None,
             "chi_span_deg": float(np.ptp(unwrapped)) if points else None,
             "n_unavailable_widths": sum(row["width_status"] == "unavailable" for row in points),

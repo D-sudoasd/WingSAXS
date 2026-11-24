@@ -52,6 +52,10 @@ class LamellarSettings:
                 value = value.item()
             if isinstance(value, Integral) and not isinstance(value, bool):
                 object.__setattr__(self, name, int(value))
+        if isinstance(self.manual_second_orientation, np.bool_):
+            object.__setattr__(
+                self, "manual_second_orientation", bool(self.manual_second_orientation)
+            )
         self.validate()
 
     def validate(self) -> "LamellarSettings":
@@ -63,13 +67,17 @@ class LamellarSettings:
             raise ValueError("manual_unit must be 'nm' or 'relative'")
         for name, maximum in (("layer_count", 512), ("stack_count", 256)):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, Integral):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
                 raise ValueError(f"{name} must be a nonnegative integer")
             if value < 0 or value > maximum:
                 raise ValueError(f"{name} must be between 0 and {maximum}")
-        if isinstance(self.seed, bool) or not isinstance(self.seed, Integral):
+        if isinstance(self.seed, (bool, np.bool_)) or not isinstance(self.seed, Integral):
             raise ValueError("seed must be an integer")
-        if self.selected_branch not in {-1, 0, 1}:
+        if (
+            isinstance(self.selected_branch, (bool, np.bool_))
+            or not isinstance(self.selected_branch, Integral)
+            or self.selected_branch not in {-1, 0, 1}
+        ):
             raise ValueError("selected_branch must be -1, 0, or 1")
         for name in ("thickness_ratio", "width_ratio", "depth_ratio", "manual_period"):
             value = _finite(getattr(self, name))
@@ -257,9 +265,11 @@ class LamellarScene:
         if name == "scientific_boundary":
             return str(metadata.get(name, ""))
         if name == "draw_axis_deg":
-            return float(metadata.get(name, 90.0))
+            value = metadata.get(name)
+            return 90.0 if value is None else float(value)
         if name == "reference_period":
-            return float(metadata.get(name, 1.0))
+            value = metadata.get(name)
+            return 1.0 if value is None else float(value)
         raise AttributeError(name)
 
     def __getitem__(self, key: str) -> Any:

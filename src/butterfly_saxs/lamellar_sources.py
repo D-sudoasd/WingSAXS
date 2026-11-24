@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from .lamellar import _q_unit_from_source, _source_identity
+from .lamellar_adapter import _q_unit_from_source, _source_identity
 from .lamellar_utils import _copy_metadata, _read
 
 _NATIVE_SINGLE_HINTS = {
@@ -82,7 +82,7 @@ def _batch_prefix(path: Path) -> str | None:
     """Return the native export prefix for a manifest companion name."""
 
     suffix = "manifest.json"
-    return path.name[: -len(suffix)] if path.name.endswith(suffix) else None
+    return path.name[: -len(suffix)] if path.name.casefold().endswith(suffix) else None
 
 
 def _native_batch_manifest(path: Path, value: Any, npz_path: Path | None) -> bool:
@@ -92,7 +92,11 @@ def _native_batch_manifest(path: Path, value: Any, npz_path: Path | None) -> boo
     if prefix is None or not isinstance(value, Mapping) or not isinstance(value.get("frames"), list):
         return False
     expected_npz = path.with_name(prefix + "results.npz")
-    if npz_path is None or npz_path != expected_npz or not npz_path.is_file():
+    if (
+        npz_path is None
+        or os.path.normcase(os.fspath(npz_path)) != os.path.normcase(os.fspath(expected_npz))
+        or not npz_path.is_file()
+    ):
         return False
     ellipse_path = path.with_name(prefix + "ellipse_fit.json")
     provenance_path = path.with_name(prefix + "provenance.json")
@@ -198,12 +202,17 @@ def _attach_single_npz(
                 source.setdefault("q", np.array(archive[key_map["q"]], copy=True))
             q_unit_key = _first_key(keys, ("q_unit", "q_unit_name"))
             if q_unit_key is not None:
-                try:
-                    source.setdefault(
-                        "q_unit", str(np.asarray(archive[q_unit_key]).item())
-                    )
-                except Exception:
-                    pass
+                unit_array = np.asarray(archive[q_unit_key])
+                if unit_array.ndim == 0:
+                    raw_unit = unit_array.item()
+                elif unit_array.size == 1:
+                    raw_unit = unit_array.reshape(()).item()
+                else:
+                    raw_unit = None
+                if isinstance(raw_unit, (bytes, bytearray)):
+                    raw_unit = raw_unit.decode("utf-8", errors="replace")
+                if raw_unit is not None and str(raw_unit).strip():
+                    source.setdefault("q_unit", str(raw_unit).strip())
         source["array_path"] = os.fspath(path)
         source["npz_path"] = os.fspath(path)
         source["array_keys"] = dict(key_map)
@@ -272,7 +281,10 @@ def _resolve_native_pair(path: Path) -> tuple[Path | None, Path | None]:
     if path.is_dir():
         native_batches: list[tuple[Path, Path]] = []
         for manifest in sorted(path.glob("*manifest.json")):
-            npz = manifest.with_name(_batch_prefix(manifest) + "results.npz")
+            prefix = _batch_prefix(manifest)
+            if prefix is None:
+                continue
+            npz = manifest.with_name(prefix + "results.npz")
             if not npz.is_file():
                 continue
             try:
@@ -291,7 +303,7 @@ def _resolve_native_pair(path: Path) -> tuple[Path | None, Path | None]:
             return native_batches[0]
         json_candidates = sorted(path.glob("*.json"))
         for candidate in json_candidates:
-            if _batch_prefix(candidate) is not None or candidate.name in {
+            if _batch_prefix(candidate) is not None or candidate.name.casefold() in {
                 "provenance.json",
                 "frame_summary.json",
                 "ellipse_fit.json",
@@ -307,9 +319,10 @@ def _resolve_native_pair(path: Path) -> tuple[Path | None, Path | None]:
         npz = path.with_name(prefix + "results.npz") if prefix is not None else path.with_suffix(".npz")
         return path, npz if npz.is_file() else None
     if path.suffix.lower() == ".npz":
+        results_suffix = "results.npz"
         manifest = (
-            path.with_name(path.name[: -len("results.npz")] + "manifest.json")
-            if path.name.endswith("results.npz")
+            path.with_name(path.name[: -len(results_suffix)] + "manifest.json")
+            if path.name.casefold().endswith(results_suffix)
             else None
         )
         same_stem_json = path.with_suffix(".json")

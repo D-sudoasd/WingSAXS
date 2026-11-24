@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from numbers import Integral
 from typing import Any
@@ -400,7 +401,7 @@ def simulate_projected_density_fft(
         raise ValueError("the projected scene produced an unusable FFT")
     qx = np.fft.fftshift(2.0 * np.pi * np.fft.fftfreq(columns, d=dx))
     qy = np.fft.fftshift(2.0 * np.pi * np.fft.fftfreq(rows, d=dy))
-    period_samples = float(np.min(sizes[:, 2]) / min(dx, dy))
+    period_samples = float(np.min(sizes) / max(dx, dy))
     warnings: list[str] = []
     if period_samples < 2.0:
         warnings.append(
@@ -475,15 +476,19 @@ def render_lamellar_scattering(
 ) -> Any:
     """Render the paired real-space and reciprocal-space panels."""
 
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
-    from matplotlib.colors import LogNorm
+    from matplotlib.colors import LogNorm, Normalize
 
     if figure is None:
         figure = Figure(figsize=(12.0, 5.1), constrained_layout=True, facecolor="#fbfcfd")
+        FigureCanvasAgg(figure)
     else:
         figure.clear()
         figure.set_layout_engine("constrained")
         figure.set_facecolor("#fbfcfd")
+        if getattr(figure, "canvas", None) is None:
+            FigureCanvasAgg(figure)
     density_axis, intensity_axis = figure.subplots(1, 2)
     is_chinese = str(language).lower().startswith("zh")
     font = font_properties(size=None, language="zh") if is_chinese else None
@@ -535,15 +540,19 @@ def render_lamellar_scattering(
     density_colorbar.set_label(density_label, color="#30424d", **font_kwargs)
     normalized = result.normalized_intensity
     positive = normalized[normalized > 0.0]
-    floor = max(float(np.max(positive)) * 1e-8, np.finfo(float).tiny)
     qx_edges = _centers_to_edges(result.qx)
     qy_edges = _centers_to_edges(result.qy)
+    if positive.size > 0:
+        floor = max(float(np.max(positive)) * 1e-8, np.finfo(float).tiny)
+        intensity_norm: Any = LogNorm(vmin=floor, vmax=max(1.0, floor * 10.0))
+    else:
+        intensity_norm = Normalize(vmin=0.0, vmax=1.0)
     intensity_image = intensity_axis.imshow(
         normalized,
         origin="lower",
         extent=(qx_edges[0], qx_edges[-1], qy_edges[0], qy_edges[-1]),
         cmap="cividis",
-        norm=LogNorm(vmin=floor, vmax=1.0),
+        norm=intensity_norm,
         interpolation="nearest",
         aspect="equal",
     )
@@ -613,6 +622,32 @@ def _centers_to_edges(values: np.ndarray) -> np.ndarray:
     return np.concatenate(([values[0] - half_step], values + half_step))
 
 
+def _publish_exclusive(source: Path, destination: Path) -> None:
+    """Publish a staged file without overwriting an existing destination."""
+
+    try:
+        os.link(source, destination)
+        return
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if destination.exists():
+            raise FileExistsError(f"destination already exists: {destination}") from exc
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        fd = os.open(destination, flags, 0o666)
+        try:
+            with os.fdopen(fd, "wb") as dst, source.open("rb") as src:
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except BaseException:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            raise
+
+
 def export_lamellar_scattering(
     result: LamellarScatteringResult,
     output_path: str | os.PathLike[str],
@@ -628,13 +663,13 @@ def export_lamellar_scattering(
 
     target = Path(output_path).expanduser()
     if target.suffix.lower() == ".npz":
-        stem = target.with_suffix("")
+        stem = target.with_name(target.stem)
         npz_path = target
     else:
         stem = target
-        npz_path = stem.with_suffix(".npz")
-    json_path = stem.with_suffix(".json")
-    png_path = stem.with_suffix(".png")
+        npz_path = stem.with_name(f"{stem.name}.npz")
+    json_path = stem.with_name(f"{stem.name}.json")
+    png_path = stem.with_name(f"{stem.name}.png")
     targets = (npz_path, json_path, png_path)
     if not stem.parent.exists():
         raise FileNotFoundError(f"output directory does not exist: {stem.parent}")
@@ -675,11 +710,9 @@ def export_lamellar_scattering(
                 if overwrite:
                     os.replace(source, destination)
                 else:
-                    # A same-filesystem hard link publishes the complete file
-                    # atomically and fails if another writer created the target.
-                    os.link(source, destination)
+                    _publish_exclusive(source, destination)
                     published.append(destination)
-        except Exception:
+        except BaseException:
             if not overwrite:
                 for destination in published:
                     try:

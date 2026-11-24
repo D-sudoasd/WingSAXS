@@ -89,7 +89,13 @@ def _jsonable(value: Any) -> Any:
 
 
 def _json_text(value: Any) -> str:
-    return json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        _jsonable(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _scene_arrays(scene: Any) -> dict[str, np.ndarray]:
@@ -127,13 +133,29 @@ def _scene_arrays(scene: Any) -> dict[str, np.ndarray]:
                 population_rows.append((row.get("branch_id"), row.get("period"), row.get("angle_deg"), row.get("status", "")))
             else:
                 values = list(row)
-                values += [""] * max(0, 4 - len(values))
+                values += [np.nan] * max(0, 3 - len(values))
+                if len(values) < 4:
+                    values.append("")
                 population_rows.append(tuple(values[:4]))
     except (TypeError, ValueError):
         population_rows = []
-    arrays["population_branch_id"] = np.asarray([row[0] for row in population_rows], dtype=float) if population_rows else np.empty((0,), dtype=float)
-    arrays["population_period"] = np.asarray([row[1] for row in population_rows], dtype=float) if population_rows else np.empty((0,), dtype=float)
-    arrays["population_angle_deg"] = np.asarray([row[2] for row in population_rows], dtype=float) if population_rows else np.empty((0,), dtype=float)
+
+    def _float_column(col: int) -> np.ndarray:
+        out: list[float] = []
+        for row in population_rows:
+            raw = row[col]
+            if raw in (None, ""):
+                out.append(float("nan"))
+            else:
+                try:
+                    out.append(float(raw))
+                except (TypeError, ValueError):
+                    out.append(float("nan"))
+        return np.asarray(out, dtype=float)
+
+    arrays["population_branch_id"] = _float_column(0) if population_rows else np.empty((0,), dtype=float)
+    arrays["population_period"] = _float_column(1) if population_rows else np.empty((0,), dtype=float)
+    arrays["population_angle_deg"] = _float_column(2) if population_rows else np.empty((0,), dtype=float)
     arrays["population_status"] = np.asarray([str(row[3]) for row in population_rows], dtype="U64") if population_rows else np.empty((0,), dtype="U1")
     arrays["scene_metadata_json"] = np.asarray(_json_text({
         "metadata": _get(scene, "metadata", {}),
@@ -172,6 +194,15 @@ def _parameter_rows(scene: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (Mapping, list, tuple, np.ndarray)):
+        return _json_text(value)
+    cleaned = _jsonable(value)
+    return "" if cleaned is None else str(cleaned)
+
+
 def _write_parameter_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     columns = {"source_index"}
     for row in rows:
@@ -181,7 +212,7 @@ def _write_parameter_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=ordered, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({name: _json_text(row.get(name, "")) if isinstance(row.get(name, ""), (Mapping, list, tuple, np.ndarray)) else str(_jsonable(row.get(name, "")) if row.get(name, "") is not None else "") for name in ordered})
+            writer.writerow({name: _csv_cell(row.get(name, "")) for name in ordered})
 
 
 def _hash(path: Path) -> str:
@@ -274,7 +305,7 @@ def _capture_uint8(value: Any) -> np.ndarray | None:
         return None
     if array.ndim == 3 and array.shape[-1] not in {3, 4}:
         return None
-    if array.dtype.kind in "fc":
+    if array.dtype.kind == "f":
         finite = np.isfinite(array)
         if not np.any(finite):
             return None
@@ -461,7 +492,7 @@ def export_lamellar_scene(
         _check_cancel(cancel_event)
         _publish(stage, target)
         return _single_output_paths(target)
-    except Exception:
+    except BaseException:
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
         raise
@@ -561,11 +592,18 @@ def _sequence_parameter_rows(frame_entries: Sequence[Mapping[str, Any]], scenes:
     return rows
 
 
-def _blank_scene(index: int, reason: str, *, length_unit: str = "relative") -> Any:
+def _blank_scene(
+    index: int,
+    reason: str,
+    *,
+    status: str = "unavailable",
+    source_identity: Any | None = None,
+    length_unit: str = "relative",
+) -> Any:
     return SimpleNamespace(
-        status="unavailable",
+        status=status,
         message=reason,
-        source_identity=f"frame_{index:04d}",
+        source_identity=f"frame_{index:04d}" if source_identity in (None, "") else source_identity,
         length_unit=length_unit,
         metadata={"frame_index": index},
         vertices=np.empty((0, 8, 3), dtype=float),
@@ -578,18 +616,20 @@ def _sequence_bounds(scenes: Sequence[Any], *, length_unit: str | None = None) -
     for scene in scenes:
         if scene is None:
             continue
+        if _status(scene) in {"unavailable", "stale"}:
+            continue
         if length_unit is not None and str(_get(scene, "length_unit", "relative")) != length_unit:
             continue
         try:
             vertices = np.asarray(_get(scene, "vertices", np.empty((0, 8, 3))), dtype=float)
         except (TypeError, ValueError):
             vertices = np.empty((0, 8, 3), dtype=float)
-        if vertices.ndim == 3 and vertices.shape[1:] == (8, 3) and vertices.size:
+        if vertices.ndim == 3 and vertices.shape[1:] == (8, 3) and vertices.size and bool(np.all(np.isfinite(vertices))):
             points.append(vertices.reshape(-1, 3))
     if not points:
         return np.asarray(((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)), dtype=float)
     flat = np.concatenate(points, axis=0)
-    low, high = np.nanmin(flat, axis=0), np.nanmax(flat, axis=0)
+    low, high = np.min(flat, axis=0), np.max(flat, axis=0)
     span = np.maximum(high - low, 1.0)
     return np.vstack((low - 0.08 * span, high + 0.08 * span))
 
@@ -669,7 +709,13 @@ def export_lamellar_sequence(
             status = _status(scene)
             missing = original is None or status in {"unavailable", "stale"} or not _has_geometry(scene)
             if missing and original is not None and status == "stale" and not _get(scene, "message", ""):
-                scene = _blank_scene(index, "Frame is stale; no current geometry was exported" if str(language).lower().startswith("en") else "帧已过期，未导出当前几何数据")
+                scene = _blank_scene(
+                    index,
+                    "Frame is stale; no current geometry was exported" if str(language).lower().startswith("en") else "帧已过期，未导出当前几何数据",
+                    status="stale",
+                    source_identity=_source_identity(original),
+                    length_unit=str(_get(original, "length_unit", blank_unit)),
+                )
             qmap_observed, qx, qy = _qmap_item(qmaps, index)
             image_item = _sequence_item(images, index)
             image_missing = images is not None and image_item is None and qmap_observed is None
@@ -683,10 +729,11 @@ def export_lamellar_sequence(
                 # observed panel with their q-map coordinates.
                 capture = None
                 observed = qmap_observed if qmap_observed is not None else image_item
+            scene_length_unit = str(_get(scene, "length_unit", "relative"))
             if observed is not None or capture is not None:
-                figure = render_lamellar_combined(scene, observed=observed, qx=qx, qy=qy, image_3d=capture, camera=camera, language=language, bounds=viewport_by_unit.get(str(scene.length_unit)))
+                figure = render_lamellar_combined(scene, observed=observed, qx=qx, qy=qy, image_3d=capture, camera=camera, language=language, bounds=viewport_by_unit.get(scene_length_unit))
             else:
-                figure = render_lamellar_2d(scene, language=language, bounds=viewport_by_unit.get(str(scene.length_unit)))
+                figure = render_lamellar_2d(scene, language=language, bounds=viewport_by_unit.get(scene_length_unit))
             frame_path = stage / f"frame_{index:04d}.png"
             figure.savefig(frame_path, format="png", dpi=220, bbox_inches="tight")
             frame_paths.append(frame_path)
@@ -743,9 +790,8 @@ def export_lamellar_sequence(
             "viewport_bounds_by_unit": _jsonable(viewport_by_unit),
             "files": [path.name for path in frame_paths] + [gif_path.name, parameter_sources_path.name],
         }
-        _write_json(stage / "manifest.json", manifest)
-        # Add file hashes after the frame identity records are written.  The
-        # manifest itself is deliberately excluded to avoid a circular hash.
+        # Compute file hashes for all staged artifacts before writing the
+        # manifest.  The manifest itself is excluded to avoid a circular hash.
         artifacts = [{"name": path.name, "size": path.stat().st_size, "sha256": _hash(path)} for path in sorted(stage.iterdir()) if path.is_file() and path.name != "manifest.json"]
         manifest["artifacts"] = artifacts
         manifest["file_hashes"] = {item["name"]: item["sha256"] for item in artifacts}
@@ -758,7 +804,7 @@ def export_lamellar_sequence(
         result["parameter_sources"] = target / "parameter_sources.csv"
         result["manifest"] = target / "manifest.json"
         return result
-    except Exception:
+    except BaseException:
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
         raise

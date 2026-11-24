@@ -104,6 +104,8 @@ def _options_from(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "raw_support_sigma",
         "angular_noise_smoothing_sigma_bins",
     ):
+        if isinstance(out[key], (bool, np.bool_)):
+            raise ValueError(f"options[{key!r}] must be numeric")
         try:
             out[key] = float(out[key])
         except (TypeError, ValueError, OverflowError) as exc:
@@ -119,7 +121,7 @@ def _options_from(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "radial_bins",
     ):
         item = out[key]
-        if isinstance(item, bool):
+        if isinstance(item, (bool, np.bool_)):
             raise ValueError(f"options[{key!r}] must be an integer")
         try:
             cast = int(item)
@@ -514,11 +516,6 @@ def _angular_candidates(
         float(options["minimum_prominence"]),
         float(options["minimum_prominence_sigma"]) * noise_sigma,
     )
-    fill_floor = baseline - max(dynamic_range, abs(baseline), 1.0) * 4.0
-    filled = np.where(supported, values, fill_floor)
-    extended = np.tile(filled, 3)
-    repeated_peaks, _ = find_peaks(extended)
-    middle = repeated_peaks[(repeated_peaks >= n_bins) & (repeated_peaks < 2 * n_bins)]
     wlen = int(
         max(
             5,
@@ -530,22 +527,64 @@ def _angular_candidates(
     wlen = min(wlen, 2 * n_bins - 1)
     if wlen % 2 == 0:
         wlen -= 1
+    peak_measures: list[tuple[int, float, float]] = []
+    if bool(np.all(supported)):
+        extended = np.tile(values, 3)
+        repeated_peaks, _ = find_peaks(extended)
+        middle = repeated_peaks[(repeated_peaks >= n_bins) & (repeated_peaks < 2 * n_bins)]
+        for peak_extended in middle:
+            index = int(peak_extended - n_bins)
+            prominence_data = peak_prominences(
+                extended, np.asarray([peak_extended]), wlen=max(3, wlen)
+            )
+            prominence = float(prominence_data[0][0])
+            width_data = peak_widths(
+                extended,
+                np.asarray([peak_extended]),
+                rel_height=0.5,
+                prominence_data=prominence_data,
+            )
+            width_deg = float(width_data[0][0] * bin_width)
+            peak_measures.append((index, prominence, width_deg))
+    else:
+        # Analyze each contiguous supported circular run independently so
+        # masked gaps never introduce an artificial cliff or edge peak.
+        first_gap = int(np.flatnonzero(~supported)[0])
+        shift = (first_gap + 1) % n_bins
+        sup_rot = np.roll(supported, -shift)
+        val_rot = np.roll(values, -shift)
+        padded = np.r_[False, sup_rot, False]
+        starts = np.flatnonzero(padded[1:] & ~padded[:-1])
+        ends = np.flatnonzero(~padded[1:] & padded[:-1])
+        for run_start, run_end in zip(starts.tolist(), ends.tolist()):
+            run_len = run_end - run_start
+            if run_len < 3:
+                continue
+            segment = val_rot[run_start:run_end]
+            local_peaks, _ = find_peaks(segment)
+            if not local_peaks.size:
+                continue
+            run_wlen = min(max(3, wlen), run_len)
+            if run_wlen % 2 == 0 and run_wlen > 3:
+                run_wlen -= 1
+            prominence_data = peak_prominences(segment, local_peaks, wlen=run_wlen)
+            width_data = peak_widths(
+                segment,
+                local_peaks,
+                rel_height=0.5,
+                prominence_data=prominence_data,
+            )
+            for local_peak, prom, width_bins in zip(
+                local_peaks.tolist(),
+                prominence_data[0].tolist(),
+                width_data[0].tolist(),
+            ):
+                index = int((shift + run_start + local_peak) % n_bins)
+                peak_measures.append((index, float(prom), float(width_bins * bin_width)))
     records: list[dict[str, Any]] = []
-    for peak_extended in middle:
-        index = int(peak_extended - n_bins)
+    for index, prominence, width_deg in peak_measures:
         if not supported[index]:
             continue
-        prominence_data = peak_prominences(
-            extended, np.asarray([peak_extended]), wlen=max(3, wlen)
-        )
-        prominence = float(prominence_data[0][0])
-        width_data = peak_widths(
-            extended,
-            np.asarray([peak_extended]),
-            rel_height=0.5,
-            prominence_data=prominence_data,
-        )
-        width_deg = float(width_data[0][0] * bin_width)
         angle = float(centers[index])
         coverage = float(profile["coverage_fraction"][index])
         count = int(profile["valid_pixel_counts"][index])
@@ -949,7 +988,12 @@ def compute_peak_landmarks(
                 mode="wrap",
             )
             filtered = np.full(values.shape, np.nan, dtype=np.float64)
-            np.divide(numerator, denominator, out=filtered, where=denominator > 0.05)
+            np.divide(
+                numerator,
+                denominator,
+                out=filtered,
+                where=(denominator > 0.05) & common_angular_support,
+            )
             return filtered
 
         measured_angular = filter_angular(measured_angular)

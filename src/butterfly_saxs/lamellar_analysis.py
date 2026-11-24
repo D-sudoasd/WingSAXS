@@ -64,6 +64,8 @@ def _finite(value: Any) -> float | None:
             value = item()
         except (TypeError, ValueError):
             pass
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -230,16 +232,15 @@ def _candidate_and_value(
     source_status: str,
 ) -> tuple[float | None, float | None, str, str]:
     row = _evidence_for(evidence, name)
+    status = _text(row.get("status", row.get("identifiability_status")), "candidate") if row else "candidate"
+    raw_value = _finite(row.get("value", row.get("estimate"))) if row else None
     candidate = _finite(row.get("candidate_value")) if row else None
     if candidate is None:
-        candidate = geometry.get(name)
-    status = _text(row.get("status", row.get("identifiability_status")), "candidate") if row else "candidate"
-    value = _finite(row.get("value", row.get("estimate"))) if row else None
-    if status.casefold() not in {"available", "estimate"}:
-        value = None
+        candidate = raw_value if raw_value is not None else geometry.get(name)
+    value = raw_value if status.casefold() == "available" else None
     reason = _text(row.get("reason", row.get("reasons"))) if row else ""
     if not reason:
-        if value is not None and status.casefold() in {"available", "estimate"}:
+        if value is not None and status.casefold() == "available":
             reason = "quantitative_parameter_available"
         elif candidate is not None:
             reason = "finite_fit_candidate_without_quantitative_evidence"
@@ -291,13 +292,34 @@ def _model_radius_in_unit(
     return radius * factor if factor is not None else None
 
 
+def _normalise_branch_key(value: Any) -> Any:
+    if isinstance(value, bool):
+        return None
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            value = item()
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    return None
+
+
 def _member_id(member: Mapping[str, Any], index: int) -> Any:
     value = member.get("branch_id", member.get("fit_branch_id"))
-    if isinstance(value, bool):
-        return index
-    if isinstance(value, (int, str)):
-        return value
-    return index
+    normalized = _normalise_branch_key(value)
+    return index if normalized is None else normalized
 
 
 def _members(
@@ -307,9 +329,14 @@ def _members(
     reference_axis_deg: float,
     default_q_unit: str,
 ) -> list[dict[str, Any]]:
-    raw_members = _sequence(ellipse.get("ellipses"))
+    raw_members = _sequence(_get(ellipse, "ellipses", "ellipse_pair"))
     members: list[dict[str, Any]] = []
-    if not raw_members and all(values.get(name) is not None for name in ("a", "b", "theta_deg")):
+    if (
+        not raw_members
+        and all(values.get(name) is not None for name in ("a", "b", "theta_deg"))
+        and float(values["a"]) > 0.0
+        and float(values["b"]) > 0.0
+    ):
         theta = float(values["theta_deg"])
         raw_members = [
             {"theta_deg": reference_axis_deg + theta},
@@ -319,7 +346,12 @@ def _members(
         if not isinstance(raw, Mapping) and not hasattr(raw, "__dict__"):
             continue
         normalized = public_ellipse_payload(raw)
-        member_q_unit = _text(_get(normalized, "q_unit", "source_q_unit"), default_q_unit)
+        raw_member_q_unit = _text(_get(normalized, "q_unit", "source_q_unit"), "")
+        member_q_unit = (
+            default_q_unit
+            if _normalized_q_unit(raw_member_q_unit) in {"", "unknown", "none"}
+            else raw_member_q_unit
+        )
         global_to_member = _q_conversion_factor(
             default_q_unit, member_q_unit, allow_same_unknown=True
         )
@@ -330,9 +362,14 @@ def _members(
         if angle is None and values.get("theta_deg") is not None:
             theta = float(values["theta_deg"])
             angle = reference_axis_deg + (theta if index == 0 else -theta)
-        a = _finite(_get(normalized, "a", "semi_major"))
-        b = _finite(_get(normalized, "b", "semi_minor"))
+        raw_a = _finite(_get(normalized, "a", "semi_major"))
+        raw_b = _finite(_get(normalized, "b", "semi_minor"))
+        if (raw_a is not None and raw_a <= 0.0) or (raw_b is not None and raw_b <= 0.0):
+            continue
+        a, b = raw_a, raw_b
         ratio = _finite(_get(normalized, "axis_ratio", "axes_ratio"))
+        if ratio is not None and ratio <= 0.0:
+            ratio = None
         if a is None:
             value = values.get("a")
             a = value * global_to_member if value is not None and global_to_member is not None else None
@@ -359,7 +396,7 @@ def _members(
         if cy is None:
             value = center.get("cy")
             cy = value * global_to_member if value is not None and global_to_member is not None else None
-        if angle is None or a is None or b is None:
+        if angle is None or a is None or b is None or a <= 0.0 or b <= 0.0:
             continue
         members.append(
             {
@@ -626,6 +663,12 @@ def analyze_lamellar_morphology(source: Any, *, angular_samples: int = 181) -> d
             values[name] = value
         elif values.get(name) is None:
             values[name] = candidate if candidate is not None else value
+    for axis_name in ("a", "b"):
+        axis_val = values.get(axis_name)
+        if axis_val is not None and axis_val <= 0.0:
+            values[axis_name] = None
+    if values.get("axis_ratio") is not None and values["axis_ratio"] <= 0.0:
+        values["axis_ratio"] = None
     if values["b"] is None and values["a"] is not None and values["axis_ratio"] is not None:
         values["b"] = values["a"] * values["axis_ratio"]
     if values["axis_ratio"] is None and values["a"] not in (None, 0.0) and values["b"] is not None:
@@ -648,7 +691,7 @@ def analyze_lamellar_morphology(source: Any, *, angular_samples: int = 181) -> d
     support_statuses_by_branch: dict[Any, set[str]] = {}
     unassigned_support_count = 0
     for row in model_support:
-        branch = row.get("branch_id")
+        branch = _normalise_branch_key(row.get("branch_id"))
         if branch is None or (isinstance(branch, int) and branch < 0):
             unassigned_support_count += 1
             continue
@@ -681,7 +724,11 @@ def analyze_lamellar_morphology(source: Any, *, angular_samples: int = 181) -> d
         )
         member["unassigned_support_count"] = int(unassigned_support_count)
 
-    candidate_geometry_exists = all(values.get(name) is not None for name in ("a", "b", "theta_deg"))
+    candidate_geometry_exists = (
+        all(values.get(name) is not None for name in ("a", "b", "theta_deg"))
+        and float(values["a"]) > 0.0
+        and float(values["b"]) > 0.0
+    )
     if candidate_geometry_exists and not members:
         candidate_geometry_exists = False
     analysis_status = (
@@ -732,10 +779,19 @@ def analyze_lamellar_morphology(source: Any, *, angular_samples: int = 181) -> d
             candidate, value, status, reason = _candidate_and_value(
                 name, values, evidence, source_status=source_status
             )
-            if failed_source:
+            if name in ("a", "b", "axis_ratio") and candidate is not None and candidate <= 0.0:
+                candidate = None
+                value = None
+                status = "failed" if failed_source else "unavailable"
+                reason = "nonpositive_ellipse_axis"
+            elif failed_source:
                 value = None
                 status = "candidate" if candidate is not None else ("failed" if source_failed or execution_failure else "unavailable")
                 reason = "source_execution_failed_candidate_retained" if execution_failure is not None else "ellipse_fit_failed_candidate_retained"
+            elif name == "theta_deg" and axis_unidentified:
+                value = None
+                status = "candidate" if candidate is not None else status
+                reason = "near_circular_ellipse_axis_unidentifiable"
             parameter_states[name] = (candidate, value, status, reason)
             parameter_rows.append(_geometry_parameter_row(label, unit, candidate, value, status, reason))
 
@@ -764,7 +820,12 @@ def analyze_lamellar_morphology(source: Any, *, angular_samples: int = 181) -> d
         )
     if base_periods is None:
         ln = l_major = None
-        spacing_flags: tuple[str, ...] = ("spacing_unavailable_missing_ellipse_center",)
+        if center["cx"] is None or center["cy"] is None:
+            spacing_flags: tuple[str, ...] = ("spacing_unavailable_missing_ellipse_center",)
+        elif values.get("a") is not None and values.get("b") is not None and values.get("theta_deg") is None:
+            spacing_flags = ("spacing_unavailable_missing_ellipse_orientation",)
+        else:
+            spacing_flags = ("ellipse_spacing_unavailable",)
     else:
         ln_raw, _lz_default_raw, l_major_raw, spacing_flags = base_periods
         ln = ln_raw if math.isfinite(ln_raw) else None
@@ -909,7 +970,7 @@ def analyze_lamellar_morphology(source: Any, *, angular_samples: int = 181) -> d
 
     observed_directions: list[dict[str, Any]] = []
     for item in observed:
-        branch_id = item.get("branch_id")
+        branch_id = _normalise_branch_key(item.get("branch_id"))
         angle = _finite(item.get("angle_deg"))
         observation_unit = _text(item.get("q_unit"), q_unit)
         matching = next((member for member in members if member.get("branch_id") == branch_id), None)
@@ -925,7 +986,7 @@ def analyze_lamellar_morphology(source: Any, *, angular_samples: int = 181) -> d
         )
         prediction_status = matching.get("status", "candidate") if matching is not None else None
         comparison_reason = "model_and_observation_converted_to_observation_q_unit"
-        if matching is None and branch_id is None and members:
+        if matching is None and (branch_id is None or (isinstance(branch_id, int) and branch_id < 0)) and members:
             predictions = [
                 (_model_radius_in_unit(member, angle, observation_unit), member)
                 for member in members
