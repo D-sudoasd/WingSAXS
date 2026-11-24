@@ -353,6 +353,9 @@ if QT_AVAILABLE:
             self._qt_modules: tuple[Any, ...] | None = None
             self._renderer_attempted = False
             self._renderer_failed = False
+            self._renderer_error = ""
+            self._scene_error = ""
+            self._camera_signal_connected = False
             self._camera_state: dict[str, Any] = {
                 "yaw": _STANDARD_VIEWS["isometric"][0],
                 "pitch": _STANDARD_VIEWS["isometric"][1],
@@ -379,10 +382,29 @@ if QT_AVAILABLE:
             layout = QtWidgets.QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
             layout.addWidget(self._stack)
-            self._set_message("Preparing the native 3-D renderer…")
+            self._set_message(self._preparing_message())
             # Module probing is inexpensive and does not allocate a graphics
             # surface.  The QQuickWidget itself is created on first show/use.
             self._probe_modules()
+
+        def _preparing_message(self) -> str:
+            return (
+                "正在准备原生三维渲染器…"
+                if self._language == "zh"
+                else "Preparing the native 3-D renderer…"
+            )
+
+        def _connect_camera_signal(self, root: Any) -> None:
+            if root is None or self._camera_signal_connected or not hasattr(root, "cameraChanged"):
+                return
+            try:
+                root.cameraChanged.connect(
+                    self._on_qml_camera_changed,
+                    QtCore.Qt.ConnectionType.UniqueConnection,
+                )
+            except TypeError:
+                root.cameraChanged.connect(self._on_qml_camera_changed)
+            self._camera_signal_connected = True
 
         @property
         def bounds(self) -> np.ndarray | None:
@@ -511,19 +533,21 @@ if QT_AVAILABLE:
                 # Retain module references so plugin types cannot be unloaded
                 # while the QML engine is alive.
                 self._qt_modules = (QtQuickWidgets, QtQuick3D)
-                self.error_message = ""
+                self._renderer_error = ""
+                self.error_message = self._scene_error
                 return True
             except Exception as exc:  # pragma: no cover - host dependent
                 self._qt_modules = None
                 self.available = False
-                self.error_message = f"Qt Quick 3D is unavailable: {exc}"
+                self._renderer_error = f"Qt Quick 3D is unavailable: {exc}"
+                self.error_message = self._renderer_error
                 self._renderer_failed = True
-                self._set_message(self.error_message)
+                self._set_message(self._renderer_error)
                 self._renderer_attempted = True
                 return False
 
         def _set_message(self, message: str) -> None:
-            if message and str(message) == self.error_message:
+            if message and self._renderer_error and str(message) == self._renderer_error:
                 self._message.setText(
                     "三维显示暂不可用。请在支持图形加速的环境中重新打开；二维分析仍可使用。"
                     if self._language == "zh"
@@ -534,6 +558,7 @@ if QT_AVAILABLE:
             else:
                 self._message.setText(str(message))
                 self._message.setToolTip("")
+                self._message.setAccessibleDescription(str(message))
             if self._stack is not None:
                 self._stack.setCurrentWidget(self._message)
 
@@ -550,15 +575,17 @@ if QT_AVAILABLE:
                 return False
             if QtWidgets.QApplication.instance() is None:
                 self.available = False
-                self.error_message = "A QApplication is required before creating the 3-D renderer."
+                self._renderer_error = "A QApplication is required before creating the 3-D renderer."
+                self.error_message = self._renderer_error
                 self._renderer_failed = True
-                self._set_message(self.error_message)
+                self._set_message(self._renderer_error)
                 return False
             if not _QML_PATH.exists():
                 self.available = False
-                self.error_message = f"Missing Qt Quick 3D scene: {_QML_PATH}"
+                self._renderer_error = f"Missing Qt Quick 3D scene: {_QML_PATH}"
+                self.error_message = self._renderer_error
                 self._renderer_failed = True
-                self._set_message(self.error_message)
+                self._set_message(self._renderer_error)
                 return False
             try:
                 QtQuickWidgets = self._qt_modules[0]
@@ -569,10 +596,13 @@ if QT_AVAILABLE:
                 quick.statusChanged.connect(self._on_qml_status)
                 self._stack.addWidget(quick)
                 self._quick = quick
+                self._camera_signal_connected = False
                 quick.setSource(QtCore.QUrl.fromLocalFile(str(_QML_PATH)))
                 # A source can become Ready synchronously, but processing one
                 # bounded event turn also covers offscreen Windows RHI setup.
-                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 100)
+                QtWidgets.QApplication.processEvents(
+                    QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 100
+                )
                 root = quick.rootObject()
                 if root is None:
                     errors = self._qml_errors(quick)
@@ -584,21 +614,25 @@ if QT_AVAILABLE:
                 backend_error = self._rhi_backend_error(quick)
                 if backend_error:
                     raise RuntimeError(backend_error)
-                if hasattr(root, "cameraChanged"):
-                    root.cameraChanged.connect(self._on_qml_camera_changed)
+                self._connect_camera_signal(root)
                 self.available = True
-                self.error_message = ""
+                self._renderer_error = ""
+                self.error_message = self._scene_error
                 self._apply_root_state()
-                self._show_renderer()
+                if self._scene_error:
+                    self._set_message(self._scene_error)
+                else:
+                    self._show_renderer()
                 return True
             except Exception as exc:  # pragma: no cover - renderer/driver dependent
                 self.available = False
                 self._renderer_failed = True
-                self.error_message = f"Qt Quick 3D renderer could not start: {exc}"
+                self._renderer_error = f"Qt Quick 3D renderer could not start: {exc}"
                 errors = self._qml_errors(self._quick)
                 if errors:
-                    self.error_message = f"{self.error_message}\n{errors}"
-                self._set_message(self.error_message)
+                    self._renderer_error = f"{self._renderer_error}\n{errors}"
+                self.error_message = self._renderer_error
+                self._set_message(self._renderer_error)
                 return False
 
         @staticmethod
@@ -622,8 +656,9 @@ if QT_AVAILABLE:
         def _on_scene_graph_error(self, _error: Any, message: str) -> None:
             self.available = False
             self._renderer_failed = True
-            self.error_message = f"Qt Quick 3D scene-graph error: {message}"
-            self._set_message(self.error_message)
+            self._renderer_error = f"Qt Quick 3D scene-graph error: {message}"
+            self.error_message = self._renderer_error
+            self._set_message(self._renderer_error)
 
         @staticmethod
         def _qml_errors(quick: Any) -> str:
@@ -646,16 +681,29 @@ if QT_AVAILABLE:
                 error = False
             if error:
                 self.available = False
-                self.error_message = self._qml_errors(self._quick) or "Qt Quick 3D scene failed to load."
-                self._set_message(self.error_message)
+                self._renderer_error = self._qml_errors(self._quick) or "Qt Quick 3D scene failed to load."
+                self.error_message = self._renderer_error
+                self._set_message(self._renderer_error)
             elif ready and self._qml_root is None:
+                backend_error = self._rhi_backend_error(self._quick)
+                if backend_error:
+                    self.available = False
+                    self._renderer_failed = True
+                    self._renderer_error = f"Qt Quick 3D renderer could not start: {backend_error}"
+                    self.error_message = self._renderer_error
+                    self._set_message(self._renderer_error)
+                    return
                 self._qml_root = self._quick.rootObject()
-                if self._qml_root is not None and hasattr(self._qml_root, "cameraChanged"):
-                    self._qml_root.cameraChanged.connect(self._on_qml_camera_changed)
+                self._connect_camera_signal(self._qml_root)
                 self.available = self._qml_root is not None
                 if self.available:
+                    self._renderer_error = ""
+                    self.error_message = self._scene_error
                     self._apply_root_state()
-                    self._show_renderer()
+                    if self._scene_error:
+                        self._set_message(self._scene_error)
+                    else:
+                        self._show_renderer()
 
         def _on_qml_camera_changed(self, state: Any) -> None:
             if getattr(self, "_updating_camera", False):
@@ -808,7 +856,10 @@ if QT_AVAILABLE:
         def _process_events(self, timeout_ms: int = 180) -> None:
             app = QtWidgets.QApplication.instance()
             if app is not None:
-                app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, int(timeout_ms))
+                app.processEvents(
+                    QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents,
+                    int(timeout_ms),
+                )
 
         def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
             super().showEvent(event)
@@ -838,12 +889,14 @@ if QT_AVAILABLE:
                 self._payload = None
                 self._bounds = _finite_bounds(bounds)
                 self._has_scene = False
-                self.available = bool(self._quick is not None and self._qml_root is not None)
-                self.error_message = f"Lamellar scene cannot be displayed: {exc}"
-                self._set_message(self.error_message)
+                self._scene_error = f"Lamellar scene cannot be displayed: {exc}"
+                self.error_message = self._renderer_error or self._scene_error
+                self._set_message(self._scene_error)
                 if self._qml_root is not None:
                     self._qml_root.setProperty("slabData", [])
                 return
+            self._scene_error = ""
+            self.error_message = self._renderer_error
             self._payload = payload
             self._bounds = payload.bounds.copy()
             self._prepare_publication_geometry(
@@ -872,8 +925,10 @@ if QT_AVAILABLE:
             else:
                 # Keep a valid scene pending so the first show/explicit capture
                 # can render it without the caller having to resend the frame.
-                if self.error_message:
-                    self._set_message(self.error_message)
+                if self._renderer_error:
+                    self._set_message(self._renderer_error)
+                else:
+                    self._set_message(self._preparing_message())
 
         def clear(self, message: str = "") -> None:
             """Remove all slabs and optionally show a neutral state message."""
@@ -882,6 +937,8 @@ if QT_AVAILABLE:
             self._payload = None
             self._bounds = None
             self._has_scene = False
+            self._scene_error = ""
+            self.error_message = self._renderer_error
             self._publication_mesh = None
             self._publication_groups = []
             self._publication_group_maps = []
@@ -898,8 +955,10 @@ if QT_AVAILABLE:
                 self._set_message(message)
             elif self.available:
                 self._show_renderer()
+            elif self._renderer_error:
+                self._set_message(self._renderer_error)
             else:
-                self._set_message("Preparing the native 3-D renderer…")
+                self._set_message(self._preparing_message())
 
         def camera_state(self) -> dict[str, Any]:
             """Return a JSON-friendly snapshot of the current orbit camera."""
@@ -968,8 +1027,12 @@ if QT_AVAILABLE:
             self._language = "zh" if value.startswith("zh") else "en"
             if self._qml_root is not None:
                 self._qml_root.setProperty("language", self._language)
-            if not self.available and self.error_message:
-                self._set_message(self.error_message)
+            if self._renderer_error:
+                self._set_message(self._renderer_error)
+            elif self._scene_error:
+                self._set_message(self._scene_error)
+            elif not self.available and not self._has_scene:
+                self._set_message(self._preparing_message())
 
         def set_selected_branch(self, branch: int) -> None:
             value = int(branch)
@@ -1091,10 +1154,7 @@ if QT_AVAILABLE:
                     image = image.copy(0, 0, width, height)
                 return image.copy()
             except Exception as exc:  # pragma: no cover - renderer/driver dependent
-                self.error_message = f"Qt Quick 3D capture failed: {exc}"
-                self.available = False
-                self._set_message(self.error_message)
-                raise RuntimeError(self.error_message) from exc
+                raise RuntimeError(f"Qt Quick 3D capture failed: {exc}") from exc
             finally:
                 if capture is not None:
                     capture.hide()
@@ -1509,7 +1569,7 @@ def render_publication_scene(
         if style is not None:
             view.set_publication_style(style, cancel_event=cancel_event)
         view.show()
-        app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 16)
+        app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 16)
         return view.capture_publication(
             scene,
             style=style,
@@ -1522,7 +1582,7 @@ def render_publication_scene(
         )
     finally:
         view.close()
-        app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 16)
+        app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 16)
 
 
 __all__ = ["Lamellar3DView", "render_publication_scene"]

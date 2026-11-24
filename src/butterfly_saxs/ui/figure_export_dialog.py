@@ -780,7 +780,10 @@ if QT_AVAILABLE:
                     else "打开已导出图包"
                 )
             )
-            if not self._running:
+            if self._running:
+                self.cancel_button.setText("Cancel export" if english else "取消导出")
+                self.start_button.setText("Exporting…" if english else "正在导出…")
+            else:
                 self.cancel_button.setText("Close" if english else "关闭")
                 self.start_button.setText(
                     "Start background export" if english else "开始后台导出"

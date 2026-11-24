@@ -13,6 +13,66 @@ from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets
 from .workers import AnalysisWorker
 
 
+_TEXT: dict[str, tuple[str, str]] = {
+    "window_title": ("发表画板 · Publication artboard", "Publication artboard"),
+    "title": ("发表画板", "Publication artboard"),
+    "subtitle": ("平直片层 · 精细三维 · 可编辑标注", "Flat lamellae · Detailed 3D · Editable labels"),
+    "export": ("导出发表图…", "Export publication figure…"),
+    "template": ("构图", "Template"),
+    "template_structure": ("结构主图", "Structure only"),
+    "template_evidence": ("SAXS＋结构", "SAXS + structure"),
+    "artboard": ("画板", "Artboard"),
+    "preset_double": ("双栏 · 183 mm", "Double column · 183 mm"),
+    "preset_single": ("单栏 · 89 mm", "Single column · 89 mm"),
+    "preset_custom": ("自定义", "Custom"),
+    "width": ("宽度 (mm)", "Width (mm)"),
+    "height": ("高度 (mm)", "Height (mm)"),
+    "dpi": ("分辨率", "Resolution"),
+    "figure_language": ("图中文字", "Figure text"),
+    "palette": ("配色", "Palette"),
+    "palette_editorial": ("冷暖哑光", "Warm/cool matte"),
+    "palette_grayscale": ("灰度", "Grayscale"),
+    "background": ("背景", "Background"),
+    "bg_white": ("白色", "White"),
+    "bg_transparent": ("透明", "Transparent"),
+    "bevel": ("边缘精修", "Edge bevel"),
+    "roughness": ("哑光程度", "Matte roughness"),
+    "inset": ("显示层间关系特写", "Show interlayer close-up"),
+    "labels": ("显示参数与法向标注", "Show parameter & normal labels"),
+    "ao": ("柔和层间阴影", "Soft interlayer ambient occlusion"),
+    "reset_labels": ("恢复自动标注位置", "Reset annotation positions"),
+    "auto_camera": ("平衡视角与自动取景", "Balanced view & auto-framing"),
+    "use_camera": ("采用工作台当前视角", "Use workbench 3D camera"),
+    "note": (
+        "可拖动图中标注调整位置。\n图内厚度与横向尺寸为示意设定；完整来源随导出保存。",
+        "Drag annotations on the preview to reposition them.\nSlab thickness and lateral size are schematic assumptions; full provenance is exported alongside.",
+    ),
+    "waiting": ("等待当前场景", "Waiting for current scene"),
+    "cancel": ("取消", "Cancel"),
+    "close": ("关闭", "Close"),
+    "source_changed": ("数据已改变，等待当前场景更新", "Source data changed; waiting for updated scene"),
+    "no_scene": (
+        "当前没有可用场景，请先完成测量或选择手动示意。",
+        "No available scene yet; complete a measurement or choose a manual schematic first.",
+    ),
+    "rendering_preview": ("正在绘制发表预览…", "Rendering publication preview…"),
+    "preview_updated": ("预览已更新 · 可拖动文字调整位置", "Preview updated · Drag annotations to reposition"),
+    "preview_failed": ("预览未完成：", "Preview incomplete: "),
+    "export_dir_title": ("发表图导出目录", "Publication figure export folder"),
+    "rendering_hires": ("正在生成原始高分辨率三维图…", "Rendering high-resolution 3D scene…"),
+    "saving_outputs": ("正在保存矢量文字、图像与来源…", "Saving vector text, images, and provenance…"),
+    "saving_progress": ("正在保存发表图与来源… {current} / {total}", "Saving publication figure and provenance… {current} / {total}"),
+    "exported": ("已导出：", "Exported: "),
+    "export_failed": ("导出未完成：", "Export incomplete: "),
+    "cancelled": ("已取消", "Cancelled"),
+}
+
+
+def _pub_tr(key: str, language: str) -> str:
+    pair = _TEXT[key]
+    return pair[1 if str(language).lower().startswith("en") else 0]
+
+
 if QT_AVAILABLE:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
     from matplotlib.figure import Figure
@@ -64,9 +124,10 @@ if QT_AVAILABLE:
     class PublicationDialog(QtWidgets.QDialog):
         documentChanged = QtCore.Signal(object)
 
-        def __init__(self, parent=None, *, document=None, context_provider=None):
+        def __init__(self, parent=None, *, document=None, context_provider=None, language: str | None = None):
             super().__init__(parent)
-            self.setWindowTitle("发表画板 · Publication artboard")
+            self._ui_language = str(language or getattr(parent, "language", "zh_CN") or "zh_CN")
+            self.setWindowTitle(_pub_tr("window_title", self._ui_language))
             self.setObjectName("publicationDialog")
             self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, False)
             self._provider = context_provider
@@ -95,10 +156,54 @@ if QT_AVAILABLE:
             screen = QtGui.QGuiApplication.primaryScreen()
             available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1366, 900)
             self.resize(min(1240, available.width() - 40), min(830, available.height() - 50))
+            self.set_language(self._ui_language)
+
+        def _t(self, key: str) -> str:
+            return _pub_tr(key, self._ui_language)
+
+        @property
+        def language(self) -> str:
+            return self._ui_language
+
+        def set_language(self, language: str) -> None:
+            self._ui_language = str(language or "zh_CN")
+            self.setWindowTitle(self._t("window_title"))
+            self._title_label.setText(self._t("title"))
+            self._subtitle_label.setText(self._t("subtitle"))
+            self.export_button.setText(self._t("export"))
+            self.inset_check.setText(self._t("inset"))
+            self.labels_check.setText(self._t("labels"))
+            self.ao_check.setText(self._t("ao"))
+            self.reset_labels_button.setText(self._t("reset_labels"))
+            self.auto_camera_button.setText(self._t("auto_camera"))
+            self.use_camera_button.setText(self._t("use_camera"))
+            self._note_label.setText(self._t("note"))
+            self.cancel_button.setText(self._t("cancel"))
+            self.close_button.setText(self._t("close"))
+            for field, key in self._form_field_keys:
+                label = self.form.labelForField(field)
+                text = self._t(key)
+                if label is not None:
+                    label.setText(text)
+                field.setAccessibleName(text)
+            for combo, option_keys in (
+                (self.template_combo, (("structure", "template_structure"), ("evidence", "template_evidence"))),
+                (self.width_preset, ((183., "preset_double"), (89., "preset_single"), (0., "preset_custom"))),
+                (self.palette_combo, (("editorial", "palette_editorial"), ("grayscale", "palette_grayscale"))),
+                (self.background_combo, (("white", "bg_white"), ("transparent", "bg_transparent"))),
+            ):
+                for data, key in option_keys:
+                    idx = combo.findData(data)
+                    if idx >= 0:
+                        combo.setItemText(idx, self._t(key))
+            if not self._rendering and self._worker is None and self._rendered is None:
+                self.status.setText(self._t("waiting"))
+            elif self._rendered is not None and not self._rendering and self._worker is None:
+                self.status.setText(self._t("preview_updated"))
 
             from .help import apply_help
 
-            apply_help(self, getattr(parent, "language", "zh_CN"))
+            apply_help(self, self._ui_language)
 
         def _build_ui(self):
             self.setStyleSheet(
@@ -109,13 +214,13 @@ if QT_AVAILABLE:
             outer = QtWidgets.QVBoxLayout(self)
             outer.setContentsMargins(16, 12, 16, 12)
             header = QtWidgets.QHBoxLayout()
-            title = QtWidgets.QLabel("发表画板")
-            title.setStyleSheet("font-size: 22px; font-weight: 600; color: #2a3b44;")
-            header.addWidget(title)
-            subtitle = QtWidgets.QLabel("平直片层 · 精细三维 · 可编辑标注")
-            subtitle.setStyleSheet("color: #627581;")
-            header.addWidget(subtitle, 1)
-            self.export_button = QtWidgets.QPushButton("导出发表图…")
+            self._title_label = QtWidgets.QLabel(self._t("title"))
+            self._title_label.setStyleSheet("font-size: 22px; font-weight: 600; color: #2a3b44;")
+            header.addWidget(self._title_label)
+            self._subtitle_label = QtWidgets.QLabel(self._t("subtitle"))
+            self._subtitle_label.setStyleSheet("color: #627581;")
+            header.addWidget(self._subtitle_label, 1)
+            self.export_button = QtWidgets.QPushButton(self._t("export"))
             self.export_button.setObjectName("publicationExportButton")
             self.export_button.setStyleSheet("background: #426f81; color: white; border: 0; border-radius: 4px;")
             self.export_button.clicked.connect(self._choose_export)
@@ -129,38 +234,39 @@ if QT_AVAILABLE:
             self.form = QtWidgets.QFormLayout()
             self.form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
             controls.addLayout(self.form)
-            self.template_combo = self._combo("构图", (("结构主图", "structure"), ("SAXS＋结构", "evidence")))
-            self.width_preset = self._combo("画板", (("双栏 · 183 mm", 183.), ("单栏 · 89 mm", 89.), ("自定义", 0.)))
-            self.width_spin = self._spin("宽度 (mm)", 50., 300., 183.)
-            self.height_spin = self._spin("高度 (mm)", 40., 250., 95.)
-            self.dpi_combo = self._combo("分辨率", (("600 dpi", 600), ("450 dpi", 450), ("1200 dpi", 1200)))
-            self.language_combo = self._combo("图中文字", (("English", "en"), ("中文", "zh_CN")))
-            self.palette_combo = self._combo("配色", (("冷暖哑光", "editorial"), ("灰度", "grayscale")))
-            self.background_combo = self._combo("背景", (("白色", "white"), ("透明", "transparent")))
-            self.bevel_spin = self._spin("边缘精修", 0., .24, .12, step=.02, decimals=2)
-            self.roughness_spin = self._spin("哑光程度", .35, 1., .72, step=.05, decimals=2)
-            self.inset_check = QtWidgets.QCheckBox("显示层间关系特写")
+            self._form_field_keys: list[tuple[Any, str]] = []
+            self.template_combo = self._combo("template", ((self._t("template_structure"), "structure"), (self._t("template_evidence"), "evidence")))
+            self.width_preset = self._combo("artboard", ((self._t("preset_double"), 183.), (self._t("preset_single"), 89.), (self._t("preset_custom"), 0.)))
+            self.width_spin = self._spin("width", 50., 300., 183.)
+            self.height_spin = self._spin("height", 40., 250., 95.)
+            self.dpi_combo = self._combo("dpi", (("600 dpi", 600), ("450 dpi", 450), ("1200 dpi", 1200)))
+            self.language_combo = self._combo("figure_language", (("English", "en"), ("中文", "zh_CN")))
+            self.palette_combo = self._combo("palette", ((self._t("palette_editorial"), "editorial"), (self._t("palette_grayscale"), "grayscale")))
+            self.background_combo = self._combo("background", ((self._t("bg_white"), "white"), (self._t("bg_transparent"), "transparent")))
+            self.bevel_spin = self._spin("bevel", 0., .24, .12, step=.02, decimals=2)
+            self.roughness_spin = self._spin("roughness", .35, 1., .72, step=.05, decimals=2)
+            self.inset_check = QtWidgets.QCheckBox(self._t("inset"))
             self.inset_check.setChecked(True)
             controls.addWidget(self.inset_check)
-            self.labels_check = QtWidgets.QCheckBox("显示参数与法向标注")
+            self.labels_check = QtWidgets.QCheckBox(self._t("labels"))
             self.labels_check.setChecked(True)
             controls.addWidget(self.labels_check)
-            self.ao_check = QtWidgets.QCheckBox("柔和层间阴影")
+            self.ao_check = QtWidgets.QCheckBox(self._t("ao"))
             self.ao_check.setChecked(True)
             controls.addWidget(self.ao_check)
-            self.reset_labels_button = QtWidgets.QPushButton("恢复自动标注位置")
+            self.reset_labels_button = QtWidgets.QPushButton(self._t("reset_labels"))
             self.reset_labels_button.clicked.connect(self.reset_annotation_positions)
             controls.addWidget(self.reset_labels_button)
-            self.auto_camera_button = QtWidgets.QPushButton("平衡视角与自动取景")
+            self.auto_camera_button = QtWidgets.QPushButton(self._t("auto_camera"))
             self.auto_camera_button.clicked.connect(self.reset_camera)
             controls.addWidget(self.auto_camera_button)
-            self.use_camera_button = QtWidgets.QPushButton("采用工作台当前视角")
+            self.use_camera_button = QtWidgets.QPushButton(self._t("use_camera"))
             self.use_camera_button.clicked.connect(self.use_workbench_camera)
             controls.addWidget(self.use_camera_button)
-            note = QtWidgets.QLabel("可拖动图中标注调整位置。\n图内厚度与横向尺寸为示意设定；完整来源随导出保存。")
-            note.setWordWrap(True)
-            note.setStyleSheet("color: #647782; font-size: 11px; padding-top: 12px;")
-            controls.addWidget(note)
+            self._note_label = QtWidgets.QLabel(self._t("note"))
+            self._note_label.setWordWrap(True)
+            self._note_label.setStyleSheet("color: #647782; font-size: 11px; padding-top: 12px;")
+            controls.addWidget(self._note_label)
             controls.addStretch(1)
             scroll = QtWidgets.QScrollArea()
             scroll.setWidgetResizable(True)
@@ -186,13 +292,13 @@ if QT_AVAILABLE:
             body.addWidget(paper, 1)
             outer.addLayout(body, 1)
             footer = QtWidgets.QHBoxLayout()
-            self.status = QtWidgets.QLabel("等待当前场景")
+            self.status = QtWidgets.QLabel(self._t("waiting"))
             self.status.setWordWrap(True)
             footer.addWidget(self.status, 1)
-            self.cancel_button = QtWidgets.QPushButton("取消")
+            self.cancel_button = QtWidgets.QPushButton(self._t("cancel"))
             self.cancel_button.clicked.connect(self.cancel)
             footer.addWidget(self.cancel_button)
-            self.close_button = QtWidgets.QPushButton("关闭")
+            self.close_button = QtWidgets.QPushButton(self._t("close"))
             self.close_button.clicked.connect(self.close)
             footer.addWidget(self.close_button)
             outer.addLayout(footer)
@@ -206,23 +312,27 @@ if QT_AVAILABLE:
                 widget.toggled.connect(self._controls_changed)
             self._set_busy(False)
 
-        def _combo(self, label, options):
+        def _combo(self, label_key, options):
             widget = QtWidgets.QComboBox()
             for text, value in options:
                 widget.addItem(text, value)
-            widget.setAccessibleName(label)
-            self.form.addRow(label, widget)
+            label_text = self._t(label_key)
+            widget.setAccessibleName(label_text)
+            self.form.addRow(label_text, widget)
+            self._form_field_keys.append((widget, label_key))
             return widget
 
-        def _spin(self, label, low, high, initial, *, step=1., decimals=1):
+        def _spin(self, label_key, low, high, initial, *, step=1., decimals=1):
             widget = QtWidgets.QDoubleSpinBox()
             widget.setRange(low, high)
             widget.setDecimals(decimals)
             widget.setSingleStep(step)
             widget.setValue(initial)
             widget.setKeyboardTracking(False)
-            widget.setAccessibleName(label)
-            self.form.addRow(label, widget)
+            label_text = self._t(label_key)
+            widget.setAccessibleName(label_text)
+            self.form.addRow(label_text, widget)
+            self._form_field_keys.append((widget, label_key))
             return widget
 
         def _preset_changed(self):
@@ -295,7 +405,7 @@ if QT_AVAILABLE:
             self._figure.clear()
             self.canvas.draw_idle()
             self.export_button.setEnabled(False)
-            self.status.setText("数据已改变，等待当前场景更新")
+            self.status.setText(self._t("source_changed"))
 
         def context_ready(self):
             if self.isVisible():
@@ -313,7 +423,7 @@ if QT_AVAILABLE:
         def _read_context(self):
             context = self._provider() if callable(self._provider) else self._context
             if not context or context.get("scene") is None or not context["scene"].metadata.get("available"):
-                raise ValueError("当前没有可用场景，请先完成测量或选择手动示意。")
+                raise ValueError(self._t("no_scene"))
             return context
 
         def refresh_preview(self):
@@ -326,7 +436,7 @@ if QT_AVAILABLE:
             self._rendering = True
             self._pending = False
             self._set_busy(True)
-            self.status.setText("正在绘制发表预览…")
+            self.status.setText(self._t("rendering_preview"))
             try:
                 from .lamellar_3d import render_publication_scene
                 from ..publication import render_publication_figure
@@ -347,12 +457,12 @@ if QT_AVAILABLE:
                 self._rendered = frame
                 self._context = context
                 self._camera = deepcopy(frame.camera)
-                self.status.setText("预览已更新 · 可拖动文字调整位置")
+                self.status.setText(self._t("preview_updated"))
                 self.size_label.setText(f"{self._spec.width_mm:g} × {self._spec.height_mm:g} mm  ·  {self._spec.dpi} dpi  ·  6.5 pt text")
                 self.documentChanged.emit(self.document())
             except Exception as exc:
                 if token == self._serial:
-                    self.status.setText("预览未完成：" + str(exc))
+                    self.status.setText(self._t("preview_failed") + str(exc))
                     self._rendered = None
             finally:
                 self._rendering = False
@@ -421,7 +531,7 @@ if QT_AVAILABLE:
             self.documentChanged.emit(self.document())
 
         def _choose_export(self):
-            directory = QtWidgets.QFileDialog.getExistingDirectory(self, "发表图导出目录")
+            directory = QtWidgets.QFileDialog.getExistingDirectory(self, self._t("export_dir_title"))
             if not directory:
                 return
             target = Path(directory) / "publication-figure"
@@ -439,7 +549,7 @@ if QT_AVAILABLE:
             event = self._event
             self._rendering = True
             self._set_busy(True)
-            self.status.setText("正在生成原始高分辨率三维图…")
+            self.status.setText(self._t("rendering_hires"))
             try:
                 from .lamellar_3d import render_publication_scene
 
@@ -452,7 +562,7 @@ if QT_AVAILABLE:
                                                  cancel_event=event)
                 if event.is_set() or token != self._serial:
                     raise RuntimeError("Export cancelled")
-                self.status.setText("正在保存矢量文字、图像与来源…")
+                self.status.setText(self._t("saving_outputs"))
 
                 def job(**_):
                     from ..publication import export_publication_figure
@@ -470,9 +580,9 @@ if QT_AVAILABLE:
                 self._pool.start(worker)
             except Exception as exc:
                 if event.is_set():
-                    self.status.setText("已取消")
+                    self.status.setText(self._t("cancelled"))
                 elif token == self._serial:
-                    self.status.setText("导出未完成：" + str(exc))
+                    self.status.setText(self._t("export_failed") + str(exc))
             finally:
                 self._rendering = False
                 self._set_busy(self._worker is not None)
@@ -483,13 +593,13 @@ if QT_AVAILABLE:
         def _export_progress(self, token, kind, value):
             if token == self._serial:
                 current, total = value
-                self.status.setText(f"正在保存发表图与来源… {current} / {total}")
+                self.status.setText(self._t("saving_progress").format(current=current, total=total))
 
         @QtCore.Slot(int, str, object)
         def _export_finished(self, token, kind, result):
             self._worker = None
             if token == self._serial:
-                self.status.setText("已导出：" + str(Path(next(iter(result.values()))).parent))
+                self.status.setText(self._t("exported") + str(Path(next(iter(result.values()))).parent))
             self._set_busy(False)
             if self._pending and self.isVisible():
                 self._preview_timer.start()
@@ -498,7 +608,7 @@ if QT_AVAILABLE:
         def _export_failed(self, token, kind, error):
             self._worker = None
             if token == self._serial:
-                self.status.setText("导出未完成：" + str(error))
+                self.status.setText(self._t("export_failed") + str(error))
             self._set_busy(False)
             if self._pending and self.isVisible():
                 self._preview_timer.start()
@@ -512,10 +622,14 @@ if QT_AVAILABLE:
             self._serial += 1
             self._pending = False
             self._preview_timer.stop()
-            self.status.setText("已取消")
+            self.status.setText(self._t("cancelled"))
 
         def jobs_running(self):
-            return self._rendering or self._worker is not None
+            return self._rendering or self._worker is not None or self._pool.activeThreadCount() > 0
+
+        def wait_for_done(self, timeout_ms: int = 1500) -> bool:
+            self._pool.clear()
+            return bool(self._pool.waitForDone(int(timeout_ms)))
 
         def showEvent(self, event):  # noqa: N802
             super().showEvent(event)
@@ -524,6 +638,7 @@ if QT_AVAILABLE:
         def closeEvent(self, event):  # noqa: N802
             self.cancel()
             self.documentChanged.emit(self.document())
+            self.wait_for_done(500)
             event.accept()
 
 else:

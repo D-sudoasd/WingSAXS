@@ -50,6 +50,8 @@ _TEXT = {
     "click_start": ("已选第一端点；再选第二端点。", "First endpoint selected; choose the second endpoint."),
     "export_filter": ("CSV 文件 (*.csv);;JSON 文件 (*.json)", "CSV files (*.csv);;JSON files (*.json)"),
     "export_done": ("测量已导出：{path}", "Measurements exported: {path}"),
+    "export_exists": ("文件已存在，是否覆盖？\n{path}", "File already exists. Overwrite?\n{path}"),
+    "export_failed": ("导出失败：{reason}", "Export failed: {reason}"),
     "nothing_export": ("没有可导出的测量记录。", "There are no measurement records to export."),
     "point_name": ("点 / 邻域", "Point / patch"),
     "line_name": ("线剖面", "Line profile"),
@@ -243,6 +245,7 @@ if QT_AVAILABLE:
             splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
             self.image_plot = pg.PlotWidget(background="#161b22")
             self.image_plot.setObjectName("localMeasurementImage")
+            self.image_plot.setProperty("plotTheme", "dark")
             self.image_plot.setMinimumSize(360, 260)
             self.image_plot.setLabel("bottom", "Detector column", units="pixel")
             self.image_plot.setLabel("left", "Detector row", units="pixel")
@@ -490,6 +493,10 @@ if QT_AVAILABLE:
             self.patch_radius.setVisible(is_point)
             self.roi_width_label.setVisible(is_roi)
             self.roi_half_width.setVisible(is_roi)
+            note = _tr("gap_hint", self.language)
+            if is_roi:
+                note += " " + _tr("interpretation", self.language)
+            self.boundary_note.setText(note)
 
         def _current_hint(self) -> str:
             mode = str(self.mode_combo.currentData() or "point")
@@ -525,6 +532,14 @@ if QT_AVAILABLE:
                 if high <= low:
                     high = low + 1.0
             self.image_item.setImage(display, autoLevels=False, levels=(float(low), float(high)))
+            self.image_item.setRect(
+                QtCore.QRectF(
+                    -0.5,
+                    -0.5,
+                    float(self._data.shape[1]),
+                    float(self._data.shape[0]),
+                )
+            )
             self.image_plot.setRange(xRange=(-0.5, self._data.shape[1] - 0.5),
                                      yRange=(-0.5, self._data.shape[0] - 0.5), padding=0.02)
             self.status.setText(self._current_hint())
@@ -697,48 +712,94 @@ if QT_AVAILABLE:
             if not 0 <= index < len(self._records):
                 return
             record = self._records[index]
+            english = self.language.lower().startswith("en")
             if isinstance(record, LineProfile):
                 self._render_profile(record)
                 width = record.fwhm.value
                 if width is None:
-                    fwhm_text = f"FWHM unavailable: {record.fwhm.reason}."
+                    fwhm_text = (
+                        f"FWHM unavailable: {record.fwhm.reason}."
+                        if english
+                        else f"FWHM 不可用：{record.fwhm.reason}。"
+                    )
                 else:
-                    fwhm_text = f"FWHM = {width:.6g} {_display_unit(record.fwhm.x_unit)}; status: {record.fwhm.status}."
+                    fwhm_text = (
+                        f"FWHM = {width:.6g} {_display_unit(record.fwhm.x_unit)}; status: {record.fwhm.status}."
+                        if english
+                        else f"FWHM = {width:.6g} {_display_unit(record.fwhm.x_unit)}；状态：{record.fwhm.status}。"
+                    )
                     if record.fwhm.length_proxy is not None:
-                        fwhm_text += f" 2π/FWHM = {record.fwhm.length_proxy:.6g} {_display_unit(record.fwhm.length_unit)} (profile-based proxy)."
-                self.details.setText(
-                    f"{fwhm_text}\n{_tr('fwhm_note', self.language)}\n"
+                        fwhm_text += (
+                            f" 2π/FWHM = {record.fwhm.length_proxy:.6g} {_display_unit(record.fwhm.length_unit)} (profile-based proxy)."
+                            if english
+                            else f" 2π/FWHM = {record.fwhm.length_proxy:.6g} {_display_unit(record.fwhm.length_unit)}（剖面宽度代理值）。"
+                        )
+                sample_summary = (
                     f"Observed samples: {int(np.count_nonzero(record.valid))}/{record.valid.size}; "
                     f"q unit: {_display_unit(record.q_unit)}; profile axis: {_display_unit(record.axis_unit)}."
+                    if english
+                    else f"有效观测点：{int(np.count_nonzero(record.valid))}/{record.valid.size}；"
+                    f"q 单位：{_display_unit(record.q_unit)}；剖面坐标：{_display_unit(record.axis_unit)}。"
                 )
+                self.details.setText(f"{fwhm_text}\n{_tr('fwhm_note', self.language)}\n{sample_summary}")
             elif isinstance(record, PointMeasurement):
                 self.profile_plot.clear()
-                spacing = (f"L = 2π/|q| = {record.spacing:.6g} {_display_unit(record.spacing_unit)}"
-                           if record.spacing is not None else "L = 2π/|q| unavailable for this q unit or q=0.")
-                self.details.setText(
-                    f"Pixel (column, row) = ({record.col}, {record.row}); I = {record.intensity:.6g}.\n"
-                    f"qx = {record.qx:.6g}, qy = {record.qy:.6g}, |q| = {record.q:.6g} {_display_unit(record.q_unit)}.\n"
-                    f"{spacing}\nPatch: n={record.patch_count}, mean={record.patch_mean:.6g}, "
-                    f"median={record.patch_median:.6g}, SD={record.patch_std:.6g}.\n{_tr('physical_note', self.language)}"
-                )
+                if record.spacing is not None:
+                    spacing = f"L = 2π/|q| = {record.spacing:.6g} {_display_unit(record.spacing_unit)}"
+                else:
+                    spacing = (
+                        "L = 2π/|q| unavailable for this q unit or q=0."
+                        if english
+                        else "当前 q 单位或 q=0 无法给出 L = 2π/|q|。"
+                    )
+                if english:
+                    self.details.setText(
+                        f"Pixel (column, row) = ({record.col}, {record.row}); I = {record.intensity:.6g}.\n"
+                        f"qx = {record.qx:.6g}, qy = {record.qy:.6g}, |q| = {record.q:.6g} {_display_unit(record.q_unit)}.\n"
+                        f"{spacing}\nPatch: n={record.patch_count}, mean={record.patch_mean:.6g}, "
+                        f"median={record.patch_median:.6g}, SD={record.patch_std:.6g}.\n{_tr('physical_note', self.language)}"
+                    )
+                else:
+                    self.details.setText(
+                        f"像素 (列, 行) = ({record.col}, {record.row})；I = {record.intensity:.6g}。\n"
+                        f"qx = {record.qx:.6g}，qy = {record.qy:.6g}，|q| = {record.q:.6g} {_display_unit(record.q_unit)}。\n"
+                        f"{spacing}\n邻域统计：n={record.patch_count}，均值={record.patch_mean:.6g}，"
+                        f"中位数={record.patch_median:.6g}，标准差={record.patch_std:.6g}。\n{_tr('physical_note', self.language)}"
+                    )
             else:
                 self.profile_plot.clear()
-                axis = "unavailable" if record.orientation_deg is None else f"{record.orientation_deg:.4f}° from +qx"
-                eigen = record.eigenvalue_ratio
-                ratio_text = "unavailable" if eigen is None else f"{eigen:.4g}"
-                self.details.setText(
-                    f"Observed q-space principal axis: {axis}.\n"
-                    f"Pixels: {record.n_pixels}; eigenvalue ratio: {ratio_text}; status: {record.status}.\n"
-                    f"Weights: {record.weighting}.\n{record.interpretation}"
+                axis = (
+                    ("unavailable" if english else "不可用")
+                    if record.orientation_deg is None
+                    else (
+                        f"{record.orientation_deg:.4f}° from +qx"
+                        if english
+                        else f"相对 +qx 为 {record.orientation_deg:.4f}°"
+                    )
                 )
+                eigen = record.eigenvalue_ratio
+                ratio_text = ("unavailable" if english else "不可用") if eigen is None else f"{eigen:.4g}"
+                if english:
+                    self.details.setText(
+                        f"Observed q-space principal axis: {axis}.\n"
+                        f"Pixels: {record.n_pixels}; eigenvalue ratio: {ratio_text}; status: {record.status}.\n"
+                        f"Weights: {record.weighting}.\n{record.interpretation}"
+                    )
+                else:
+                    self.details.setText(
+                        f"观测 q 空间主轴：{axis}。\n"
+                        f"有效像素数：{record.n_pixels}；特征值比：{ratio_text}；状态：{record.status}。\n"
+                        f"权重：{record.weighting}。\n{record.interpretation}"
+                    )
             self._draw_measurement_overlays()
 
         def _render_profile(self, record: LineProfile) -> None:
             self.profile_plot.clear()
-            distance = "路径距离" if not self.language.lower().startswith("en") else "Path distance"
+            english = self.language.lower().startswith("en")
+            distance = "Path distance" if english else "路径距离"
             self.profile_plot.getPlotItem().getAxis("bottom").enableAutoSIPrefix(False)
             self.profile_plot.setLabel("bottom", f"{distance} ({_display_unit(record.axis_unit)})")
-            intensity = "观测强度" if not self.language.lower().startswith("en") else "Observed intensity"
+            intensity = "Observed intensity" if english else "观测强度"
             self.profile_plot.setLabel("left", intensity)
             self.profile_plot.plot(
                 record.axis, record.intensity, pen=pg.mkPen("#246b8e", width=2),
@@ -753,7 +814,12 @@ if QT_AVAILABLE:
                 if crossing is not None:
                     self.profile_plot.addItem(pg.InfiniteLine(pos=crossing, angle=90,
                                                              pen=pg.mkPen("#a65e20", style=QtCore.Qt.PenStyle.DashLine)))
-            self.profile_plot.setTitle(f"Observed samples: {int(np.count_nonzero(record.valid))}/{record.valid.size}")
+            valid_count = int(np.count_nonzero(record.valid))
+            self.profile_plot.setTitle(
+                f"Observed samples: {valid_count}/{record.valid.size}"
+                if english
+                else f"有效观测点：{valid_count}/{record.valid.size}"
+            )
 
         def _draw_measurement_overlays(self) -> None:
             for item in self._overlay_items:
@@ -819,16 +885,32 @@ if QT_AVAILABLE:
             )
             if not path:
                 return
-            if path.lower().endswith(".json") or "JSON" in selected_filter.upper():
-                target = Path(path)
-                if target.suffix.lower() != ".json":
-                    target = target.with_suffix(".json")
-                export_local_measurements_json(target, self._records, overwrite=True)
-            else:
-                target = Path(path)
-                if target.suffix.lower() != ".csv":
-                    target = target.with_suffix(".csv")
-                export_local_measurements_csv(target, self._records, overwrite=True)
+            use_json = path.lower().endswith(".json") or "JSON" in selected_filter.upper()
+            target = Path(path)
+            expected_suffix = ".json" if use_json else ".csv"
+            if target.suffix.lower() != expected_suffix:
+                target = target.with_suffix(expected_suffix)
+            overwrite = False
+            if target.exists():
+                answer = QtWidgets.QMessageBox.question(
+                    self,
+                    title,
+                    _tr("export_exists", self.language).format(path=target),
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No,
+                )
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+                overwrite = True
+            try:
+                if use_json:
+                    export_local_measurements_json(target, self._records, overwrite=overwrite)
+                else:
+                    export_local_measurements_csv(target, self._records, overwrite=overwrite)
+            except (OSError, ValueError, TypeError) as exc:
+                self.status.setText(_tr("export_failed", self.language).format(reason=exc))
+                return
             self.status.setText(_tr("export_done", self.language).format(path=target))
 
         def export_to(self, path: str | Path, *, overwrite: bool = False) -> Path:

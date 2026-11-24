@@ -32,7 +32,15 @@ from .i18n import (
 )
 from .models import ParameterRow, ParameterTableModel
 from .project_document import ProjectDocumentController
-from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
+from .qt_compat import (
+    QT_AVAILABLE,
+    QtCore,
+    QtGui,
+    QtWidgets,
+    is_qt_valid,
+    require_qt,
+    safe_single_shot,
+)
 from .butterfly_workbench import ButterflyWorkbench
 from .butterfly_figure_export import new_figure_export_target, run_butterfly_figure_export
 from .figure_export_dialog import FigureExportDialog
@@ -1915,6 +1923,7 @@ if QT_AVAILABLE:
                     snapshot,
                     width_mm=float(values["width_mm"]),
                     dpi=int(values["dpi"]),
+                    journal_style=values.get("journal_style"),
                 )
             except (FileExistsError, OSError, RuntimeError, TypeError, ValueError) as exc:
                 dialog.set_export_error(exc)
@@ -1950,6 +1959,7 @@ if QT_AVAILABLE:
             *,
             width_mm: float,
             dpi: int = 600,
+            journal_style: str | None = None,
         ) -> int:
             """Queue a detached measurement-figure snapshot on the shared pool."""
 
@@ -1968,6 +1978,8 @@ if QT_AVAILABLE:
             export_context = deepcopy(dict(snapshot.get("context") or {}))
             export_context["figure_width_mm"] = float(width_mm)
             export_context["figure_dpi"] = int(dpi)
+            if journal_style is not None:
+                export_context["journal_style"] = str(journal_style)
             generation = self._generation.next()
             cancel_event = threading.Event()
             payload = {
@@ -2026,6 +2038,8 @@ if QT_AVAILABLE:
                     "cancel_event": cancel_event,
                 }
             )
+            if journal_style is not None:
+                payload["journal_style"] = str(journal_style)
             worker = AnalysisWorker(
                 run_butterfly_figure_export,
                 generation=generation,
@@ -2768,7 +2782,6 @@ if QT_AVAILABLE:
             center_row.addWidget(self._ellipse_center_labels["qy"])
             center_row.addWidget(self.ellipse_center_qy_spin)
 
-            angle_row = QtWidgets.QHBoxLayout()
             angle_container = QtWidgets.QWidget(self.ellipse_group)
             angle_row = QtWidgets.QHBoxLayout(angle_container)
             angle_row.setContentsMargins(0, 0, 0, 0)
@@ -2873,6 +2886,9 @@ if QT_AVAILABLE:
                 self._on_display_setting_changed
             )
             for spin in (
+                self.ridge_snr_threshold_spin,
+                self.ridge_min_peak_fraction_spin,
+                self.ridge_min_coverage_spin,
                 self.n_angular_bins_spin,
                 self.n_ridge_angles_spin,
                 self.n_radial_bins_spin,
@@ -3416,7 +3432,16 @@ if QT_AVAILABLE:
             self.coverage_label.setText(
                 f"{self._tr('metric.coverage')}: {self._metric_display['coverage']}"
             )
-            self.flags_label.setToolTip(self.flags_label.text())
+            from . import help_primary
+
+            flags_help_pair = help_primary.CONTROL_HELP.get("RefinementMainWindow", {}).get("flags_label")
+            if flags_help_pair is not None:
+                help_prefix = flags_help_pair[1 if self._language == "en" else 0]
+                tooltip = f"{help_prefix}\n{self.flags_label.text()}"
+            else:
+                tooltip = self.flags_label.text()
+            self.flags_label.setToolTip(tooltip)
+            self.flags_label.setWhatsThis(tooltip)
 
         def _render_status(self) -> None:
             values = dict(self._status_values)
@@ -7531,6 +7556,12 @@ if QT_AVAILABLE:
         def _snapshot_engine_document(self) -> dict[str, Any]:
             """Keep service state references so a failed load can be undone."""
 
+            snapshot_fn = getattr(self.engine, "snapshot_state", None)
+            if callable(snapshot_fn):
+                try:
+                    return {"__service_state__": snapshot_fn()}
+                except Exception:
+                    pass
             snapshot: dict[str, Any] = {}
             for name in (
                 "_poni",
@@ -7554,7 +7585,17 @@ if QT_AVAILABLE:
             return snapshot
 
         def _restore_engine_document(self, snapshot: Mapping[str, Any]) -> None:
+            if "__service_state__" in snapshot:
+                restore_fn = getattr(self.engine, "restore_state", None)
+                if callable(restore_fn):
+                    try:
+                        restore_fn(snapshot["__service_state__"])
+                        return
+                    except Exception:
+                        pass
             for name, value in snapshot.items():
+                if name == "__service_state__":
+                    continue
                 try:
                     setattr(self.engine, name, value)
                 except Exception:
@@ -7641,6 +7682,8 @@ if QT_AVAILABLE:
                 self.display_settings
             )
             snapshot["lamellar_view"] = self.lamellar_page.snapshot_state()
+            if hasattr(self, "butterfly_workbench"):
+                snapshot["butterfly_workbench"] = self.butterfly_workbench.snapshot_state()
             snapshot["local_measurements"] = self.local_measurement_page.document()
             snapshot["azimuthal_view"] = self.azimuthal_page.document()
             snapshot["density2d_view"] = self.density2d_page.document()
@@ -7830,6 +7873,19 @@ if QT_AVAILABLE:
             self._sync_fit_session_controls(preserve_edits=True)
             self._render_metric_labels()
             self._render_status()
+            if isinstance(self._last_result, Mapping):
+                self._update_measurements(self._last_result)
+            else:
+                self._update_measurements({})
+            if self.evolution_records:
+                self.plot_evolution(self.evolution_records)
+            else:
+                self.evolution_table.setRowCount(0)
+                self.evolution_parameter_combo.clear()
+                if self.evolution_plot is not None:
+                    self.evolution_plot.clear()
+            if "butterfly_workbench" in snapshot and hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.restore_state(snapshot["butterfly_workbench"])
             if "lamellar_view" in snapshot:
                 self.lamellar_page.restore_state(snapshot["lamellar_view"])
             self._sync_image_measurement_pages()
@@ -7998,7 +8054,26 @@ if QT_AVAILABLE:
                 )
                 if not chosen:
                     return False
-                path = chosen
+                candidate = Path(chosen)
+                if candidate.suffix.lower() != ".json":
+                    candidate = candidate.with_suffix(".json")
+                    if candidate.exists():
+                        english = self._language.lower().startswith("en")
+                        answer = QtWidgets.QMessageBox.question(
+                            self,
+                            self._tr("dialog.save_project"),
+                            (
+                                f"Project file already exists. Overwrite?\n{candidate}"
+                                if english
+                                else f"项目文件已存在，是否覆盖？\n{candidate}"
+                            ),
+                            QtWidgets.QMessageBox.StandardButton.Yes
+                            | QtWidgets.QMessageBox.StandardButton.No,
+                            QtWidgets.QMessageBox.StandardButton.No,
+                        )
+                        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                            return False
+                path = candidate
             try:
                 target = self._project_controller.save(path, self.project_to_dict())
             except (OSError, TypeError, ValueError) as exc:
@@ -8189,7 +8264,14 @@ if QT_AVAILABLE:
             self.evolution_table.setRowCount(len(rows))
             for row_index, row in enumerate(rows):
                 for column, key in enumerate(keys):
-                    self.evolution_table.setItem(row_index, column, QtWidgets.QTableWidgetItem(str(row.get(key, ""))))
+                    cell_value = row.get(key)
+                    if cell_value is None or (
+                        isinstance(cell_value, float) and not math.isfinite(cell_value)
+                    ):
+                        cell_text = ""
+                    else:
+                        cell_text = str(cell_value)
+                    self.evolution_table.setItem(row_index, column, QtWidgets.QTableWidgetItem(cell_text))
             ignored = {"time", "time_s", "frame", "index", "status", "path"}
             numeric_keys = [
                 str(key)
@@ -8308,11 +8390,38 @@ if QT_AVAILABLE:
 
         # ----- status and lifetime ---------------------------------------------
 
+        def _clear_busy_focus_widget(self, *_args: Any) -> None:
+            self._busy_focus_widget = None
+
+        def _remember_busy_focus_widget(self, widget: Any) -> None:
+            if not is_qt_valid(widget):
+                return
+            self._busy_focus_widget = widget
+            destroyed = getattr(widget, "destroyed", None)
+            if destroyed is not None:
+                try:
+                    destroyed.connect(
+                        self._clear_busy_focus_widget,
+                        QtCore.Qt.ConnectionType.UniqueConnection,
+                    )
+                except Exception:
+                    pass
+
         def _restore_busy_focus(self) -> None:
             focus_target = self._busy_focus_widget
             self._busy_focus_widget = None
-            if focus_target is not None and focus_target.isVisible() and focus_target.isEnabled():
-                QtCore.QTimer.singleShot(0, focus_target.setFocus)
+            if (
+                is_qt_valid(focus_target)
+                and focus_target.isVisible()
+                and focus_target.isEnabled()
+            ):
+                safe_single_shot(
+                    0,
+                    focus_target,
+                    lambda w=focus_target: w.setFocus()
+                    if (is_qt_valid(w) and w.isVisible() and w.isEnabled())
+                    else None,
+                )
 
         def _current_job_elapsed(self) -> float:
             if self._job_started_at is None:
@@ -8363,7 +8472,7 @@ if QT_AVAILABLE:
                     self._active_job_kind = str(kind)
                 self._job_elapsed_timer.start()
                 if self._busy_focus_widget is None:
-                    self._busy_focus_widget = self.focusWidget()
+                    self._remember_busy_focus_widget(self.focusWidget())
                 page_is_butterfly = (
                     hasattr(self, "pages")
                     and hasattr(self, "butterfly_page")
@@ -8374,7 +8483,13 @@ if QT_AVAILABLE:
                     if page_is_butterfly and self.butterfly_workbench.cancel_button.isVisible()
                     else self.cancel_button
                 )
-                QtCore.QTimer.singleShot(0, focus_target.setFocus)
+                safe_single_shot(
+                    0,
+                    focus_target,
+                    lambda w=focus_target: w.setFocus()
+                    if (is_qt_valid(w) and w.isVisible() and w.isEnabled())
+                    else None,
+                )
                 if hasattr(self, "butterfly_workbench"):
                     self.butterfly_workbench.set_job_status(
                         "cancelling" if self._cancel_pending else "running",
@@ -8496,11 +8611,25 @@ if QT_AVAILABLE:
                 except Exception:
                     pass
 
+        def _wait_child_pools_done(self, timeout_ms: int = 1500) -> None:
+            for page in (self.lamellar_page, self.azimuthal_page, self.density2d_page):
+                wait_fn = getattr(page, "wait_for_done", None)
+                if callable(wait_fn):
+                    wait_fn(timeout_ms)
+
         def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
             if self._closing:
                 event.ignore()
                 return
             self._closing = True
+            for timer_attr in (
+                "workflow_status_timer",
+                "_job_elapsed_timer",
+                "_figure_export_dialog_stale_timer",
+            ):
+                timer = getattr(self, timer_attr, None)
+                if is_qt_valid(timer) and callable(getattr(timer, "stop", None)):
+                    timer.stop()
             self.cancel_jobs()
             self.lamellar_page.shutdown()
             for page in (self.azimuthal_page, self.density2d_page):
@@ -8509,20 +8638,24 @@ if QT_AVAILABLE:
             if self._workers or self.lamellar_page.jobs_running() or self._measurement_jobs_running():
                 self._set_status("status.closing")
                 event.ignore()
-                QtCore.QTimer.singleShot(50, self._finish_close_when_idle)
+                safe_single_shot(50, self, self._finish_close_when_idle)
                 return
             self._thread_pool.waitForDone(1500)
+            self._wait_child_pools_done(1500)
             event.accept()
 
         def _measurement_jobs_running(self) -> bool:
             return any(page.jobs_running() for page in (self.azimuthal_page, self.density2d_page))
 
         def _finish_close_when_idle(self) -> None:
+            if not is_qt_valid(self):
+                return
             if self._workers or self.lamellar_page.jobs_running() or self._measurement_jobs_running():
-                QtCore.QTimer.singleShot(50, self._finish_close_when_idle)
+                safe_single_shot(50, self, self._finish_close_when_idle)
                 return
             self._thread_pool.clear()
             self._thread_pool.waitForDone(1500)
+            self._wait_child_pools_done(1500)
             self._closing = False
             self.close()
 

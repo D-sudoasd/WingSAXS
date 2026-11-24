@@ -184,14 +184,23 @@ def style_plot(plot: Any) -> None:
 
     if not QT_AVAILABLE or plot is None:
         return
-    plot.setBackground(COLORS["surface"])
+    is_dark = str(plot.property("plotTheme") or "").strip().lower() == "dark"
+    if is_dark:
+        axis_pen = "#3b4454"
+        text_pen = "#c4cedb"
+        grid_alpha = 0.18
+    else:
+        plot.setBackground(COLORS["surface"])
+        axis_pen = COLORS["border"]
+        text_pen = COLORS["muted"]
+        grid_alpha = 0.14
     for name in ("bottom", "left"):
         axis = plot.getAxis(name)
-        axis.setPen(COLORS["border"])
-        axis.setTextPen(COLORS["muted"])
+        axis.setPen(axis_pen)
+        axis.setTextPen(text_pen)
         axis.setStyle(tickFont=QtGui.QFont("Segoe UI", 9), autoExpandTextSpace=True)
-        axis.label.setDefaultTextColor(QtGui.QColor(COLORS["muted"]))
-    plot.showGrid(x=True, y=True, alpha=0.14)
+        axis.label.setDefaultTextColor(QtGui.QColor(text_pen))
+    plot.showGrid(x=True, y=True, alpha=grid_alpha)
 
 
 __all__ = ["COLORS", "apply_theme", "style_plot"]

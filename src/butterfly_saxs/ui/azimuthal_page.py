@@ -14,7 +14,7 @@ from ..azimuthal_analysis import (
     fit_azimuthal_peaks,
     measure_azimuthal_profile,
 )
-from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets, require_qt
+from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets, require_qt, safe_single_shot
 from .workers import AnalysisWorker, GenerationGuard
 
 
@@ -355,26 +355,32 @@ if QT_AVAILABLE:
             if not upper > lower:
                 self.invalidate(self._tr("analysis_error").format(error="q map has no radial range"))
                 raise ValueError("q map has no radial range")
-            self.q_min_spin.setRange(lower, upper)
-            self.q_max_spin.setRange(lower, upper)
-            span = upper - lower
-            self.q_min_spin.setSingleStep(max(span / 100.0, np.finfo(float).eps))
-            self.q_max_spin.setSingleStep(max(span / 100.0, np.finfo(float).eps))
-            self.q_min_spin.setDecimals(10)
-            self.q_max_spin.setDecimals(10)
-            unit_suffix = f" {_display_q_unit(self.q_unit)}"
-            self.q_min_spin.setSuffix(unit_suffix)
-            self.q_max_spin.setSuffix(unit_suffix)
-            if (previous_window and _same_q_unit(previous_unit, self.q_unit)
-                    and previous_window[1] > previous_window[0]):
-                q_min = float(np.clip(previous_window[0], lower, upper))
-                q_max = float(np.clip(previous_window[1], lower, upper))
-                if q_max <= q_min:
+            self.q_min_spin.blockSignals(True)
+            self.q_max_spin.blockSignals(True)
+            try:
+                self.q_min_spin.setRange(lower, upper)
+                self.q_max_spin.setRange(lower, upper)
+                span = upper - lower
+                self.q_min_spin.setSingleStep(max(span / 100.0, np.finfo(float).eps))
+                self.q_max_spin.setSingleStep(max(span / 100.0, np.finfo(float).eps))
+                self.q_min_spin.setDecimals(10)
+                self.q_max_spin.setDecimals(10)
+                unit_suffix = f" {_display_q_unit(self.q_unit)}"
+                self.q_min_spin.setSuffix(unit_suffix)
+                self.q_max_spin.setSuffix(unit_suffix)
+                if (previous_window and _same_q_unit(previous_unit, self.q_unit)
+                        and previous_window[1] > previous_window[0]):
+                    q_min = float(np.clip(previous_window[0], lower, upper))
+                    q_max = float(np.clip(previous_window[1], lower, upper))
+                    if q_max <= q_min:
+                        q_min, q_max = lower, upper
+                else:
                     q_min, q_max = lower, upper
-            else:
-                q_min, q_max = lower, upper
-            self.q_min_spin.setValue(q_min)
-            self.q_max_spin.setValue(q_max)
+                self.q_min_spin.setValue(q_min)
+                self.q_max_spin.setValue(q_max)
+            finally:
+                self.q_min_spin.blockSignals(False)
+                self.q_max_spin.blockSignals(False)
             self.profile = None
             self.fit_result = None
             self.analyze_button.setEnabled(not self.jobs_running())
@@ -527,12 +533,18 @@ if QT_AVAILABLE:
             self._closed = True
             self._generation.next()
 
+        def wait_for_done(self, timeout_ms: int = 1500) -> bool:
+            """Drain the private worker pool cleanly during teardown."""
+            self._thread_pool.clear()
+            return bool(self._thread_pool.waitForDone(int(timeout_ms)))
+
         def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
             self.shutdown()
             if self.jobs_running():
                 event.ignore()
-                QtCore.QTimer.singleShot(50, self.close)
+                safe_single_shot(50, self, self.close)
                 return
+            self.wait_for_done()
             event.accept()
 
         def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API

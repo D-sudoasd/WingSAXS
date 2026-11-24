@@ -32,6 +32,10 @@ _TEXT = {
     "saved": ("结果已保存：\n{paths}", "Results saved:\n{paths}"),
     "save_title": ("导出投影 FFT", "Export projection FFT"),
     "save_filter": ("压缩数组 (*.npz)", "Compressed arrays (*.npz)"),
+    "overwrite_prompt": (
+        "目标输出文件已存在，是否覆盖？\n{paths}",
+        "Output file(s) already exist. Overwrite?\n{paths}",
+    ),
     "notice_title": ("投影 FFT 结果", "Projection FFT results"),
     "canvas_hint": (
         "左：投影密度；右：归一化 FFT 功率（对数色标）",
@@ -162,7 +166,8 @@ if QT_AVAILABLE:
                 render_lamellar_scattering(
                     self._result, figure=self.figure, language=self._language
                 )
-                self.canvas.draw_idle()
+                if self.canvas.isVisible():
+                    self.canvas.draw_idle()
                 self.export_button.setEnabled(True)
                 diagnostics = self._result.diagnostics
                 warning_lines = diagnostics.get("warnings", [])
@@ -173,11 +178,18 @@ if QT_AVAILABLE:
                     f"{value:.3g}" for value in diagnostics["nyquist_q_xy"]
                 )
                 unit = self._result.q_unit
-                detail = (
-                    f"Δq = {resolution} {unit}; q Nyquist = {nyquist} {unit}. "
-                    f"Minimum slab dimension = "
-                    f"{diagnostics['thinnest_slab_dimension_pixels']:.2f} px."
-                )
+                if str(self._language).lower().startswith("zh"):
+                    detail = (
+                        f"Δq = {resolution} {unit}；奈奎斯特 q = {nyquist} {unit}。"
+                        f"最薄片层像素尺寸 = "
+                        f"{diagnostics['thinnest_slab_dimension_pixels']:.2f} px。"
+                    )
+                else:
+                    detail = (
+                        f"Δq = {resolution} {unit}; q Nyquist = {nyquist} {unit}. "
+                        f"Minimum slab dimension = "
+                        f"{diagnostics['thinnest_slab_dimension_pixels']:.2f} px."
+                    )
                 if warning_lines:
                     detail += "\n" + "\n".join(warning_lines)
                     self.status.setStyleSheet("color: #805722; padding: 4px 0;")
@@ -192,6 +204,10 @@ if QT_AVAILABLE:
             finally:
                 self.calculate_button.setEnabled(True)
 
+        def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+            super().showEvent(event)
+            self.canvas.draw_idle()
+
         def _export(self) -> None:
             if self._result is None:
                 return
@@ -203,11 +219,34 @@ if QT_AVAILABLE:
             )
             if not chosen:
                 return
+            target = Path(chosen)
+            if target.suffix.lower() != ".npz":
+                target = target.with_suffix(".npz")
+            existing = [
+                candidate
+                for candidate in (target, target.with_suffix(".json"), target.with_suffix(".png"))
+                if candidate.exists()
+            ]
+            overwrite = False
+            if existing:
+                answer = QtWidgets.QMessageBox.question(
+                    self,
+                    _t("notice_title", self._language),
+                    _t("overwrite_prompt", self._language).format(
+                        paths="\n".join(str(path) for path in existing)
+                    ),
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No,
+                )
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+                overwrite = True
             try:
                 paths = export_lamellar_scattering(
                     self._result,
-                    chosen,
-                    overwrite=False,
+                    target,
+                    overwrite=overwrite,
                     language=self._language,
                 )
             except (OSError, ValueError, TypeError) as exc:

@@ -872,7 +872,7 @@ if QT_AVAILABLE:
             if not state.calibrated:
                 unit_text += " · uncalibrated" if english else " · 未标定"
             next_pair = self._NEXT_TEXT.get(state.next_step_key, (state.next_step_key, state.next_step_key))
-            if state.trace_method == "annular_peak":
+            if state.trace_method == "annular_peak" and state.next_step_key not in {"load", "identify", "wait", "retry"}:
                 next_pair = (
                     ("复核各环峰位后，评估对角配对的双椭圆", "Review ring peaks, then evaluate the paired ellipses")
                     if state.next_step_key == "evaluate" else

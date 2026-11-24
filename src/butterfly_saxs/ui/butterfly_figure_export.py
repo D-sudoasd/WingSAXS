@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,14 @@ def run_butterfly_figure_export(*, payload: Mapping[str, Any], **_: Any) -> dict
             progress_callback({"percent": int(percent), "phase": str(phase)})
 
     comparison_inputs = {"model": payload["model"]} if payload.get("model") is not None else {}
+    journal_style = payload.get("journal_style")
+    extra_kwargs: dict[str, Any] = {}
+    if journal_style is not None:
+        sig = inspect.signature(export_butterfly_figure)
+        if "journal_style" in sig.parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+        ):
+            extra_kwargs["journal_style"] = str(journal_style)
     return export_butterfly_figure(
         payload["target"],
         observed=payload["observed"],
@@ -46,6 +55,7 @@ def run_butterfly_figure_export(*, payload: Mapping[str, Any], **_: Any) -> dict
         cancel_event=payload["cancel_event"],
         progress=report_progress,
         **comparison_inputs,
+        **extra_kwargs,
     )
 
 

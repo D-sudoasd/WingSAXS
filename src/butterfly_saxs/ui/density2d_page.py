@@ -15,8 +15,17 @@ from ..density2d import (
     export_density2d_bundle,
 )
 from ..settings import canonical_q_unit
-from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets, require_qt
+from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets, require_qt, safe_single_shot
 from .workers import AnalysisWorker, GenerationGuard
+
+
+def _display_q_unit(unit: str) -> str:
+    canonical = canonical_q_unit(unit)
+    return {
+        "nm⁻¹": "nm^-1",
+        "Å⁻¹": "A^-1",
+        "pixel-q": "pixel-q",
+    }.get(canonical, str(unit or "unknown"))
 
 
 def _analyze_frame(parameters: dict[str, Any]) -> Any:
@@ -378,8 +387,8 @@ if QT_AVAILABLE:
             self.q_max_spin.setRange(q_lower, q_upper)
             self.q_min_spin.setDecimals(10)
             self.q_max_spin.setDecimals(10)
-            self.q_min_spin.setSuffix(f" {self.q_unit}")
-            self.q_max_spin.setSuffix(f" {self.q_unit}")
+            self.q_min_spin.setSuffix(f" {_display_q_unit(self.q_unit)}")
+            self.q_max_spin.setSuffix(f" {_display_q_unit(self.q_unit)}")
             step = max(span / 100.0, np.finfo(float).eps)
             self.q_min_spin.setSingleStep(step)
             self.q_max_spin.setSingleStep(step)
@@ -530,12 +539,18 @@ if QT_AVAILABLE:
             self._closed = True
             self._generation.next()
 
+        def wait_for_done(self, timeout_ms: int = 1500) -> bool:
+            """Drain the private worker pool cleanly during teardown."""
+            self._thread_pool.clear()
+            return bool(self._thread_pool.waitForDone(int(timeout_ms)))
+
         def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
             self.shutdown()
             if self.jobs_running():
                 event.ignore()
-                QtCore.QTimer.singleShot(50, self.close)
+                safe_single_shot(50, self, self.close)
                 return
+            self.wait_for_done()
             event.accept()
 
         def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
@@ -554,7 +569,7 @@ if QT_AVAILABLE:
             summary = self._tr("analyzed").format(
                 q0=profile.q_min,
                 q1=profile.q_max,
-                unit=profile.q_unit,
+                unit=_display_q_unit(profile.q_unit),
                 angle=profile.azimuth_center_deg,
                 width=profile.azimuth_half_width_deg,
                 bins=profile.n_supported_bins,
@@ -693,7 +708,7 @@ if QT_AVAILABLE:
                 self._tr("residual_title"), loc="left", fontproperties=font
             )
             self.residual_axes.set_ylabel(self._tr("residual"), fontproperties=font)
-            unit = self.q_unit
+            unit = _display_q_unit(self.q_unit)
             self.residual_axes.set_xlabel(self._tr("q_axis").format(unit=unit), fontproperties=font)
             self.profile_axes.tick_params(labelbottom=False)
 
@@ -711,7 +726,19 @@ if QT_AVAILABLE:
                     if not fit.success or fit.model_name not in self._selected_models():
                         continue
                     color = colors[fit.model_name]
-                    q_grid = np.geomspace(float(fit.q_min), float(fit.q_max), 180)
+                    q_lo = float(fit.q_min)
+                    q_hi = float(fit.q_max)
+                    if not (np.isfinite(q_lo) and np.isfinite(q_hi) and q_hi > q_lo):
+                        continue
+                    if q_lo > 0.0:
+                        q_grid = np.geomspace(q_lo, q_hi, 180)
+                    else:
+                        positive_profile_q = profile.q[supported & (profile.q > 0.0)]
+                        safe_lo = float(np.min(positive_profile_q)) if positive_profile_q.size else 0.0
+                        if 0.0 < safe_lo < q_hi:
+                            q_grid = np.geomspace(safe_lo, q_hi, 180)
+                        else:
+                            q_grid = np.linspace(max(q_lo, 0.0), q_hi, 180)
                     fitted_grid = evaluate_density2d_model(q_grid, fit.model_name, fit.parameters)
                     visible = np.isfinite(fitted_grid)
                     self.profile_axes.plot(
@@ -755,13 +782,15 @@ if QT_AVAILABLE:
                 self.canvas.draw_idle()
 
         def _fit_legend(self, fit: Density2DFit) -> str:
+            english = str(self.language).lower().startswith("en")
             if fit.model_name == "power_law":
-                return f"Power law · α={float(fit.parameters['alpha']):.3g}"
+                prefix = "Power law" if english else "幂律"
+                return f"{prefix} · α={float(fit.parameters['alpha']):.3g}"
             if "xi" in fit.parameters:
                 return f"OZ · ξ={float(fit.parameters['xi']):.3g} {fit.parameters['xi_unit']}"
             if "xi_candidate" in fit.parameters:
                 return f"OZ · ξ*={float(fit.parameters['xi_candidate']):.3g} {fit.parameters['xi_unit']}"
-            return "OZ empirical fit"
+            return "OZ empirical fit" if english else "OZ 经验拟合"
 
         def export_to(self, csv_path: str | Path, *, overwrite: bool = False) -> tuple[Path, Path]:
             if self.profile is None or not self.fits:

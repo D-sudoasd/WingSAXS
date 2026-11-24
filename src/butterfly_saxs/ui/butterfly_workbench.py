@@ -198,6 +198,7 @@ if QT_AVAILABLE:
             self.view_tabs = None
             if _pg is not None:
                 self.plot = _pg.PlotWidget(self)
+                self.plot.setProperty("plotTheme", "dark")
                 self.plot.setBackground("#16181e")
                 self.plot.showGrid(x=True, y=True, alpha=0.18)
                 self.plot.setMinimumHeight(112)
@@ -659,9 +660,10 @@ if QT_AVAILABLE:
             self.point_list.currentRowChanged.connect(self._on_point_list_changed)
             self.point_list.itemActivated.connect(lambda _item: self._on_point_list_changed(self.point_list.currentRow()))
             self.point_list.installEventFilter(self)
-            QtGui.QShortcut(QtGui.QKeySequence("Delete"), self.point_list).activated.connect(
-                self._exclude_selected_point
-            )
+            delete_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Delete"), self.point_list)
+            delete_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetShortcut)
+            delete_shortcut.activated.connect(self._exclude_selected_point)
+            self._point_delete_shortcut = delete_shortcut
             frame_layout.addWidget(self.point_title_label)
             frame_layout.addWidget(self.point_list)
             frame_layout.addStretch(1)
@@ -2580,12 +2582,7 @@ if QT_AVAILABLE:
             self._render_q_range_feedback()
             self._render_fit_source_state()
             self._render_fit_assessment()
-            self.normal_profile.empty_label.setText(
-                "Select a measured point" if english else "请选择测量点"
-            )
-            self.ellipse_diagnostic.empty_label.setText(
-                "Select a measured point" if english else "请选择测量点"
-            )
+            self._render_legacy_banner()
             self._render_magnification_label()
             self._render_excluded_count()
             self._render_batch_feedback()
@@ -3113,11 +3110,21 @@ if QT_AVAILABLE:
         def set_legacy_method(self, method: Any) -> None:
             value = str(method or "radial_peak")
             self._legacy_method = None if value == "butterfly_curvature" else value
+            self._render_legacy_banner()
+
+        def _render_legacy_banner(self) -> None:
             if self._legacy_method:
-                self.legacy_banner.setText(
-                    f"Loaded legacy ridge method '{self._legacy_method}'. "
-                    "Choose Identify arcs to explicitly use butterfly_curvature; the project method is preserved."
-                )
+                english = self._language.lower().startswith("en")
+                if english:
+                    self.legacy_banner.setText(
+                        f"Loaded legacy ridge method '{self._legacy_method}'. "
+                        "Choose Identify arcs to explicitly use butterfly_curvature; the project method is preserved."
+                    )
+                else:
+                    self.legacy_banner.setText(
+                        f"已载入旧版脊线方法“{self._legacy_method}”。"
+                        "点击“识别弧线”将显式使用 butterfly_curvature；原项目方法保持不变。"
+                    )
             self.legacy_banner.setVisible(bool(self._legacy_method))
 
         def _point_list_label(
@@ -4362,28 +4369,122 @@ if QT_AVAILABLE:
             apply_help(dialog, self._language)
             if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
                 return
+            title = "Keyboard edit" if english else "键盘编辑"
             kind = str(mode.currentData())
             if kind == "seed":
                 try:
-                    edit = {"type": "seed", "qx": float(qx_edit.text()), "qy": float(qy_edit.text())}
+                    qx_val = float(qx_edit.text().strip())
+                    qy_val = float(qy_edit.text().strip())
                 except ValueError:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        title,
+                        "Enter finite numeric values for qx and qy."
+                        if english
+                        else "请输入有效的有限数值作为 qx 和 qy。",
+                    )
                     return
+                if not (math.isfinite(qx_val) and math.isfinite(qy_val)):
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        title,
+                        "Coordinates must be finite numbers (NaN and Inf are not allowed)."
+                        if english
+                        else "坐标必须为有限数值（不允许 NaN 或 Inf）。",
+                    )
+                    return
+                edit = {"type": "seed", "qx": qx_val, "qy": qy_val}
             else:
                 pairs: list[list[float]] = []
                 try:
                     for token in points_edit.text().split(";"):
-                        x_text, y_text = token.strip().split(",", 1)
-                        pairs.append([float(x_text), float(y_text)])
+                        cleaned = token.strip()
+                        if not cleaned:
+                            continue
+                        x_text, y_text = cleaned.split(",", 1)
+                        x_val, y_val = float(x_text.strip()), float(y_text.strip())
+                        if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                            raise ValueError("non-finite coordinate")
+                        pairs.append([x_val, y_val])
                 except (TypeError, ValueError):
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        title,
+                        "Enter finite coordinate pairs formatted as 'qx,qy; qx,qy; …'."
+                        if english
+                        else "请输入有限坐标点对，格式如“qx,qy; qx,qy; …”。",
+                    )
                     return
                 if kind in {"exclude_rectangle", "include_rectangle"} and len(pairs) == 2:
                     (x0, y0), (x1, y1) = pairs
                     pairs = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
                     kind = "exclude_polygon" if kind == "exclude_rectangle" else "include_polygon"
                 if len(pairs) < 3:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        title,
+                        "Enter 2 opposite corners for a rectangle or at least 3 vertices for a polygon."
+                        if english
+                        else "矩形需输入 2 个对角点，多边形至少需输入 3 个顶点。",
+                    )
                     return
                 edit = {"type": kind, "points": pairs}
             self._on_edit_requested(edit)
+
+        def snapshot_state(self) -> dict[str, Any]:
+            """Capture visual/edit/result state for atomic project rollback."""
+
+            return {
+                "frame_data": dict(self._frame_data),
+                "current_frame": self._current_frame,
+                "edits": deepcopy(self._edits),
+                "redo_edits": deepcopy(self._redo_edits),
+                "result": deepcopy(self._result),
+                "result_fresh": bool(self._result_fresh),
+                "requested_q_window": self._requested_q_window,
+                "legacy_method": self._legacy_method,
+                "page_status_state": self._page_status_state,
+                "page_status_kind": self._page_status_kind,
+                "page_status_error": self._page_status_error,
+            }
+
+        def restore_state(self, snapshot: Mapping[str, Any]) -> None:
+            """Restore frame data, edits, and derived results after a failed load."""
+
+            if not isinstance(snapshot, Mapping):
+                return
+            frame_data = snapshot.get("frame_data")
+            if isinstance(frame_data, Mapping):
+                self.set_data(
+                    frame_data.get("observed"),
+                    qx=frame_data.get("qx"),
+                    qy=frame_data.get("qy"),
+                    valid_mask=frame_data.get("valid_mask"),
+                    q_unit=frame_data.get("q_unit"),
+                    source=snapshot.get("current_frame"),
+                )
+            self._edits = deepcopy(list(snapshot.get("edits") or []))
+            self._redo_edits = deepcopy(list(snapshot.get("redo_edits") or []))
+            self._settings["edits"] = deepcopy(self._edits)
+            self.qspace.set_edits(self._edits)
+            self._update_edit_buttons()
+            q_window = snapshot.get("requested_q_window")
+            self.set_q_window(q_window)
+            legacy_method = snapshot.get("legacy_method")
+            self._legacy_method = None if not legacy_method else str(legacy_method)
+            self._render_legacy_banner()
+            saved_result = snapshot.get("result")
+            if saved_result and snapshot.get("result_fresh"):
+                self.set_result(deepcopy(saved_result))
+            else:
+                self._page_status_state = str(
+                    snapshot.get("page_status_state")
+                    or ("ready" if self._has_loaded_data else "empty")
+                )
+                self._page_status_kind = str(snapshot.get("page_status_kind") or "")
+                self._page_status_error = snapshot.get("page_status_error")
+                self._render_page_status()
+            self._sync_action_state()
 
         def undo_edit(self) -> None:
             if not self._edits:

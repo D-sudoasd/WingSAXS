@@ -188,6 +188,7 @@ if QT_AVAILABLE:
             self._closed = False
             self._bounds: Any = None
             self._focus: str | None = None
+            self.focus_buttons: dict[str, Any] = {}
             self._debounce = QtCore.QTimer(self)
             self._debounce.setSingleShot(True)
             self._debounce.setInterval(140)
@@ -374,6 +375,7 @@ if QT_AVAILABLE:
                 bar.addWidget(self.camera_combo)
                 bar.addWidget(self._button("reset_camera", lambda: self.view3d.reset_camera(), tool=True))
             button = self._button("focus", lambda: self.focus_view(key), tool=True)
+            self.focus_buttons[key] = button
             bar.addWidget(button)
             layout.addLayout(bar)
             if key == "three_d":
@@ -402,6 +404,8 @@ if QT_AVAILABLE:
             self.controls.set_language(language)
             self.view3d.set_language(language)
             self.q_view.set_language(language)
+            if self._publication_dialog is not None:
+                self._publication_dialog.set_language(language)
             self.slider.setAccessibleName(tr("frame", language))
             self.speed.setAccessibleName("Playback frames per second" if language == "en" else "播放速度：每秒帧数")
             self._refresh_buttons()
@@ -826,6 +830,13 @@ if QT_AVAILABLE:
             self._focus = None if self._focus == name else name
             for key, panel in self.panels.items():
                 panel.setVisible(self._focus in (None, key))
+            for key, button in self.focus_buttons.items():
+                text_key = "unfocus" if self._focus == key else "focus"
+                button.setProperty("textKey", text_key)
+                label = tr(text_key, self.language)
+                button.setText(label)
+                button.setToolTip(label)
+                button.setAccessibleName(label)
             self.left.setVisible(self._focus in (None, "saxs", "two_d"))
             self.control_scroll.setVisible(self._focus is None and self.settings_button.isChecked())
 
@@ -881,8 +892,17 @@ if QT_AVAILABLE:
             self.cancel_jobs()
             self.invalidate("loading")
             self.status.setText(tr("loading", self.language))
-            path = str(Path(path).resolve())
-            self._start_job("import", lambda cancel, progress: (load_lamellar_sources(path), path))
+            resolved = str(Path(path).resolve())
+
+            def _load(cancel: threading.Event, _progress: Any) -> tuple[Any, str]:
+                if cancel.is_set():
+                    raise RuntimeError("import cancelled")
+                sources = load_lamellar_sources(resolved)
+                if cancel.is_set():
+                    raise RuntimeError("import cancelled")
+                return sources, resolved
+
+            self._start_job("import", _load)
 
         def _choose_export(self, sequence: bool) -> None:
             parent = QtWidgets.QFileDialog.getExistingDirectory(self, tr("export", self.language))
@@ -1022,7 +1042,8 @@ if QT_AVAILABLE:
             return hashlib.sha256(signature.encode()).hexdigest()
 
         def restore_document(self, document: Mapping[str, Any] | None, *, context_signature: str | None = None,
-                             observed: Any = None, qx: Any = None, qy: Any = None) -> None:
+                             observed: Any = None, qx: Any = None, qy: Any = None,
+                             queue_build: bool = True) -> None:
             self.cancel_jobs()
             document = dict(document or {})
             if document and document.get("version") != 1:
@@ -1064,13 +1085,18 @@ if QT_AVAILABLE:
             index = self.speed.findData(document.get("fps", 5))
             self.speed.setCurrentIndex(index if index >= 0 else 2)
             self._clear_views("building" if self._fresh else "stale")
-            self._queue_build()
+            if queue_build:
+                self._queue_build()
 
         def snapshot_state(self) -> dict[str, Any]:
             return {"document": self.document(), "sources": list(self.sources), "signature": self._context_signature}
 
         def restore_state(self, snapshot: Mapping[str, Any]) -> None:
-            self.restore_document(snapshot.get("document"), context_signature=snapshot.get("signature"))
+            self.restore_document(
+                snapshot.get("document"),
+                context_signature=snapshot.get("signature"),
+                queue_build=False,
+            )
             self.sources = list(snapshot.get("sources") or [])
             self._queue_build()
 
@@ -1081,8 +1107,22 @@ if QT_AVAILABLE:
                 self._publication_dialog.cancel()
                 self._publication_dialog.close()
 
+        def wait_for_done(self, timeout_ms: int = 1500) -> bool:
+            """Drain private thread pools cleanly during teardown."""
+            self._pool.clear()
+            ok = bool(self._pool.waitForDone(int(timeout_ms)))
+            if self._publication_dialog is not None and callable(
+                getattr(self._publication_dialog, "wait_for_done", None)
+            ):
+                ok = bool(self._publication_dialog.wait_for_done(int(timeout_ms))) and ok
+            return ok
+
         def jobs_running(self) -> bool:
-            return bool(self._workers) or bool(self._publication_dialog is not None and self._publication_dialog.jobs_running())
+            return (
+                bool(self._workers)
+                or self._pool.activeThreadCount() > 0
+                or bool(self._publication_dialog is not None and self._publication_dialog.jobs_running())
+            )
 
         def publication_context(self) -> dict[str, Any] | None:
             if (self.current_scene is None or not self.current_scene.metadata.get("available")
@@ -1099,10 +1139,16 @@ if QT_AVAILABLE:
             from .publication_panel import PublicationDialog
 
             if self._publication_dialog is None:
-                self._publication_dialog = PublicationDialog(self, document=self._publication_document,
-                                                              context_provider=self.publication_context)
+                self._publication_dialog = PublicationDialog(
+                    self,
+                    document=self._publication_document,
+                    context_provider=self.publication_context,
+                    language=self.language,
+                )
                 self._publication_dialog.documentChanged.connect(self._save_publication_document)
                 self._publication_dialog.finished.connect(self._publication_closed)
+            else:
+                self._publication_dialog.set_language(self.language)
             self._publication_dialog.show()
             self._publication_dialog.raise_()
 

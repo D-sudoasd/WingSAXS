@@ -356,12 +356,21 @@ if QT_AVAILABLE:
                     self._display_percentile if display_percentile is None else display_percentile,
                 )
             self._observed = _as_array(observed, dtype=float)
+            self._butterfly = {}
+            self._edits = []
+            self._point_by_id = {}
+            self._arc_segments_cache = {}
+            self._butterfly_revision += 1
+            self._selected_point_id = None
+            self._draft_points.clear()
             if self._observed is None or self._observed.ndim != 2:
                 self._observed = None
                 self._qx = self._qy = self._valid_mask = None
                 self._q_bounds = None
                 self._base_q_bounds = None
                 self._display = None
+                self.set_peak_landmarks(None)
+                self.set_fit_layers(None)
                 self._mesh_revision += 1
                 self._mesh_cache_key = None
                 self.update()
@@ -385,8 +394,6 @@ if QT_AVAILABLE:
                 percentile=self._display_percentile,
                 level_mask=active_mask,
             )
-            self._draft_points.clear()
-            self._selected_point_id = None
             self.set_peak_landmarks(None)
             self.set_fit_layers(None)
             self._mesh_revision += 1
@@ -408,6 +415,7 @@ if QT_AVAILABLE:
                     self._apply_q_window()
                 except (TypeError, ValueError):
                     return
+            self._prepare_display()
             self._mesh_revision += 1
             self._mesh_cache_key = None
             self.update()
@@ -1558,10 +1566,12 @@ if QT_AVAILABLE:
                         xvalue = 0. if x0 < 0 < x1 else xvalue
                         yvalue = 0. if y0 < 0 < y1 else yvalue
                     xp, yp = self._q_to_screen(xvalue, y0), self._q_to_screen(x0, yvalue)
-                    painter.drawText(QtCore.QRectF(xp.x() - 28, self._plot_rect.bottom() + 2, 56, 14),
-                                     QtCore.Qt.AlignmentFlag.AlignCenter, f"{xvalue:.2g}")
-                    painter.drawText(QtCore.QRectF(self._plot_rect.left() - 39, yp.y() - 7, 34, 14),
-                                     QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, f"{yvalue:.2g}")
+                    if xp is not None:
+                        painter.drawText(QtCore.QRectF(xp.x() - 28, self._plot_rect.bottom() + 2, 56, 14),
+                                         QtCore.Qt.AlignmentFlag.AlignCenter, f"{xvalue:.2g}")
+                    if yp is not None:
+                        painter.drawText(QtCore.QRectF(self._plot_rect.left() - 39, yp.y() - 7, 34, 14),
+                                         QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, f"{yvalue:.2g}")
                 painter.drawText(QtCore.QRectF(0, self.height() - 17, self.width(), 15),
                                  QtCore.Qt.AlignmentFlag.AlignCenter, f"qx ({self._q_unit})")
                 painter.drawText(int(self._plot_rect.left() + 3), int(self._plot_rect.top() + 11), "qy")

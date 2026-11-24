@@ -360,7 +360,13 @@ if QT_AVAILABLE:
                 return False
             key = self.COLUMNS[index.column()][0]
             if key == "vary" and role == QtCore.Qt.ItemDataRole.CheckStateRole:
-                value = value == QtCore.Qt.CheckState.Checked
+                if isinstance(value, bool):
+                    pass
+                else:
+                    try:
+                        value = QtCore.Qt.CheckState(value) == QtCore.Qt.CheckState.Checked
+                    except (TypeError, ValueError):
+                        value = value == QtCore.Qt.CheckState.Checked
             elif role not in (None, QtCore.Qt.ItemDataRole.EditRole, QtCore.Qt.ItemDataRole.CheckStateRole):
                 return False
             row = self._rows[index.row()]
@@ -368,9 +374,27 @@ if QT_AVAILABLE:
             if getattr(row, key) == new_value:
                 return False
             setattr(row, key, new_value)
-            self.dataChanged.emit(index, index, [QtCore.Qt.ItemDataRole.DisplayRole, role])
+            emitted_roles = [QtCore.Qt.ItemDataRole.DisplayRole]
+            if role is not None and role not in emitted_roles:
+                emitted_roles.append(role)
+            self.dataChanged.emit(index, index, emitted_roles)
             if key == "vary":
                 self.dataChanged.emit(index, index, [QtCore.Qt.ItemDataRole.CheckStateRole])
+            if key == "value":
+                derived_name = f"{row.name}_deg"
+                for derived_idx, derived_row in enumerate(self._rows):
+                    if derived_row.name == derived_name and derived_row.expression:
+                        try:
+                            derived_row.value = math.degrees(float(new_value))
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            deg_index = self.index(derived_idx, 1)
+                            self.dataChanged.emit(
+                                deg_index,
+                                deg_index,
+                                [QtCore.Qt.ItemDataRole.DisplayRole],
+                            )
             self.parameterChanged.emit(row.name, key, new_value)
             self.parametersChanged.emit()
             return True

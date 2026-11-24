@@ -97,10 +97,12 @@ class ProjectDocumentController:
             normalized["batch"] = batch_copy
         return normalized
 
-    def save(self, path: str | Path, document: Any) -> Path:
+    def save(self, path: str | Path, document: Any, *, overwrite: bool = True) -> Path:
         """Atomically publish strict JSON and return the resolved target."""
 
         target = Path(path).expanduser().resolve()
+        if not overwrite and target.exists():
+            raise FileExistsError(f"refusing to overwrite existing project file: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = self._serialize(document)
         text = json.dumps(payload, indent=2, allow_nan=False)

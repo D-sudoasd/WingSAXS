@@ -6,9 +6,14 @@ set "PROJECT_DIR=%~dp0"
 cd /d "%PROJECT_DIR%"
 set "PYTHON="
 set "PYTHON_ARGS="
+set "PYTHONW_ARGS="
 set "CHECK_ONLY=0"
 if /I "%~1"=="--check" set "CHECK_ONLY=1"
-set "PYTHONPATH=%PROJECT_DIR%src;%PYTHONPATH%"
+if defined PYTHONPATH (
+    set "PYTHONPATH=%PROJECT_DIR%src;%PYTHONPATH%"
+) else (
+    set "PYTHONPATH=%PROJECT_DIR%src"
+)
 
 rem Prefer project environments when available.
 for %%V in (.venv-project .venv venv) do call :try_project_python "%%V"
@@ -29,7 +34,6 @@ if "%CHECK_ONLY%"=="0" pause
 exit /b 1
 
 :python_ready
-set "PYTHONPATH=%PROJECT_DIR%src;%PYTHONPATH%"
 if defined PYTHON goto :doctor_project
 %PYTHON_ARGS% -m butterfly_saxs.doctor --require-ui --quiet
 set "DOCTOR_STATUS=%ERRORLEVEL%"
@@ -64,7 +68,11 @@ if "%CHECK_ONLY%"=="1" (
     exit /b 0
 )
 if defined PYTHON goto :start_project_gui
-start "" /D "%PROJECT_DIR%" %PYTHON_ARGS% -m butterfly_saxs.ui.launcher %*
+if defined PYTHONW_ARGS (
+    start "" /D "%PROJECT_DIR%" %PYTHONW_ARGS% -m butterfly_saxs.ui.launcher %*
+) else (
+    start "" /D "%PROJECT_DIR%" %PYTHON_ARGS% -m butterfly_saxs.ui.launcher %*
+)
 goto :start_status
 
 :start_project_gui
@@ -94,4 +102,6 @@ if errorlevel 1 exit /b 0
 py -%~1 -c "import butterfly_saxs; import PySide6, pyqtgraph, fabio, pyFAI" >nul 2>&1
 if errorlevel 1 exit /b 0
 set "PYTHON_ARGS=py -%~1"
+where pyw >nul 2>&1
+if not errorlevel 1 set "PYTHONW_ARGS=pyw -%~1"
 exit /b 0

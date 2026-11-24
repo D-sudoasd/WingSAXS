@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from . import main_window as _base
-from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets
+from .i18n import translate
+from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets, is_qt_valid, safe_single_shot
 
 _BASE_WINDOW = _base.RefinementMainWindow
 
@@ -201,11 +202,17 @@ def _workflow_lines(window: Any) -> tuple[str, bool]:
     result = getattr(window, "_last_result", None)
     failed = _result_failed(window)
     fit_session = getattr(window, "_fit_session", {})
-    review = (
+    raw_review = (
         str(fit_session.get("manual_status", "unreviewed"))
         if isinstance(fit_session, Mapping)
         else "unreviewed"
     )
+    lang = _language(window)
+    review_key = f"manual.{raw_review.strip().lower()}"
+    try:
+        review_label = translate(lang, review_key)
+    except KeyError:
+        review_label = raw_review
     geometry_only = _geometry_only(window)
     if result is None:
         result_value = text["result_none"]
@@ -227,7 +234,7 @@ def _workflow_lines(window: Any) -> tuple[str, bool]:
             ),
         ) or "WARN"
         raw_kind = str(getattr(window, "_last_result_kind", None) or "geometry")
-        if _language(window) == "zh_CN":
+        if lang == "zh_CN":
             kind = "几何测量" if raw_kind == "measure_geometry" else "几何精修"
         else:
             kind = (
@@ -240,8 +247,23 @@ def _workflow_lines(window: Any) -> tuple[str, bool]:
             quality=quality,
         )
     else:
-        kind = str(getattr(window, "_last_result_kind", None) or "result")
-        result_value = text["result_ready"].format(kind=kind, review=review)
+        raw_kind = str(getattr(window, "_last_result_kind", None) or "result").strip()
+        zh_kind_map = {
+            "preview": "预览",
+            "optimize": "优化",
+            "batch": "批处理",
+            "measure_geometry": "几何测量",
+            "refine_geometry": "几何精修",
+            "result": "计算",
+        }
+        if lang == "zh_CN" and raw_kind.lower() in zh_kind_map:
+            kind_label = zh_kind_map[raw_kind.lower()]
+        else:
+            try:
+                kind_label = translate(lang, f"job.{raw_kind.lower()}")
+            except KeyError:
+                kind_label = raw_kind
+        result_value = text["result_ready"].format(kind=kind_label, review=review_label)
 
     if observed is None:
         next_step = text["open_image"]
@@ -253,7 +275,7 @@ def _workflow_lines(window: Any) -> tuple[str, bool]:
         next_step = text["identify_arcs"]
     elif geometry_only:
         next_step = text["geometry_review"]
-    elif review in {"unreviewed", ""}:
+    elif raw_review in {"unreviewed", ""}:
         next_step = text["review"]
     else:
         next_step = text["export"]
@@ -271,9 +293,11 @@ def _workflow_lines(window: Any) -> tuple[str, bool]:
 
 
 def _refresh_workflow_guide(window: Any) -> None:
+    if not is_qt_valid(window):
+        return
     label = getattr(window, "workflow_status_label", None)
     group = getattr(window, "workflow_status_group", None)
-    if label is None or group is None:
+    if not is_qt_valid(label) or not is_qt_valid(group):
         return
     text = _GUIDE_TEXT[_language(window)]
     if group.title() != text["title"]:
@@ -293,7 +317,7 @@ def _refresh_workflow_guide(window: Any) -> None:
 def _ensure_widget_visible_exact(scroll: Any, widget: Any) -> None:
     """Scroll a focused control until both horizontal edges are visible."""
 
-    if scroll is None or widget is None or not widget.isVisible():
+    if not is_qt_valid(scroll) or not is_qt_valid(widget) or not widget.isVisible():
         return
     scroll.ensureWidgetVisible(widget, 0, 0)
     viewport = scroll.viewport()
@@ -319,10 +343,11 @@ class _FocusVisibilityFilter(QtCore.QObject):
         self.scroll = scroll
 
     def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802 - Qt API
-        if event.type() == QtCore.QEvent.Type.FocusIn:
-            QtCore.QTimer.singleShot(
+        if event.type() == QtCore.QEvent.Type.FocusIn and is_qt_valid(self.scroll) and is_qt_valid(watched):
+            safe_single_shot(
                 0,
-                lambda: _ensure_widget_visible_exact(self.scroll, watched),
+                watched,
+                lambda s=self.scroll, w=watched: _ensure_widget_visible_exact(s, w),
             )
         return False
 

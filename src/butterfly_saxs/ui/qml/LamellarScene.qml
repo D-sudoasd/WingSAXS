@@ -1,5 +1,5 @@
-import QtQuick 6.8
-import QtQuick3D 6.8
+import QtQuick
+import QtQuick3D
 
 // The Python side supplies normalized scene records.  The normalization is
 // uniform, so the specimen-plane frame and every oriented box remain exact
@@ -266,7 +266,7 @@ Item {
     MouseArea {
         id: interaction
         anchors.fill: parent
-        visible: root.showOverlays && !root.publicationMode
+        visible: !root.publicationMode
         hoverEnabled: false
         property bool dragging: false
         property real lastX: 0

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from math import cos, pi, sin
+from math import cos, isfinite, pi, sin
 from typing import Any
 
 from .i18n import translate, validate_language
@@ -424,9 +424,13 @@ if QT_AVAILABLE:
             levels: Any = None,
             extent: tuple[float, float, float, float] | None = None,
         ) -> None:
-            self.image_data = _as_array(data)
+            parsed = _as_array(data)
+            if parsed is None:
+                self.clear_image()
+                return
+            self.image_data = parsed
             self.image_extent = extent
-            if self.image_item is None or self.image_data is None:
+            if self.image_item is None:
                 return
             self._state_message = None
             self.state_label.clear()
@@ -799,9 +803,12 @@ if QT_AVAILABLE:
 
         def set_language(self, language: str) -> None:
             self._language = validate_language(language)
+            active_q_window = self._active_q_window
             for view in self.views.values():
                 view.set_language(self._language)
             self._set_overlay_axis_labels()
+            if active_q_window is not None:
+                self.set_q_view(active_q_window)
 
         def set_images(
             self,
@@ -1019,12 +1026,16 @@ else:
             self._title_key = _VIEW_TITLE_KEYS.get(title)
             self._language = validate_language(language)
             self.image_data: Any = None
+            self.raw_image_data: Any = None
             self.image_extent: tuple[float, float, float, float] | None = None
             self.ridge_points: list[tuple[float, float]] = []
+            self.rejected_ridge_points: list[tuple[float, float]] = []
             self.ellipses: list[Any] = []
             self.model_ellipses: list[Any] = []
             self.roi: tuple[float, float, float, float] | None = None
             self.roi_specs: list[Any] = []
+            self._state_message: str | None = None
+            self._active_q_window: tuple[float, float] | None = None
 
         @property
         def language(self) -> str:
@@ -1043,7 +1054,11 @@ else:
             extent: tuple[float, float, float, float] | None = None,
         ) -> None:
             del levels
-            self.image_data = _as_array(data)
+            parsed = _as_array(data)
+            if parsed is None:
+                self.clear_image()
+                return
+            self.image_data = parsed
             self.image_extent = extent
 
         def set_roi(self, roi: Any = None, *, render: bool = True) -> None:
@@ -1061,9 +1076,22 @@ else:
 
         set_data = set_image
 
-        def clear_image(self) -> None:
+        def clear_image(self, message: str | None = None) -> None:
             self.image_data = None
+            self.raw_image_data = None
             self.image_extent = None
+            self._state_message = str(message) if message else None
+
+        def set_q_view(self, q_window: Any = None, *, full: bool = False) -> None:
+            if full or q_window is None:
+                self._active_q_window = None
+                return
+            try:
+                low, high = (float(value) for value in q_window)
+                if isfinite(low) and isfinite(high) and low >= 0.0 and high > low:
+                    self._active_q_window = (low, high)
+            except (TypeError, ValueError):
+                return
 
         def set_overlay(
             self,

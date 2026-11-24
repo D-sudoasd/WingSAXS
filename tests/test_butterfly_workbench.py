@@ -127,7 +127,7 @@ def test_butterfly_edit_undo_project_roundtrip_and_cancel(qtbot, tmp_path):
     _set_frame(window)
     page = window.butterfly_workbench
     window.show()
-    qtbot.waitForWindowShown(window)
+    qtbot.waitExposed(window)
 
     page.correction_mode_combo.setCurrentIndex(page.correction_mode_combo.findData("seed"))
     page.correct_button.click()
@@ -176,11 +176,11 @@ def test_old_project_keeps_legacy_method_and_offscreen_pages_are_capturable(qtbo
     assert window.load_project(project_path)
     assert window.analysis_settings["ridge_method"] == "radial_peak"
     window.show()
-    qtbot.waitForWindowShown(window)
+    qtbot.waitExposed(window)
     assert window.butterfly_workbench.legacy_banner.isVisible()
     window.resize(980, 680)
     window.show()
-    qtbot.waitForWindowShown(window)
+    qtbot.waitExposed(window)
     first = tmp_path / "butterfly-980x680.png"
     second = tmp_path / "butterfly-1280x800.png"
     window.butterfly_workbench.save_screenshot(first)
@@ -351,7 +351,7 @@ def test_workbench_retains_extrapolated_ellipse_as_limited_candidate(qtbot, tmp_
     assert "环 L（nm）" in labels
     window.resize(980, 680)
     window.show()
-    qtbot.waitForWindowShown(window)
+    qtbot.waitExposed(window)
     shot = tmp_path / "workbench-ring-only.png"
     window.butterfly_workbench.save_screenshot(shot)
     assert shot.stat().st_size > 0

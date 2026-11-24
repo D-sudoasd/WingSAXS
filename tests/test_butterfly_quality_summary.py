@@ -378,7 +378,7 @@ def test_summary_long_observables_keep_full_bbox_at_980_and_1600(qtbot, tmp_path
     page.set_analysis_settings({"stage": "evaluate", "resamples": 32})
     page.set_result(result)
     window.show()
-    qtbot.waitForWindowShown(window)
+    qtbot.waitExposed(window)
     for width, name in ((980, "980"), (1600, "1600")):
         window.resize(width, 680 if width == 980 else 1050)
         qtbot.waitUntil(lambda: window.width() == width, timeout=1_000)
