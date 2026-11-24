@@ -7,6 +7,7 @@ import math
 import threading
 from typing import Any
 
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
@@ -15,6 +16,28 @@ import numpy as np
 from .serialization import json_safe
 from .settings import canonical_q_unit
 from .visualization import _diagnostic_q_axis_labels, _display_transform
+
+
+def save_agg_figure(
+    fig: Figure,
+    destination: Any,
+    *,
+    clear: bool = False,
+    **savefig_kwargs: Any,
+) -> Any:
+    """Save ``fig`` via object-oriented ``FigureCanvasAgg`` without touching ``pyplot`` or ``matplotlib.use``."""
+
+    if not isinstance(getattr(fig, "canvas", None), FigureCanvasAgg):
+        FigureCanvasAgg(fig)
+    try:
+        fig.savefig(destination, **savefig_kwargs)
+    finally:
+        if clear:
+            from matplotlib._pylab_helpers import Gcf
+
+            Gcf.destroy_fig(fig)
+            fig.clear()
+    return destination
 
 _SUPPORTED_WIDTHS_MM = (89.0, 183.0)
 _EXPORT_LOCK = threading.RLock()

@@ -1,11 +1,11 @@
 """Content identities for calculation and presentation reuse, without a cache."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 from importlib import metadata
 from pathlib import Path
 import platform
-from collections.abc import Mapping
 
 
 # The reviewed compact writer and scalar-list copy specialization preserve
@@ -21,19 +21,99 @@ _PREVIOUS_COMPACT_CHECKPOINT_SOURCES = frozenset({
     ('56e387c44681532539585d4051b7f8e61b4819276561dff5fa8009642ab21d77', '0ff804228c2cb7e06f00f759fd2b892aae5e1138b6dd03fd5fb13b8600859d35'),
     ('d7597a2daa437577c3bab935825405cde87d53642f782231031541cfe7341428', '869afa78dfa39e57f9a11b7612a6183a89fd42e154e028654884214890652cf1'),
     ('251a28278620099c46a0f6a28423faafb1ff6c9eb9d55307076622124eee599a', '8a9f78ef594741b8ae99aeefddc271a28cdd1608b2b46bb16176f4fe775434a4'),
-
     ("ef6238070ec330b5e585270692c60a74329e3752cc13582f31897be525237e0d", "ece30c4a0b985fb0f62b1d7b1bd580fc41c6f09de15af0f276c5dbc9544a655d"),
     ("4e424ac36a0006acdb1883aa11b3d4b571ff4284d26cf0fcaf05b52426d9b572", "e479cd669d4b3eb88c89dd5ff1caf972945f14aab0cb957c22752b6559bfe62a"),
     ("2c5aab4a065f3e1328eee1beccb8cbe918f13446f79657a7d81a5fecc856acfe", "81b94845dd17d7d71ac1e82a12b9d1f26079d5aeef9e938d58f6d11dc80a2b2c"),
     ("8647f887723d2bc4d9e6e425d95f896fcff9ae34314f2bf85a513823fdd610c4", "39440ba78e13379132cc0d05a03de8c831cf9f82f6ff2660d4ebc5259a002562"),
     ("24397a5b1e1a42dfa944e96f3bd3b7c806f6a72f4b294a6cdb31a18a0e46f696", "4a79ac625a5532324788e75c75eb48f1dc975b5ebf0ca0b1c1c7822fb3c3e584"),
     ("591075a8af41bc7a8147b96af6c1303e4ff85418b9d866eaf0cf4a6b04eac315", "8189d6c90654e5cb6777e8407b91c448a525bf10137c3bf0c4449cd891490cb7"),
+    ("245a4d97c55ad028a69b8690422078465c6bd2153b2dffbddeedb85f211f01de", "6df7f1ba052cfef67b5a0bec027a78ed71c178ca55bfc2adc3dda3feea7987be"),
+    ("2af9e72a526ee7a888f174a4ec83bcf66b5c16a3b3126e8751ddbe61bb9fc841", "dcdeb736798d129fed063d5dfd87e5e8146587904f8d9bd0bd03bae83168017d"),
 })
 _PRETTY_CHECKPOINT_SOURCES = frozenset({
     ("9d2451115cdd219bf26118b62f930a9ba350dc6237ee408d6fd81fa0c7a3c0fa", "e87ce353aaf1b07ef85c13243a9e1ffc7fd60f0034d03582a160c787fa891544"),
     ("bb12be937d5b105fd81714923ae9413f3388ab45d97c1b7578461b489cb7c9e3", "ff5cc51d19ca4438b0073b83e0741cc43791ded7656556b70259e515fc713049"),
 })
-_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "3ee714943e86aedf122e0f11e645496a3af933bbb3c2ce39e0fee8c00bf156b6"
+_CHECKPOINT_COMPATIBILITY_SOURCE_SHA256 = "94ad84e61ef1c6eb82a9402830e998721f91c147c0dc9340f4b811643d2aa8c2"
+
+# Subpackages that never participate in detector/reciprocal-space calculation.
+_NON_CALCULATION_PACKAGES = frozenset({
+    "ui",
+    "lamellar",
+    "preflight",
+    "delivery",
+    "_cli",
+    "__pycache__",
+})
+
+# Subpackages still excluded when computing headless report/presentation identity.
+_PRESENTATION_EXCLUDED_PACKAGES = frozenset({
+    "ui",
+    "preflight",
+    "delivery",
+    "_cli",
+    "__pycache__",
+})
+
+# Top-level presentation, export, CLI-contract, validation-gate, and I/O utility
+# modules excluded from calculation identity (unknown/new core modules and
+# calculation subpackages such as physics/, tracing/, observables/ remain included).
+_NON_CALCULATION_MODULES = frozenset({
+    "__init__.py",
+    "__main__.py",
+    "cli_contract.py",
+    "doctor.py",
+    "service.py",
+    "campaign.py",
+    "project.py",
+    "export.py",
+    "_export_schema.py",
+    "csv_utils.py",
+    "output_lock.py",
+    "path_contract.py",
+    "path_utils.py",
+    "file_identity.py",
+    "serialization.py",
+    "report.py",
+    "report_figures.py",
+    "report_measurements.py",
+    "comparison_report.py",
+    "publication.py",
+    "publication_export.py",
+    "publication_geometry.py",
+    "publication_models.py",
+    "publication_render.py",
+    "visualization.py",
+    "composite_figures.py",
+    "figure_support.py",
+    "fit_overlays.py",
+    "font_support.py",
+    "journal_style.py",
+    "annotation_pack.py",
+    "manual_evidence.py",
+    "p3_gate.py",
+    "p4_quality.py",
+    "p4_validation.py",
+    "benchmark_arcs.py",
+    "benchmark_initialization.py",
+    "benchmark_sequence.py",
+    "benchmark_t1.py",
+    "benchmark_t2.py",
+    "sequence_diagnostics.py",
+    "uncertainty_validation.py",
+    "validation.py",
+    "lamellar.py",
+})
+
+_NON_CALCULATION_PREFIXES = (
+    "report",
+    "delivery",
+    "benchmark",
+    "publication",
+    "lamellar_",
+    "preflight",
+    "doctor",
+)
 
 
 def _reviewed_checkpoint_builder_hash(source: bytes) -> str | None:
@@ -86,23 +166,50 @@ def calculation_producers_compatible(previous: object, current: object) -> bool:
     return previous == {**current, "sources": sources}
 
 
+def iter_calculation_source_files(
+    package_root: Path | None = None,
+    *,
+    presentation: bool = False,
+) -> list[tuple[str, Path]]:
+    """Return deterministic ``(posix_relpath, path)`` pairs for calculation/presentation hashing."""
+    folder = Path(__file__).parent if package_root is None else Path(package_root)
+    excluded_packages = (
+        _PRESENTATION_EXCLUDED_PACKAGES if presentation else _NON_CALCULATION_PACKAGES
+    )
+    entries: list[tuple[str, Path]] = []
+    for path in folder.rglob("*.py"):
+        if not path.is_file():
+            continue
+        rel_parts = path.relative_to(folder).parts
+        if any(part == "__pycache__" or part.startswith(".") for part in rel_parts):
+            continue
+        if len(rel_parts) > 1 and rel_parts[0] in excluded_packages:
+            continue
+        if not presentation:
+            if len(rel_parts) == 1 and (
+                path.name in _NON_CALCULATION_MODULES
+                or path.name.startswith(_NON_CALCULATION_PREFIXES)
+            ):
+                continue
+            if "figure" in path.stem:
+                continue
+        entries.append((path.relative_to(folder).as_posix(), path))
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
 def producer_identity(*, presentation: bool = False) -> dict:
     """Bind reuse to installed source bytes and relevant dependency versions.
 
     Presentation-only edits must not invalidate calculated detector results.
-    Unknown/new modules are included conservatively in the calculation set.
+    Calculation subpackages (e.g. ``physics/``, ``tracing/``, ``observables/``)
+    and unknown/new modules are included conservatively in the calculation set.
     No identity is reused between calls or stored outside the existing receipts.
     """
-    folder = Path(__file__).parent
-    sources = {}
-    excluded = {"__main__.py", "export.py", "output_lock.py", "font_support.py",
-                "visualization.py", "figure_support.py", "fit_overlays.py", "lamellar.py"}
-    prefixes = ("report", "delivery", "benchmark", "publication", "lamellar_", "preflight", "doctor")
-    for path in sorted(folder.glob("*.py")):
-        if not presentation and (path.name in excluded or path.name.startswith(prefixes)
-                                 or "figure" in path.stem):
-            continue
-        sources[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    sources = {
+        rel_posix: hashlib.sha256(path.read_bytes()).hexdigest()
+        for rel_posix, path in iter_calculation_source_files(presentation=presentation)
+    }
     versions = {"python": platform.python_version()}
     names = ("numpy", "scipy", "pyFAI", "fabio", "h5py", "tifffile", "PyYAML", "pillow")
     if presentation:
@@ -123,7 +230,13 @@ def exporter_identity() -> dict:
     """
     identity = producer_identity()
     folder = Path(__file__).parent
-    for name in ("export.py", "visualization.py", "font_support.py", "figure_support.py"):
+    for name in (
+        "export.py",
+        "_export_schema.py",
+        "visualization.py",
+        "font_support.py",
+        "figure_support.py",
+    ):
         path = folder / name
         if path.is_file():
             identity["sources"][name] = hashlib.sha256(path.read_bytes()).hexdigest()

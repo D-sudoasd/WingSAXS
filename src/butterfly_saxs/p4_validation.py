@@ -9,7 +9,6 @@ auditable before the external P3 evidence is complete.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -23,8 +22,10 @@ from scipy.spatial import cKDTree
 
 from .benchmark_t1 import DEFAULT_CASE_NAMES as T1_DEFAULT_CASE_NAMES
 from .csv_utils import read_csv_rows
+from .file_identity import sha256_file
 from .observables import ellipse_radius
 from .pipeline import analyze_frame
+from .serialization import json_safe, write_json_atomic
 
 
 SCHEMA_VERSION = "lamellarsaxs2d.p4_engineering.v1"
@@ -51,12 +52,7 @@ _R0_ANALYSIS_CONFIG = {
 }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+_sha256 = sha256_file
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -102,18 +98,7 @@ def _quality_status(value: Any) -> str | None:
     return status if status in {"PASS", "WARN", "FAIL"} else None
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, np.ndarray):
-        return [_jsonable(item) for item in value.tolist()]
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, np.generic):
-        return _jsonable(value.item())
-    if isinstance(value, float) and not np.isfinite(value):
-        return None
-    return value
+_jsonable = json_safe
 
 
 def _periodic_error_deg(left: float, right: float) -> float:
@@ -1178,12 +1163,9 @@ def run_p4_engineering(
         "report_json": report_path.as_posix(),
         "summary_csv": summary_path.as_posix(),
     }
-    report_path.write_text(
-        json.dumps(_jsonable(report), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(report_path, report, sort_keys=False)
     _write_summary_csv(report, summary_path)
-    return _jsonable(report)
+    return json_safe(report)
 
 
 __all__ = ["SCHEMA_VERSION", "run_p4_engineering"]

@@ -9,17 +9,17 @@ as well as a plain sequence of ``FrameFitResult`` objects.
 from __future__ import annotations
 
 import csv
-import io
+import hashlib
 import importlib.metadata as importlib_metadata
+import io
 import json
-import math
 import os
 import platform
 import re
 import shutil
 import tempfile
-import zipfile
 import uuid
+import zipfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timezone
@@ -29,6 +29,26 @@ from typing import Any
 
 import numpy as np
 
+from ._export_schema import (
+    CANONICAL_FRAME_SUMMARY_COLUMNS as _CANONICAL_FRAME_SUMMARY_COLUMNS,
+    CANONICAL_LOBE_COLUMNS,
+    CANONICAL_RIDGE_COLUMNS,
+    PARAMETER_BASE_COLUMNS,
+    STREAMING_PARAMETER_COLUMNS,
+    _MISSING,
+    _batch_ellipse_row,
+    _frame_base,
+    _frame_results,
+    _frame_summary_rows,
+    _json_text,
+    _lobe_measurement_rows,
+    _parameters,
+    _result_flags,
+    _ridge_points,
+    _scalar,
+    _value,
+    build_frame_summary_row,
+)
 from .batch import (
     BatchRunResult,
     FrameFitResult,
@@ -37,28 +57,14 @@ from .batch import (
     _config_with_file_fingerprints,
     _json_safe,
 )
-from .csv_utils import safe_csv_cell
-from .file_identity import file_version
+from .figure_support import save_agg_figure
+from .file_identity import file_version, sha256_file
 from .output_lock import output_lock
 from .producer import exporter_identity
 
 
-_MISSING = object()
-_FLAG_NAMES = (
-    "scientific_flags",
-    "flags",
-    "quality_flags",
-    "fit_flags",
-    "warnings",
-)
-
-
 def _artifact_digest(path: Path) -> str:
-    digest = __import__("hashlib").sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def _checkpoint_frame_signature(item: FrameFitResult) -> str | None:
@@ -67,14 +73,11 @@ def _checkpoint_frame_signature(item: FrameFitResult) -> str | None:
     try:
         record["result"] = _checkpoint_safe(item.result)
     except RecursionError:
-        # Non-checkpointed public exports also accept cyclic metadata. They
-        # retain the existing cycle-aware sidecar serialization but cannot
-        # acquire a new checkpoint-reuse proof from that object.
         return None
     record.pop("elapsed_s")
     record.pop("resumed")
     value = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return __import__("hashlib").sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _verify_zip_members(archive: zipfile.ZipFile, members: Iterable[str]) -> None:
@@ -99,14 +102,7 @@ def _publish_staged_bundle(
     force: bool,
     preserve_existing: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, Path]:
-    """Publish a complete known bundle with rollback on publication faults.
-
-    A directory cannot atomically replace a set of historical flat files on
-    every supported filesystem.  The transaction therefore backs up only the
-    exact known targets, verifies every staged artifact, publishes a commit
-    marker last, and restores the old generation if any replace fails.  No
-    unrelated user file is moved or deleted.
-    """
+    """Publish a complete known bundle with rollback on publication faults."""
 
     if not stage.exists():
         raise FileNotFoundError(f"staging directory does not exist: {stage}")
@@ -174,708 +170,12 @@ def _publish_staged_bundle(
                 elif target in published and target.exists():
                     target.unlink()
             except OSError:
-                # Preserve the original exception.  The known target remains
-                # visible for a later manual recovery if the filesystem itself
-                # refuses restoration.
                 pass
         raise
     finally:
         shutil.rmtree(backup, ignore_errors=True)
         shutil.rmtree(stage, ignore_errors=True)
     return normalized
-
-
-def _value(value: Any, *names: str, default: Any = None) -> Any:
-    for name in names:
-        if isinstance(value, Mapping) and name in value:
-            return value[name]
-        if hasattr(value, name):
-            return getattr(value, name)
-    return default
-
-
-def _sequence(value: Any) -> list[Any]:
-    if value is None or isinstance(value, (str, bytes)):
-        return [] if value is None else [value]
-    if isinstance(value, Mapping):
-        return [value]
-    try:
-        return list(value)
-    except TypeError:
-        return [value]
-
-
-def _json_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return json.dumps(
-        _json_safe(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-
-def _scalar(value: Any) -> Any:
-    """Convert numpy/Python scalar values for CSV without coercing arrays."""
-
-    if value is None or isinstance(value, (str, bool, int)):
-        return safe_csv_cell(value)
-    if isinstance(value, float):
-        return safe_csv_cell(value) if math.isfinite(value) else ""
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return _scalar(item())
-        except Exception:  # pragma: no cover
-            pass
-    if isinstance(value, (list, tuple, Mapping)):
-        return _json_text(value)
-    return safe_csv_cell(value) if isinstance(value, (str, int, float, bool)) else _json_text(value)
-
-
-def _as_mapping(value: Any) -> Mapping[str, Any] | None:
-    if isinstance(value, Mapping):
-        return value
-    if is_dataclass(value):
-        return {field.name: getattr(value, field.name) for field in fields(value)}
-    if hasattr(value, "__dict__"):
-        return vars(value)
-    return None
-
-
-def _result_mapping(item: FrameFitResult) -> Mapping[str, Any] | None:
-    return _as_mapping(item.result)
-
-
-def _frame_results(batch: Any) -> list[FrameFitResult]:
-    if isinstance(batch, BatchRunResult):
-        return list(batch.frame_results)
-    if hasattr(batch, "frame_results"):
-        return list(batch.frame_results)
-    result: list[FrameFitResult] = []
-    for index, item in enumerate(batch or []):
-        if isinstance(item, FrameFitResult):
-            result.append(item)
-        elif isinstance(item, Mapping):
-            frame = item.get("frame", item.get("frame_ref", item.get("path", f"frame_{index}")))
-            frame_ref = frame if isinstance(frame, FrameRef) else FrameRef(frame)
-            result.append(
-                FrameFitResult(
-                    frame=frame_ref,
-                    result=item.get("result", item.get("fit_result")),
-                    status=item.get("status", "ok"),
-                    error=item.get("error"),
-                    diagnostic=item.get("diagnostic"),
-                    warm_start_from=item.get("warm_start_from", item.get("lineage")),
-                )
-            )
-        else:
-            metadata = _value(item, "metadata", default={})
-            if not isinstance(metadata, Mapping):
-                metadata = {}
-            source = metadata.get("path", metadata.get("source", f"frame_{index}"))
-            frame_ref = FrameRef(
-                source,
-                frame_id=_value(item, "frame_id", "id", default=None),
-                time=_value(item, "timestamp", "time", default=metadata.get("time")),
-                metadata=metadata,
-            )
-            result.append(FrameFitResult(frame=frame_ref, result=item))
-    return result
-
-
-def _frame_base(item: FrameFitResult, index: int) -> dict[str, Any]:
-    frame = item.frame
-    return {
-        "frame_index": index,
-        "frame_id": _scalar(frame.frame_id),
-        "path": str(frame.path),
-        "frame_selector": _scalar(frame.frame_selector),
-        "dataset": _scalar(frame.dataset_id or None),
-        "time": _scalar(frame.time),
-        "status": item.status,
-        "error": _scalar(item.error) if item.error else "",
-        "diagnostic": _scalar(item.diagnostic) if item.diagnostic else "",
-        "warm_start_from": _scalar(item.warm_start_from) if item.warm_start_from else "",
-        "elapsed_s": _scalar(item.elapsed_s),
-        "resumed": bool(item.resumed),
-    }
-
-
-def _empty_parameter_source(value: Any) -> bool:
-    if value is None or value is _MISSING:
-        return True
-    if isinstance(value, Mapping):
-        return not value
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return not value
-    try:
-        return len(value) == 0
-    except (TypeError, AttributeError):
-        return False
-
-
-def _parameter_source(value: Any) -> tuple[Any, list[Any]]:
-    """Return the preferred parameter source and metadata contexts.
-
-    ``PipelineResult`` exposes a convenience ``parameters`` property that may
-    resolve to ``full2d.parameters``.  Looking at the explicit instance fields
-    first keeps a genuine top-level ``parameters`` result authoritative while
-    still allowing the nested full2d result to be exported when no top-level
-    field exists.
-    """
-
-    contexts: list[Any] = [value]
-    if isinstance(value, Mapping):
-        full2d = _value(value, "full2d", default=_MISSING)
-        nested = _value(full2d, "parameters", "params", default=_MISSING)
-        for name in ("parameters", "params"):
-            if name in value and not _empty_parameter_source(value[name]):
-                source = value[name]
-                if not _empty_parameter_source(nested):
-                    try:
-                        is_nested_alias = _json_safe(source) == _json_safe(nested)
-                    except (TypeError, ValueError):
-                        is_nested_alias = source is nested
-                    if is_nested_alias:
-                        return source, [full2d, value]
-                return source, contexts
-    else:
-        own = vars(value) if hasattr(value, "__dict__") else {}
-        for name in ("parameters", "params"):
-            if name in own and not _empty_parameter_source(own[name]):
-                return own[name], contexts
-
-    source = _value(value, "parameters", "params", default=_MISSING)
-    if not _empty_parameter_source(source):
-        # PipelineResult's property is an alias for its nested full2d source;
-        # retain that context so stderr/flags beside the nested parameters are
-        # not lost.  A distinct top-level attribute remains authoritative.
-        full2d = _value(value, "full2d", default=_MISSING)
-        nested = _value(full2d, "parameters", "params", default=_MISSING)
-        if not _empty_parameter_source(nested) and source is nested:
-            return nested, [full2d, value]
-        return source, contexts
-
-    full2d = _value(value, "full2d", default=_MISSING)
-    if full2d is not _MISSING and full2d is not None:
-        nested = _value(full2d, "parameters", "params", default=_MISSING)
-        if not _empty_parameter_source(nested):
-            return nested, [full2d, value]
-    source = _value(value, "values", default=_MISSING)
-    if not _empty_parameter_source(source):
-        return source, contexts
-    # PipelineResult calls its scalar observables ``observables``.  They are
-    # still frame parameters for a longitudinal export.
-    source = _value(value, "observables", default=_MISSING)
-    if not _empty_parameter_source(source):
-        return source, contexts
-    ellipse = _value(value, "ellipse_fit", "ellipse", default=None)
-    nested = _value(ellipse, "parameters", "params", default=_MISSING)
-    if not _empty_parameter_source(nested):
-        return nested, [ellipse, value]
-    return _MISSING, contexts
-
-
-def _first_context_value(contexts: Sequence[Any], names: Sequence[str]) -> Any:
-    for context in contexts:
-        candidate = _value(context, *names, default=_MISSING)
-        if candidate is not _MISSING and candidate is not None:
-            return candidate
-    return _MISSING
-
-
-def _context_parameter_value(contexts: Sequence[Any], names: Sequence[str], name: Any) -> Any:
-    candidate = _first_context_value(contexts, names)
-    if candidate is _MISSING:
-        return _MISSING
-    if isinstance(candidate, Mapping):
-        return candidate.get(name, _MISSING)
-    return candidate
-
-
-def _result_flags(value: Any) -> Any:
-    """Prefer flags beside the selected parameter source."""
-
-    _, contexts = _parameter_source(value)
-    flags = _first_context_value(contexts, _FLAG_NAMES)
-    return None if flags is _MISSING else flags
-
-
-def _quality_confidence(value: Any) -> tuple[Any, Any]:
-    """Return confidence and its explanation from result or butterfly quality."""
-
-    butterfly = _value(value, "butterfly", default=None)
-    if butterfly is None:
-        butterfly = _value(_value(value, "observables", default={}), "butterfly", default=None)
-    quality = _value(butterfly, "quality", default=None)
-    if quality is None:
-        quality = _value(value, "quality", default=None)
-    confidence = _value(value, "confidence", default=_MISSING)
-    if confidence is _MISSING:
-        confidence = _value(quality, "confidence", "confidence_level", default="")
-    reason = _value(value, "confidence_reason", default=_MISSING)
-    if reason is _MISSING:
-        reason = _value(quality, "confidence_reason", "confidence_basis", default="")
-    return confidence, reason
-
-
-def _eccentricity_from_ratio(value: Any) -> float | None:
-    """Keep a missing/non-finite ellipse estimate missing during export."""
-    try:
-        ratio = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return math.sqrt(max(0., 1. - ratio ** 2)) if math.isfinite(ratio) else None
-
-
-def _parameters(value: Any) -> list[dict[str, Any]]:
-    """Normalise parameter sources while retaining fit diagnostics.
-
-    The public pipeline can supply a top-level mapping, a nested
-    ``full2d.parameters`` mapping, or a ``ParameterSet``/fit object.  Keep the
-    source values untouched until the CSV boundary so non-finite values become
-    blank rather than an invented zero.
-    """
-
-    source, contexts = _parameter_source(value)
-    if source is _MISSING or source is None:
-        return []
-
-    spec_items = getattr(source, "spec_items", None)
-    if callable(spec_items):
-        try:
-            iterable = list(spec_items())
-        except Exception:  # pragma: no cover - defensive for custom sets
-            iterable = []
-    elif isinstance(source, Mapping):
-        iterable = list(source.items())
-    elif isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
-        iterable = []
-        for item in source:
-            if isinstance(item, Mapping):
-                name = item.get("name", item.get("parameter", item.get("key")))
-                if name is not None:
-                    iterable.append((name, item))
-    else:
-        source_mapping = _as_mapping(source)
-        iterable = list(source_mapping.items()) if source_mapping is not None else []
-
-    rows: list[dict[str, Any]] = []
-    geometry_units = _value(value, "geometry_parameter_units", default={})
-    if not isinstance(geometry_units, Mapping):
-        geometry_units = {}
-    confidence, confidence_reason = _quality_confidence(value)
-    confidence_cell = (
-        _json_text(confidence)
-        if isinstance(confidence, (Mapping, list, tuple, set, frozenset))
-        else (_scalar(confidence) if confidence is not _MISSING else "")
-    )
-    confidence_reason_cell = (
-        _json_text(confidence_reason)
-        if isinstance(confidence_reason, (Mapping, list, tuple, set, frozenset))
-        else (_scalar(confidence_reason) if confidence_reason is not _MISSING else "")
-    )
-    for name, spec in iterable:
-        parameter_name = str(name)
-        if np.isscalar(spec) or isinstance(spec, str):
-            # NumPy scalars expose unrelated array attributes such as
-            # ``flags``.  They are parameter values, not rich parameter specs.
-            value_field = spec
-            stderr = uncertainty = fixed = unit = flags = bound_flags = _MISSING
-        else:
-            spec_mapping = spec if isinstance(spec, Mapping) else _as_mapping(spec)
-            if spec_mapping is not None:
-                value_field = _value(spec_mapping, "value", "val", "estimate", default=None)
-                stderr = _value(spec_mapping, "stderr", default=_MISSING)
-                uncertainty = _value(
-                    spec_mapping,
-                    "uncertainty",
-                    "sigma",
-                    "error",
-                    "std",
-                    default=_MISSING,
-                )
-                fixed = _value(spec_mapping, "fixed", "is_fixed", default=_MISSING)
-                unit = _value(spec_mapping, "unit", default=_MISSING)
-                flags = _value(spec_mapping, "flags", "scientific_flags", default=_MISSING)
-                bound_flags = _value(spec_mapping, "bound_flags", default=_MISSING)
-                if fixed is _MISSING and ("vary" in spec_mapping or "expr" in spec_mapping):
-                    fixed = spec_mapping.get("expr") is None and not bool(spec_mapping.get("vary", True))
-                if flags is _MISSING and spec_mapping.get("expr") is not None:
-                    flags = {"tied": True}
-            else:
-                value_field = getattr(spec, "value", spec)
-                stderr = getattr(spec, "stderr", _MISSING)
-                uncertainty = getattr(spec, "uncertainty", _MISSING)
-                fixed = getattr(spec, "is_fixed", _MISSING)
-                if fixed is _MISSING and hasattr(spec, "vary"):
-                    fixed = not bool(getattr(spec, "vary"))
-                unit = getattr(spec, "unit", _MISSING)
-                flags = getattr(spec, "flags", _MISSING)
-                if flags is _MISSING and getattr(spec, "is_tied", False):
-                    flags = {"tied": True}
-                bound_flags = getattr(spec, "bound_flags", _MISSING)
-
-        if stderr is _MISSING:
-            stderr = _context_parameter_value(contexts, ("stderr",), name)
-        if uncertainty is _MISSING:
-            uncertainty = stderr
-        if stderr is _MISSING:
-            stderr = uncertainty
-        if fixed is _MISSING:
-            fixed = _context_parameter_value(contexts, ("fixed", "is_fixed"), name)
-        if unit is _MISSING:
-            unit = _context_parameter_value(contexts, ("units", "unit"), name)
-        if unit is _MISSING:
-            unit = geometry_units.get(str(name), _MISSING)
-        if flags is _MISSING:
-            flags = _context_parameter_value(
-                contexts,
-                ("flags", "scientific_flags", "quality_flags", "fit_flags"),
-                name,
-            )
-        if bound_flags is _MISSING:
-            bound_flags = _context_parameter_value(contexts, ("bound_flags",), name)
-
-        rows.append(
-            {
-                "parameter": parameter_name,
-                "value": _scalar(value_field),
-                "candidate_value": _scalar(value_field),
-                "publication_status": "not_assessed",
-                "identifiability_status": "not_assessed",
-                "identifiability_reason": "",
-                "parameter_source": "candidate_only",
-                "confidence": confidence_cell,
-                "confidence_reason": confidence_reason_cell,
-                "stderr": _scalar(stderr) if stderr is not _MISSING else "",
-                "uncertainty": _scalar(uncertainty) if uncertainty is not _MISSING else "",
-                "fixed": _scalar(fixed) if fixed is not _MISSING else "",
-                "unit": _scalar(unit) if unit is not _MISSING else "",
-                "flags": (
-                    _json_text(flags)
-                    if isinstance(flags, (Mapping, list, tuple, set, frozenset))
-                    else (_scalar(flags) if flags is not _MISSING else "")
-                ),
-                "bound_flags": (
-                    _json_text(bound_flags)
-                    if isinstance(bound_flags, (Mapping, list, tuple, set, frozenset))
-                    else (_scalar(bound_flags) if bound_flags is not _MISSING else "")
-                ),
-            }
-        )
-    ellipse = _value(value, "ellipse_fit", "ellipse", default={})
-    evidence = _value(ellipse, "quantitative_parameters", default={})
-    evidence = evidence if isinstance(evidence, Mapping) else {}
-    if evidence:
-        aliases = {"semi_major": "a", "semi_minor": "b", "axes_ratio": "axis_ratio",
-                   "ellipse_axis_tilt_deg": "theta_deg", "angle_deg": "theta_deg",
-                   "eccentricity": "axis_ratio", "ellipticity": "axis_ratio"}
-        for row in rows:
-            name = row["parameter"]
-            check = evidence.get(aliases.get(name, name))
-            if not isinstance(check, Mapping):
-                continue
-            candidate_value = check.get("candidate_value")
-            if candidate_value is None:
-                candidate_value = row["value"]
-            if name in ("eccentricity", "ellipticity"):
-                candidate_value = _eccentricity_from_ratio(candidate_value)
-            row["candidate_value"] = _scalar(candidate_value)
-            row["identifiability_status"] = check.get("status", "undetermined")
-            row["identifiability_reason"] = check.get("reason", "")
-            quantitative_value = check.get("value")
-            if name in ("eccentricity", "ellipticity"):
-                quantitative_value = _eccentricity_from_ratio(quantitative_value)
-            check_status = str(check.get("status", "undetermined")).strip().casefold()
-            value_is_finite = (
-                not isinstance(quantitative_value, bool)
-                and isinstance(quantitative_value, (int, float, np.number))
-                and math.isfinite(float(quantitative_value))
-            )
-            if check_status in {"available", "estimate", "candidate"} and value_is_finite:
-                row["value"] = _scalar(quantitative_value)
-                row["publication_status"] = (
-                    "available" if check_status == "available" else "not_assessed"
-                )
-                row["parameter_source"] = (
-                    "quantitative" if check_status == "available" else "candidate"
-                )
-            else:
-                row["value"] = ""
-                row["publication_status"] = "not_assessed"
-                row["parameter_source"] = "candidate_only"
-            parameter_confidence = check.get("confidence", check.get("confidence_level", _MISSING))
-            if parameter_confidence is not _MISSING:
-                row["confidence"] = (
-                    _json_text(parameter_confidence)
-                    if isinstance(parameter_confidence, (Mapping, list, tuple, set, frozenset))
-                    else _scalar(parameter_confidence)
-                )
-            parameter_confidence_reason = check.get("confidence_reason", _MISSING)
-            if parameter_confidence_reason is not _MISSING:
-                row["confidence_reason"] = (
-                    _json_text(parameter_confidence_reason)
-                    if isinstance(parameter_confidence_reason, (Mapping, list, tuple, set, frozenset))
-                    else _scalar(parameter_confidence_reason)
-                )
-            interval = check.get("interval")
-            if isinstance(interval, (tuple, list)) and len(interval) == 2 and name not in ("eccentricity", "ellipticity"):
-                row["interval_low"], row["interval_high"] = interval
-            row["interval_kind"] = check.get("interval_kind", "")
-            if not row.get("unit"):
-                row["unit"] = "dimensionless" if name in ("eccentricity", "ellipticity") else check.get("unit", "")
-    shape_available = all(
-        isinstance(evidence.get(name), Mapping)
-        and evidence[name].get("status") == "available"
-        for name in ("a", "b", "axis_ratio", "theta_deg")
-    )
-    if not shape_available:
-        # These periods are derived from the candidate ellipse.  A raw fit
-        # scalar must not become a published Ln/Lz when quantitative evidence
-        # is missing or any required ellipse dimension is undetermined.
-        for row in rows:
-            if row["parameter"] not in {
-                "L_N", "L_z", "Ln_from_minor_axis_nm", "Lz_from_draw_axis_nm",
-                "L_from_major_axis_nm",
-            }:
-                continue
-            if row.get("candidate_value") in (None, ""):
-                row["candidate_value"] = row["value"]
-            row["value"] = ""
-            row["publication_status"] = "not_assessed"
-            row["identifiability_status"] = "undetermined"
-            row["identifiability_reason"] = "ellipse_shape_not_quantitatively_available"
-            row["parameter_source"] = "candidate_only"
-    return rows
-
-
-def _quality_summary(value: Any) -> dict[str, Any]:
-    """Flatten status and confidence labels while preserving detailed source JSON."""
-
-    butterfly = _value(value, "butterfly", default=None)
-    if butterfly is None:
-        butterfly = _value(_value(value, "observables", default={}), "butterfly", default=None)
-    quality = _value(butterfly, "quality", default=None)
-    if quality is None:
-        quality = _value(value, "quality", default=None)
-    confidence, confidence_reason = _quality_confidence(value)
-    diagnostic = _value(
-        quality,
-        "diagnostic",
-        "reason",
-        default=_value(value, "quality_diagnostic", "diagnostic", default=""),
-    )
-    return {
-        "quality_status": _scalar(
-            _value(quality, "status", default=_value(value, "quality_status", default=""))
-        ),
-        "confidence": (
-            _json_text(confidence)
-            if isinstance(confidence, (Mapping, list, tuple, set, frozenset))
-            else (_scalar(confidence) if confidence is not _MISSING else "")
-        ),
-        "confidence_reason": (
-            _json_text(confidence_reason)
-            if isinstance(confidence_reason, (Mapping, list, tuple, set, frozenset))
-            else (_scalar(confidence_reason) if confidence_reason is not _MISSING else "")
-        ),
-        "quality_diagnostic": (
-            _json_text(diagnostic)
-            if isinstance(diagnostic, (Mapping, list, tuple, set, frozenset))
-            else (_scalar(diagnostic) if diagnostic is not _MISSING else "")
-        ),
-    }
-
-
-def _radial_arc_summary(value: Any) -> dict[str, Any]:
-    """Flatten radial-hint and observed-arc comparison data for frame CSVs."""
-
-    geometry = _as_mapping(_value(value, "geometry_parameters", default=None)) or {}
-    butterfly = _value(value, "butterfly", default=None)
-    if butterfly is None:
-        butterfly = _value(_value(value, "observables", default={}), "butterfly", default=None)
-    candidate = _value(butterfly, "candidate_fit", default={})
-    candidate_parameters = _value(candidate, "parameters", "parameter_values", default={})
-    comparison = _value(geometry, "radial_arc_comparison", default=_MISSING)
-    if comparison is _MISSING:
-        comparison = _value(candidate, "radial_arc_comparison", default={})
-
-    def geometry_or_candidate(name: str, *, parameter_value: bool = False) -> Any:
-        result_value = _value(geometry, name, default=_MISSING)
-        if result_value is not _MISSING:
-            return result_value
-        if parameter_value:
-            result_value = _value(candidate_parameters, name, default=_MISSING)
-            if result_value is not _MISSING:
-                return result_value
-        return _value(candidate, name, default=None)
-
-    q_unit = _value(comparison, "q_unit", default=_MISSING)
-    if q_unit is _MISSING:
-        q_unit = _value(candidate, "q_unit", default=_MISSING)
-    if q_unit is _MISSING:
-        q_unit = _value(_value(value, "geometry_metrics", default={}), "q_unit", default="")
-    return {
-        "observed_arc_q_median": _scalar(
-            geometry_or_candidate("observed_arc_q_median", parameter_value=True)
-        ),
-        "radial_hint_q": _scalar(
-            geometry_or_candidate("radial_hint_q", parameter_value=True)
-        ),
-        "radial_arc_comparison_q_unit": _scalar(q_unit),
-        "radial_hint_selection_status": _scalar(
-            geometry_or_candidate("radial_hint_selection_status")
-        ),
-        "radial_hint_reason": _scalar(geometry_or_candidate("radial_hint_reason")),
-        "observed_arc_q_source": _scalar(
-            geometry_or_candidate("observed_arc_q_source")
-        ),
-        "radial_arc_comparison_status": _scalar(
-            _value(comparison, "status", default=None)
-        ),
-        "radial_hint_to_observed_arc_ratio": _scalar(
-            _value(comparison, "radial_hint_to_observed_arc_ratio", default=None)
-        ),
-        "radial_arc_comparison_signed_relative_difference": _scalar(
-            _value(comparison, "signed_relative_difference", default=None)
-        ),
-    }
-
-
-def _frame_summary_rows(results: Sequence[FrameFitResult]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for index, item in enumerate(results):
-        row = _frame_base(item, index)
-        result = item.result
-        mapping = _result_mapping(item)
-        params = _parameters(result)
-        # Scalar top-level observables are useful in a quick summary.  Arrays
-        # and nested mappings stay in their lossless JSON sidecars.
-        if mapping:
-            for key, value in mapping.items():
-                key_text = str(key)
-                if key_text in {"parameters", "params", "ridge_points", "ellipse_fit", "ellipse"}:
-                    continue
-                if isinstance(value, (str, int, float, bool)) or value is None:
-                    row[key_text] = _scalar(value)
-                elif key_text in _FLAG_NAMES:
-                    row[key_text] = _json_text(value)
-            if "flags" not in row:
-                row["flags"] = _json_text(_value(result, "flags", default=None))
-            if "scientific_flags" not in row:
-                row["scientific_flags"] = _json_text(
-                    _value(result, "scientific_flags", default=None)
-                )
-        for section_name, prefix in (("metrics", "fit"), ("full2d", "full2d")):
-            section = _value(result, section_name, default=None)
-            section_mapping = _as_mapping(section)
-            if not section_mapping:
-                continue
-            for metric_name in (
-                "status",
-                "success",
-                "rmse",
-                "weighted_rmse",
-                "ndata",
-                "sampled_n",
-                "sample_rmse",
-                "nfev",
-                "condition_number",
-                "condition",
-            ):
-                metric = _value(section_mapping, metric_name, default=_MISSING)
-                if metric is _MISSING or not (metric is None or np.isscalar(metric)):
-                    continue
-                if metric_name in {"status", "success"}:
-                    output_name = f"{prefix}_{metric_name}"
-                elif metric_name == "condition":
-                    output_name = "condition_number"
-                else:
-                    output_name = metric_name
-                row.setdefault(output_name, _scalar(metric))
-        for parameter in params:
-            name = parameter["parameter"]
-            row.setdefault(name, parameter["value"])
-        geometry = _as_mapping(_value(result, "geometry_parameters", default=None))
-        # Public a/b/θ come from geometry_parameters.  Intensity or solver
-        # leftovers must not fill a ring row with a capped-fit angle.
-        if geometry:
-            for name in (
-                "a",
-                "b",
-                "axis_ratio",
-                "theta_deg",
-                "center_qx",
-                "center_qy",
-                "ellipticity",
-                "eccentricity",
-                "Ln_from_minor_axis_nm",
-                "Lz_from_draw_axis_nm",
-                "L_from_major_axis_nm",
-            ):
-                if name in geometry:
-                    row[name] = _scalar(geometry[name])
-        for name, value in _quality_summary(result).items():
-            row.setdefault(name, value)
-        row.setdefault("arc_sides", _scalar(_value(result, "arc_sides", default=None)))
-        row.setdefault(
-            "q_star_from_arcs",
-            _scalar(
-                _value(geometry, "q_star_from_arcs", default=None)
-                or _value(result, "q_star_from_arcs", default=None)
-            ),
-        )
-        row.setdefault(
-            "L_from_observed_radius_nm",
-            _scalar(
-                _value(geometry, "L_from_observed_radius_nm", default=None)
-                or _value(result, "L_from_observed_radius_nm", default=None)
-            ),
-        )
-        row.setdefault(
-            "q_star_source",
-            _scalar(
-                _value(geometry, "q_star_source", default=None)
-                or _value(result, "q_star_source", default=None)
-            ),
-        )
-        row.update(_radial_arc_summary(result))
-        row.setdefault(
-            "ellipse_kind",
-            _scalar(
-                _value(result, "ellipse_kind", default=None)
-                or _value(geometry, "ellipse_kind", default=None)
-            ),
-        )
-        row.setdefault(
-            "Ln_candidate_from_minor_axis_nm",
-            _scalar(
-                _value(geometry, "Ln_candidate_from_minor_axis_nm", default=None)
-                or _value(result, "Ln_candidate_from_minor_axis_nm", default=None)
-            ),
-        )
-        row.setdefault(
-            "Lz_candidate_from_draw_axis_nm",
-            _scalar(
-                _value(geometry, "Lz_candidate_from_draw_axis_nm", default=None)
-                or _value(result, "Lz_candidate_from_draw_axis_nm", default=None)
-            ),
-        )
-        row.setdefault(
-            "L_candidate_from_major_axis_nm",
-            _scalar(
-                _value(geometry, "L_candidate_from_major_axis_nm", default=None)
-                or _value(result, "L_candidate_from_major_axis_nm", default=None)
-            ),
-        )
-        row["parameters_json"] = _json_text(params)
-        row["frame_metadata_json"] = _json_text(item.frame.metadata)
-        rows.append(row)
-    return rows
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], columns: Sequence[str] | None = None) -> Path:
@@ -893,266 +193,6 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], columns: Sequence[
         for row in rows:
             writer.writerow({key: _scalar(row.get(key, "")) for key in keys})
     return path
-
-
-def _ridge_points(value: Any) -> list[dict[str, Any]]:
-    points = _value(value, "ridge_points", "ridges", "ridge", default=None)
-    if points is None:
-        return []
-    if isinstance(points, Mapping):
-        # A named collection such as {"upper": [...], "lower": [...]} is
-        # retained by adding the branch name to each point.
-        rows: list[dict[str, Any]] = []
-        for branch, branch_points in points.items():
-            for row in _ridge_points_from_sequence(branch_points):
-                row.setdefault("branch", branch)
-                rows.append(row)
-        return rows
-    return _ridge_points_from_sequence(points)
-
-
-def _ridge_points_from_sequence(points: Any) -> list[dict[str, Any]]:
-    if points is None:
-        return []
-    tolist = getattr(points, "tolist", None)
-    if callable(tolist):
-        try:
-            points = tolist()
-        except Exception:  # pragma: no cover
-            pass
-    if isinstance(points, Mapping):
-        return [dict(points)]
-    if isinstance(points, Sequence) and not isinstance(points, (str, bytes)):
-        rows: list[dict[str, Any]] = []
-        for index, point in enumerate(points):
-            if isinstance(point, Mapping):
-                rows.append({str(key): _scalar(value) for key, value in point.items()})
-            elif (point_mapping := _as_mapping(point)) is not None:
-                row = {
-                    str(key): _scalar(value)
-                    for key, value in point_mapping.items()
-                    if key != "metadata"
-                }
-                metadata = point_mapping.get("metadata")
-                if isinstance(metadata, Mapping):
-                    for key in (
-                        "quadrant",
-                        "quadrant_pair",
-                        "branch_assignment_source",
-                        "symmetry_flags",
-                    ):
-                        if key in metadata:
-                            row[key] = _scalar(metadata[key])
-                rows.append(row)
-            elif isinstance(point, Sequence) and not isinstance(point, (str, bytes)):
-                row = {"point_index": index}
-                for axis, coordinate in enumerate(point):
-                    row["q_x" if axis == 0 else "q_y" if axis == 1 else f"coordinate_{axis}"] = _scalar(coordinate)
-                rows.append(row)
-            else:
-                rows.append({"point_index": index, "value": _scalar(point)})
-        return rows
-    return [{"value": _scalar(points)}]
-
-
-def _ellipse_fit(value: Any) -> Any:
-    return _value(value, "ellipse_fit", "ellipse", default=None)
-
-
-def _lobe_radial_profiles(value: Any) -> Any:
-    direct = _value(value, "lobe_radial_profiles", "radial_profiles", default=None)
-    if direct is not None:
-        return direct
-    observables = _value(value, "observables", "measurements", default=None)
-    return _value(observables, "lobe_radial_profiles", "radial_profiles", default=None)
-
-
-def _lobe_radial_peaks(value: Any) -> Any:
-    direct = _value(value, "lobe_radial_peaks", "radial_peaks", default=None)
-    if direct is not None:
-        return direct
-    observables = _value(value, "observables", "measurements", default=None)
-    return _value(observables, "lobe_radial_peaks", "radial_peaks", default=None)
-
-
-def _lobe_angular(value: Any) -> Any:
-    """Return direct angular lobe metrics without deriving radial values."""
-
-    direct = _value(value, "lobes", "lobe_metrics", "angular_lobes", default=None)
-    if direct is not None:
-        return direct
-    observables = _value(value, "observables", "measurements", default=None)
-    return _value(observables, "lobes", "lobe_metrics", "angular_lobes", default=None)
-
-
-def _butterfly_evidence(value: Any) -> Any:
-    """Return direct or nested butterfly evidence, preferring a valid mapping."""
-
-    direct = _value(value, "butterfly", default=None)
-    if isinstance(direct, Mapping) and direct:
-        return direct
-    observables = _value(value, "observables", default=None)
-    nested = _value(observables, "butterfly", default=None)
-    if isinstance(nested, Mapping):
-        return nested
-    return direct if direct is not None else nested if nested is not None else {}
-
-
-def _angle_pair(value: Any, angle_deg: Any = None) -> tuple[float | None, float | None]:
-    """Normalize one observed angle to the paired radian/degree fields."""
-
-    try:
-        if value is None and angle_deg is not None:
-            degree = float(angle_deg)
-            return float(np.deg2rad(degree)), degree
-        if value is not None:
-            radians = float(value)
-            return radians, float(np.degrees(radians))
-    except (TypeError, ValueError, OverflowError):
-        return None, None
-    return None, None
-
-
-def _lobe_measurement_rows(item: FrameFitResult, index: int) -> list[dict[str, Any]]:
-    """Flatten all direct angular and radial lobe scalar observables."""
-
-    base = _frame_base(item, index)
-    rows: list[dict[str, Any]] = []
-    angular = _sequence(_lobe_angular(item.result))
-    for lobe_index, lobe in enumerate(angular):
-        angle = _value(lobe, "angle", "azimuth", default=None)
-        angle_deg_value = _value(lobe, "angle_deg", "azimuth_deg", default=None)
-        angle, angle_deg = _angle_pair(angle, angle_deg_value)
-        fwhm = _value(lobe, "fwhm", "azimuthal_fwhm", default=None)
-        try:
-            fwhm_deg = float(np.degrees(float(fwhm)))
-        except (TypeError, ValueError):
-            fwhm_deg = None
-        rows.append(
-            {
-                **base,
-                "measurement_kind": "angular",
-                "lobe_index": lobe_index,
-                "angle_rad": angle,
-                "angle_deg": angle_deg,
-                "angle_unit": "rad",
-                "q_star": None,
-                "q_unit": None,
-                "intensity": _value(lobe, "intensity", default=None),
-                "baseline": _value(lobe, "baseline", default=None),
-                "snr": _value(lobe, "snr", default=None),
-                "fwhm": fwhm,
-                "fwhm_deg": fwhm_deg,
-                "radial_fwhm": None,
-                "azimuthal_fwhm": fwhm,
-                "area": _value(lobe, "area", default=None),
-                "coverage": _value(lobe, "coverage", default=None),
-                "n_pixels": _value(lobe, "n_pixels", default=None),
-                "valid": _value(lobe, "valid", default=None),
-                "accepted": _value(lobe, "valid", "accepted", default=None),
-                "method": "angular_profile",
-                "reason": _value(lobe, "reason", default=None),
-                "refinement": _value(lobe, "refinement", default=None),
-                "flags": _json_text(_value(lobe, "flags", default=())),
-            }
-        )
-    radial = _sequence(_lobe_radial_peaks(item.result))
-    for lobe_index, peak in enumerate(radial):
-        angle = _value(peak, "angle", "azimuth", default=None)
-        angle, angle_deg = _angle_pair(angle, _value(peak, "angle_deg", default=None))
-        rows.append(
-            {
-                **base,
-                "measurement_kind": "radial",
-                "lobe_index": lobe_index,
-                "angle_rad": angle,
-                "angle_deg": angle_deg,
-                "angle_unit": "rad",
-                "q_star": _value(peak, "q_star", "q", "q_position", default=None),
-                "q_unit": _value(peak, "q_unit", default=None),
-                "intensity": _value(peak, "intensity", default=None),
-                "baseline": _value(peak, "baseline", default=None),
-                "snr": _value(peak, "snr", default=None),
-                "fwhm": None,
-                "fwhm_deg": None,
-                "radial_fwhm": _value(peak, "radial_fwhm", default=None),
-                "azimuthal_fwhm": _value(peak, "azimuthal_fwhm", default=None),
-                "area": _value(peak, "area", default=None),
-                "coverage": _value(peak, "coverage", default=None),
-                "n_pixels": _value(peak, "n_pixels", default=None),
-                "valid": _value(peak, "valid", default=None),
-                "accepted": _value(peak, "accepted", "valid", default=None),
-                "method": _value(peak, "method", default="radial_peak"),
-                "reason": _value(peak, "reason", default=None),
-                "refinement": None,
-                "flags": _json_text(_value(peak, "flags", default=())),
-            }
-        )
-    butterfly = _butterfly_evidence(item.result)
-    landmarks = butterfly.get("peak_landmarks", {}) if isinstance(butterfly, Mapping) else {}
-    if isinstance(landmarks, Mapping):
-        raw = landmarks.get("raw_global_max")
-        entries = [("raw_pixel_maximum", raw)] if isinstance(raw, Mapping) else []
-        entries += [("supported_lobe_pixel", point) for point in landmarks.get("peaks", []) if isinstance(point, Mapping)]
-        for peak_index, (kind, point) in enumerate(entries):
-            rows.append({
-                **base, "measurement_kind": kind, "lobe_index": peak_index,
-                # A pixel maximum is not automatically a radial reflection.
-                "q_star": None, "q": point.get("q"), "q_unit": landmarks.get("q_unit"),
-                "qx": point.get("qx"), "qy": point.get("qy"),
-                "angle_deg": point.get("chi_deg"), "angle_unit": "deg",
-                "pixel_x": point.get("pixel_x"), "pixel_y": point.get("pixel_y"),
-                "point_id": _value(point, "peak_id", "point_id", "id", default="G"),
-                "intensity": point.get("raw_intensity"), "smoothed_intensity": point.get("smoothed_intensity"),
-                "valid": True, "accepted": None if kind == "raw_pixel_maximum" else True,
-                "method": landmarks.get("method_version"),
-                "reason": "literal maximum in supplied valid domain" if kind == "raw_pixel_maximum" else "supported lobe maximum",
-                "flags": _json_text(point.get("flags", [])), "landmark_json": _json_text(point),
-            })
-    return rows
-
-
-def _fit_audit(value: Any) -> dict[str, Any]:
-    """Collect multistart/sample-vs-full objective fields for export."""
-
-    direct = _value(value, "fit_audit", default=None)
-    if isinstance(direct, Mapping):
-        return dict(direct)
-    full2d = _value(value, "full2d", default=None)
-    source = full2d if full2d is not None else value
-    fields = (
-        "sample_cost",
-        "full_cost",
-        "selection_objective",
-        "candidate_solutions",
-        "selected_start_index",
-        "multistart_count",
-        "symmetry",
-    )
-    result = {
-        name: _value(source, name, default=None)
-        for name in fields
-        if _value(source, name, default=None) is not None
-    }
-    return result
-
-
-def _batch_ellipse_row(item: FrameFitResult, index: int) -> dict[str, Any]:
-    """Build one shared compact ellipse/butterfly sidecar row."""
-
-    from .pipeline import _jsonable
-
-    butterfly = _jsonable(_butterfly_evidence(item.result), array_summary=True)
-    return {
-        **_frame_base(item, index),
-        "ellipse_fit": _json_safe(_ellipse_fit(item.result)),
-        "fit_audit": _json_safe(_fit_audit(item.result)),
-        "lobe_angular": _json_safe(_lobe_angular(item.result)),
-        "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
-        "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
-        "peak_landmarks": _json_safe(_value(butterfly, "peak_landmarks", default={})),
-        "butterfly": _json_safe(butterfly),
-    }
 
 
 def _walk_arrays(
@@ -1188,10 +228,10 @@ def _walk_arrays(
         return
     if is_dataclass(value):
         try:
-            for field in fields(value):
+            for item_field in fields(value):
                 _walk_arrays(
-                    getattr(value, field.name),
-                    f"{prefix}__{_safe_key(field.name)}",
+                    getattr(value, item_field.name),
+                    f"{prefix}__{_safe_key(item_field.name)}",
                     output,
                     _active,
                 )
@@ -1297,7 +337,6 @@ def _frame_detail_safe(
         finally:
             _active.pop(object_id, None)
 
-    # Honor compact public mapping APIs before examining public attributes.
     for method_name in ("to_mapping", "to_dict", "as_dict"):
         method = getattr(value, method_name, None)
         if not callable(method):
@@ -1323,8 +362,6 @@ def _frame_detail_safe(
                 parameters = _value(value, "parameters", "params", default=_MISSING)
                 if parameters is not _MISSING and "parameters" not in merged:
                     merged["parameters"] = parameters
-                # Compact mappings may omit array attributes that are still
-                # retained losslessly in the NPZ archive.
                 for name in (
                     "image", "qmap", "valid_mask", "model", "residual",
                     "model_image", "residual_image", "full2d",
@@ -1413,12 +450,7 @@ def _frame_detail_record(
 def _restore_export_values(
     value: Any, archive: zipfile.ZipFile, prefix: str, *, arrays: bool = True, checkpoint_value: Any = _MISSING
 ) -> Any:
-    """Decode proven detail values needed by native scalar/vector exports.
-
-    Detector maps stay in NPZ. Small fit/profile arrays recover their exact
-    values so restart descriptors never replace existing JSON/CSV evidence.
-    The original detail record separately retains tagged Enum metadata.
-    """
+    """Decode proven detail values needed by native scalar/vector exports."""
     if isinstance(value, Mapping):
         if (set(value) == {"enum_type", "name", "value"}
                 and not isinstance(checkpoint_value, Mapping) and checkpoint_value == value["value"]):
@@ -1442,19 +474,8 @@ def _restore_export_values(
 
 
 def _contains_omitted_array(value: Any, _visited: set[int] | None = None) -> bool:
-    """Detect an explicit checkpoint marker without guessing from absence.
+    """Detect an explicit checkpoint marker without guessing from absence."""
 
-    Results can retain third-party metadata objects.  In particular, pyFAI
-    stores detector orientation as an ``Enum`` whose private ``__objclass__``
-    points back to the enum class.  Treat scalar-like values as leaves and
-    only walk public object attributes so that this provenance scan cannot
-    recurse through implementation details or cyclic metadata graphs.
-    """
-
-    # A numpy scalar may expose implementation metadata on some versions, but
-    # it is never a container for an omission marker.  Check it before
-    # ``__dict__`` traversal; Enum also covers pyFAI IntEnum members that are
-    # not caught by the builtin scalar tuple below.
     if value is None or isinstance(value, (str, bytes, int, float, complex, bool, Enum, np.generic)):
         return False
 
@@ -1473,9 +494,9 @@ def _contains_omitted_array(value: Any, _visited: set[int] | None = None) -> boo
         return any(_contains_omitted_array(item, _visited) for item in value.values())
     if is_dataclass(value):
         return any(
-            _contains_omitted_array(getattr(value, field.name), _visited)
-            for field in fields(value)
-            if not field.name.startswith("_")
+            _contains_omitted_array(getattr(value, item_field.name), _visited)
+            for item_field in fields(value)
+            if not item_field.name.startswith("_")
         )
     if isinstance(value, (list, tuple)):
         return any(_contains_omitted_array(item, _visited) for item in value)
@@ -1493,8 +514,6 @@ def _contains_omitted_array(value: Any, _visited: set[int] | None = None) -> boo
 
 
 def _write_npz(path: Path, results: Sequence[FrameFitResult]) -> Path:
-    import numpy as np
-
     arrays: dict[str, Any] = {}
     missing_frames: list[int] = []
     missing_frame_ids: list[Any] = []
@@ -1524,13 +543,9 @@ def _write_npz(path: Path, results: Sequence[FrameFitResult]) -> Path:
 
 
 def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
     from .visualization import _parameter_evolution_label, plot_parameter_evolution
 
-    # One quantity/unit per panel avoids assigning generic length/intensity
-    # units to ratios, angles or unlike quantities. Keep every frame, including
-    # missing values, so the visual sequence agrees with the CSV frame index.
     parameter_rows = [_parameters(item.result) for item in results]
     keys = list(dict.fromkeys(
         (parameter["parameter"], str(parameter.get("unit") or "").strip())
@@ -1539,14 +554,10 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not keys:
         fig = Figure(figsize=(9, 5), layout="constrained")
-        FigureCanvasAgg(fig)
-        try:
-            axis = fig.add_subplot(1, 1, 1)
-            axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
-            axis.set_axis_off()
-            fig.savefig(path, dpi=160)
-        finally:
-            fig.clear()
+        axis = fig.add_subplot(1, 1, 1)
+        axis.text(0.5, 0.5, "No scalar parameter evolution available", ha="center", va="center")
+        axis.set_axis_off()
+        save_agg_figure(fig, path, clear=True, dpi=160)
         return path
     aliases = {key: f"quantity_{index}" for index, key in enumerate(keys)}
     labels, units = {}, {}
@@ -1572,126 +583,24 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
                 state = "candidate" if state == "ok" else f"{state}; candidate"
             row[f"{alias}_status"] = state
         rows.append(row)
-    # FrameRef.time has no declared universal time unit; never assume seconds.
-    # Avoid matplotlib.use("Agg", force=True), which destroys an active QtAgg
-    # GUI backend in-process; close only if registered with pyplot.
+    from matplotlib._pylab_helpers import Gcf
+
     fig = plot_parameter_evolution(
         rows, parameters=list(aliases.values()), x_key="time" if has_time else "frame_index",
         parameter_labels=labels, parameter_units=units, output=path, dpi=160,
     )
-    try:
-        fig.clear()
-        import matplotlib.pyplot as plt
-
-        plt.close(fig)
-    except Exception:
-        pass
+    Gcf.destroy_fig(fig)
+    fig.clear()
     return path
 
 
-_CANONICAL_FRAME_SUMMARY_COLUMNS = [
-    "frame_index",
-    "frame_id",
-    "path",
-    "frame_selector",
-    "dataset",
-    "time",
-    "status",
-    "quality_status",
-    "confidence",
-    "confidence_reason",
-    "quality_diagnostic",
-    "arc_sides",
-    "q_star_from_arcs",
-    "L_from_observed_radius_nm",
-    "q_star_source",
-    "observed_arc_q_median",
-    "radial_hint_q",
-    "radial_arc_comparison_q_unit",
-    "radial_hint_selection_status",
-    "radial_hint_reason",
-    "observed_arc_q_source",
-    "radial_arc_comparison_status",
-    "radial_hint_to_observed_arc_ratio",
-    "radial_arc_comparison_signed_relative_difference",
-    "ellipse_kind",
-    "a",
-    "b",
-    "axis_ratio",
-    "theta_deg",
-    "center_qx",
-    "center_qy",
-    "ellipticity",
-    "eccentricity",
-    "Ln_from_minor_axis_nm",
-    "Lz_from_draw_axis_nm",
-    "L_from_major_axis_nm",
-    "Ln_candidate_from_minor_axis_nm",
-    "Lz_candidate_from_draw_axis_nm",
-    "L_candidate_from_major_axis_nm",
-    "fit_status",
-    "fit_success",
-    "full2d_status",
-    "full2d_success",
-    "rmse",
-    "weighted_rmse",
-    "ndata",
-    "sampled_n",
-    "sample_rmse",
-    "nfev",
-    "condition_number",
-    "error",
-    "diagnostic",
-    "warm_start_from",
-    "elapsed_s",
-    "resumed",
-    "flags",
-    "scientific_flags",
-    "parameters_json",
-    "frame_metadata_json",
-]
-
-
 class StreamingBatchExporter:
-    """Write a batch bundle while retaining at most one detector frame.
-
-    This writer is used by the CLI ``--stream`` path: each frame is converted
-    to compact rows and frame details while its arrays are appended directly
-    to a temporary NPZ zip member before the in-memory result is released.
-    """
+    """Write a batch bundle while retaining at most one detector frame."""
 
     _FRAME_COLUMNS = list(_CANONICAL_FRAME_SUMMARY_COLUMNS)
-    _PARAMETER_COLUMNS = [
-        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "parameter",
-        "value", "stderr", "uncertainty", "fixed", "unit", "flags",
-        "bound_flags", "scientific_flags",
-        "candidate_value", "publication_status", "identifiability_status", "identifiability_reason", "parameter_source",
-        "confidence", "confidence_reason",
-        "interval_low", "interval_high", "interval_kind",
-    ]
-    _RIDGE_COLUMNS = [
-        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error",
-        "warm_start_from", "elapsed_s", "resumed", "point_index", "branch",
-        "qx", "qy", "q", "q_star", "angle", "angle_deg", "intensity",
-        "baseline", "snr", "radial_fwhm", "azimuthal_fwhm", "area", "coverage",
-        "n_pixels", "valid", "accepted", "method", "reason", "flags", "support",
-        "score", "point_score", "trajectory_id", "branch_id", "q_unit",
-        "quadrant", "quadrant_pair", "branch_assignment_source", "symmetry_flags",
-        "point_id", "arc_id", "side", "pixel_x", "pixel_y", "localization_sigma_q",
-        "normal_fwhm_q", "normal_qx", "normal_qy", "q_normal_step", "scale_stability",
-        "topology_flags", "projection_qx", "projection_qy", "normal_residual_q",
-        "curvature_seed_qx", "curvature_seed_qy", "curvature_seed_pixel_x", "curvature_seed_pixel_y",
-        "profile_shift_q", "profile_shift_pixel", "profile_refinement_applied", "profile_refinement_reason",
-        "uncertainty_source",
-    ]
-    _LOBE_COLUMNS = [
-        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time",
-        "status", "error", "warm_start_from", "elapsed_s", "resumed", "measurement_kind", "lobe_index",
-        "angle_rad", "angle_deg", "angle_unit", "q_star", "q_unit", "intensity", "baseline", "snr", "fwhm", "fwhm_deg", "radial_fwhm",
-        "azimuthal_fwhm", "area", "coverage", "n_pixels", "valid", "accepted",
-        "method", "reason", "refinement", "flags",
-        "point_id", "q", "qx", "qy", "pixel_x", "pixel_y", "smoothed_intensity", "landmark_json",
-    ]
+    _PARAMETER_COLUMNS = list(STREAMING_PARAMETER_COLUMNS)
+    _RIDGE_COLUMNS = list(CANONICAL_RIDGE_COLUMNS)
+    _LOBE_COLUMNS = list(CANONICAL_LOBE_COLUMNS)
 
     def __init__(
         self,
@@ -1758,7 +667,7 @@ class StreamingBatchExporter:
             raise FileExistsError(
                 f"Export target(s) already exist; pass force=True to overwrite: {joined}"
             )
-        self._stage = Path(tempfile.mkdtemp(prefix=".stream-", dir=self.output))
+        self._stage: Path | None = Path(tempfile.mkdtemp(prefix=".stream-", dir=self.output))
         self._writers: dict[str, Any] = {}
         self._handles: dict[str, Any] = {}
         self._details_handle: Any = None
@@ -1852,6 +761,7 @@ class StreamingBatchExporter:
                 self._stage = None
                 raise
         try:
+            assert self._stage is not None
             for key, columns in (
                 ("frame_summary", self._FRAME_COLUMNS),
                 ("parameters_long", self._PARAMETER_COLUMNS),
@@ -1869,8 +779,6 @@ class StreamingBatchExporter:
                 self._stage / self._targets["frame_details"].name
             ).open("w", encoding="utf-8", newline="\n")
             npz_path = self._stage / self._targets["npz"].name
-            # Lossless low-search DEFLATE is faster for detector/q arrays;
-            # every dtype, bit and NPZ member remains present.
             self._npz = zipfile.ZipFile(npz_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1)
         except BaseException:
             self.abort()
@@ -1878,7 +786,7 @@ class StreamingBatchExporter:
 
     def can_restore(self, frame: FrameRef, index: int) -> bool:
         """Retry frames whose checkpoint advanced beyond the published NPZ."""
-        del frame  # run_batch has already matched the exact input/selection hash.
+        del frame
         metadata = self._old_npz_metadata or {}
         proof = (self._old_manifest or {}).get("provenance", {}).get("checkpoint_frame_sha256", [])
         from .producer import calculation_producers_compatible
@@ -1938,6 +846,7 @@ class StreamingBatchExporter:
                     raise ValueError("Restored checkpoint values differ from the producing bundle; recover its original checkpoint before resuming.")
             detail = None
             if item.resumed and self.resume:
+                assert self._old_npz is not None
                 detail = self._original_detail(item, len(self._compact_results))
                 item = replace(item, result=_restore_export_values(detail.get("result"), self._old_npz,
                             f"frame_{len(self._compact_results):04d}", checkpoint_value=item.result))
@@ -1949,11 +858,10 @@ class StreamingBatchExporter:
 
     def _write(self, item: FrameFitResult, *, restored_detail: dict[str, Any] | None = None) -> None:
         index = len(self._compact_results)
-        for row in _frame_summary_rows([item]):
-            row["frame_index"] = index
-            self._writers["frame_summary"].writerow(
-                {key: _scalar(row.get(key, "")) for key in self._FRAME_COLUMNS}
-            )
+        row = build_frame_summary_row(item, index)
+        self._writers["frame_summary"].writerow(
+            {key: _scalar(row.get(key, "")) for key in self._FRAME_COLUMNS}
+        )
         base = _frame_base(item, index)
         flags = _result_flags(item.result)
         for parameter in _parameters(item.result):
@@ -1973,16 +881,14 @@ class StreamingBatchExporter:
                     **point,
                 }
             )
-        for row in _lobe_measurement_rows(item, index):
+        for lobe_row in _lobe_measurement_rows(item, index):
             self._writers["lobe_measurements"].writerow(
-                {key: _scalar(row.get(key, "")) for key in self._LOBE_COLUMNS}
+                {key: _scalar(lobe_row.get(key, "")) for key in self._LOBE_COLUMNS}
             )
         self._ellipse_rows.append(_batch_ellipse_row(item, index))
         array_prefix = f"frame_{index:04d}"
         arrays: dict[str, Any] = {}
         if not (item.resumed and self._old_npz is not None):
-            # Restored arrays belong to the producing NPZ. A checkpoint may
-            # contain array-like values too; never create duplicate members.
             _walk_arrays(item.result, array_prefix, arrays)
         for name, value in arrays.items():
             with self._npz.open(name + ".npy", "w") as handle:
@@ -2009,9 +915,6 @@ class StreamingBatchExporter:
         )
         self._details_handle.flush()
         if item.result is None or _contains_omitted_array(item.result):
-            # A resumed successful frame is represented by a compact
-            # checkpoint mapping.  Its original detector arrays are preserved
-            # from the verified previous NPZ, so it is complete for export.
             if not (item.resumed and self._old_npz is not None):
                 self._missing_frames.append(index)
                 self._missing_ids.append(_scalar(item.frame.frame_id))
@@ -2038,11 +941,7 @@ class StreamingBatchExporter:
             handle.flush()
 
     def _reuse_completed_bundle(self, batch: BatchRunResult | None) -> bool:
-        """Verify the producing generation before retaining a no-op resume.
-
-        Current execution state remains in the checkpoint and CLI result.
-        Exported scientific artifacts retain their original producer metadata.
-        """
+        """Verify the producing generation before retaining a no-op resume."""
         if (not isinstance(batch, BatchRunResult) or batch.cancelled or not batch.producer_identity
                 or not batch.producer_identity.get("analyzer")
                 or not self.resume or self._old_npz is None or self._touched_frames
@@ -2087,9 +986,6 @@ class StreamingBatchExporter:
         try:
             self._close_original_details(verify=True)
             if self.resume and isinstance(batch, BatchRunResult) and batch.cancelled:
-                # A canceled recovery must not replace a delivered generation
-                # with skipped placeholders. Newly checkpointed frames whose
-                # arrays were not published will be retried by can_restore.
                 self.abort()
                 self._stage = None
                 return {**self._targets, "commit_marker": self.output / ".bundle.commit.json"}
@@ -2106,13 +1002,10 @@ class StreamingBatchExporter:
                             f"previous streamed bundle {key} does not match the validated resume run"
                         )
             if self._reuse_completed_bundle(batch):
-                # CRC/member validation already ran when opening the old NPZ;
-                # the commit hashes above also bind every table and sidecar.
-                # Keeping their timestamps lets report/package validate and
-                # reuse their own unchanged generations without rerendering.
                 self.abort()
                 self._stage = None
                 return {**self._targets, "commit_marker": self.output / ".bundle.commit.json"}
+            assert self._stage is not None
             metadata = {
                 "arrays": list(self._array_names),
                 "frame_count": len(self._compact_results),
@@ -2150,9 +1043,6 @@ class StreamingBatchExporter:
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled)
             )
             if self._old_npz is not None and not no_op_resume:
-                # Append retained entries to the still-open staging archive.
-                # New arrays were already compressed once by write(); reading
-                # them back into a second archive adds no scientific evidence.
                 merged_names: list[str] = []
                 for name in self._old_npz.namelist():
                     if name == "__metadata__.npy":
@@ -2168,15 +1058,11 @@ class StreamingBatchExporter:
                         with self._npz.open(name, "w") as target_handle:
                             shutil.copyfileobj(source_handle, target_handle)
                     merged_names.append(name)
-                # Keep the logical catalog order of the previous merge path;
-                # frame identity is encoded in member keys, not ZIP offsets.
                 metadata["arrays"] = [name[:-4] for name in merged_names if name.endswith(".npy")] + self._array_names
                 self._old_npz.close()
                 self._old_npz = None
             elif no_op_resume:
-                # Every frame was restored from the verified checkpoint.  Do
-                # not decompress/recompress the existing native NPZ archive;
-                # the publication transaction will retain that exact target.
+                assert self._old_npz is not None
                 self._old_npz.close()
                 self._old_npz = None
             metadata_bytes = io.BytesIO()
@@ -2252,9 +1138,6 @@ class StreamingBatchExporter:
                 json.dumps(provenance, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
                 encoding="utf-8",
             )
-            # Closing the reader earlier is required on Windows. Check its
-            # producing source again at the publication boundary as copying
-            # retained arrays and rendering evolution may take time.
             self._close_original_details(verify=True)
             outputs = _publish_staged_bundle(
                 self._stage,
@@ -2314,7 +1197,7 @@ class ExportResult(dict[str, Path]):
 class _CompatExportMapping(dict[str, Path]):
     """Mapping that keeps legacy iteration keys while exposing new files."""
 
-    def __init__(self, value: Mapping[str, Path], *, hidden: set[str] = frozenset()) -> None:
+    def __init__(self, value: Mapping[str, Path], *, hidden: set[str] | frozenset[str] = frozenset()) -> None:
         super().__init__(value)
         self._hidden_iteration_keys = set(hidden)
 
@@ -2381,8 +1264,6 @@ def _provenance_payload(
         resolved = _config_with_file_fingerprints(resolved_config)
         if isinstance(resolved, Mapping):
             payload["resolved_batch_config"] = _json_safe(resolved)
-            # Keep the high-value calibration/mask and selector fields easy to
-            # discover without discarding the full canonical config below.
             for name in (
                 "poni", "poni_path", "mask", "mask_path", "valid_mask",
                 "valid_mask_path", "qmap", "external_mask", "rois", "selection",
@@ -2392,8 +1273,6 @@ def _provenance_payload(
                     payload.setdefault(name, _json_safe(resolved[name]))
     user_versions = payload.get("versions")
     merged_versions = dict(user_versions) if isinstance(user_versions, Mapping) else {}
-    # Auto-detected versions are authoritative for the audited package set;
-    # user provenance may still add other version keys.
     merged_versions.update(_software_versions())
     payload["versions"] = merged_versions
     return payload
@@ -2422,48 +1301,28 @@ def _export_batch_locked(
     prefix: str = "",
     force: bool = False,
 ) -> dict[str, Path]:
-    """Write CSV, JSON/JSONL, NPZ and evolution-plot exports.
+    """Write CSV, JSON/JSONL, NPZ and evolution-plot exports."""
 
-    The returned mapping uses stable logical keys (``frame_summary``,
-    ``parameters_long``, ``ridge_points``, ``ellipse_fit``, ``npz``, and
-    ``evolution_png`` and ``frame_details``) and points to the actual files.
-
-    Existing targets are rejected before any export is written unless
-    ``force=True`` is explicitly supplied.
-    """
-
-    # Also tolerate export_batch(output_dir, batch), a common notebook form.
     if isinstance(batch, (str, os.PathLike, Path)) and not isinstance(output_dir, (str, os.PathLike, Path)):
         batch, output_dir = output_dir, batch
     output = Path(output_dir)
     results = _frame_results(batch)
     stem = f"{prefix}" if prefix else ""
 
-    frame_summary_target = output / f"{stem}frame_summary.csv"
-    parameters_long_target = output / f"{stem}parameters_long.csv"
-    ridge_points_target = output / f"{stem}ridge_points.csv"
-    lobe_measurements_target = output / f"{stem}lobe_measurements.csv"
-    ellipse_fit_target = output / f"{stem}ellipse_fit.json"
-    ellipse_jsonl_target = output / f"{stem}ellipse_fit.jsonl"
-    frame_details_target = output / f"{stem}frame_details.jsonl"
-    manifest_target = output / f"{stem}manifest.json"
-    provenance_target = output / f"{stem}provenance.json"
-    npz_target = output / f"{stem}results.npz"
-    evolution_target = output / f"{stem}evolution.png"
-    targets = (
-        frame_summary_target,
-        parameters_long_target,
-        ridge_points_target,
-        lobe_measurements_target,
-        ellipse_fit_target,
-        ellipse_jsonl_target,
-        frame_details_target,
-        manifest_target,
-        provenance_target,
-        npz_target,
-        evolution_target,
-    )
-    existing_targets = [path for path in targets if path.exists()]
+    target_map = {
+        "frame_summary": output / f"{stem}frame_summary.csv",
+        "parameters_long": output / f"{stem}parameters_long.csv",
+        "ridge_points": output / f"{stem}ridge_points.csv",
+        "lobe_measurements": output / f"{stem}lobe_measurements.csv",
+        "ellipse_fit": output / f"{stem}ellipse_fit.json",
+        "ellipse_fit_jsonl": output / f"{stem}ellipse_fit.jsonl",
+        "frame_details": output / f"{stem}frame_details.jsonl",
+        "manifest": output / f"{stem}manifest.json",
+        "provenance": output / f"{stem}provenance.json",
+        "npz": output / f"{stem}results.npz",
+        "evolution_png": output / f"{stem}evolution.png",
+    }
+    existing_targets = [path for path in target_map.values() if path.exists()]
     if existing_targets and not force:
         paths = ", ".join(str(path) for path in existing_targets)
         raise FileExistsError(
@@ -2471,156 +1330,119 @@ def _export_batch_locked(
         )
     output.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".export-", dir=output))
-    frame_summary = stage / frame_summary_target.name
-    parameters_long = stage / parameters_long_target.name
-    ridge_points = stage / ridge_points_target.name
-    lobe_measurements = stage / lobe_measurements_target.name
-    ellipse_fit = stage / ellipse_fit_target.name
-    ellipse_jsonl = stage / ellipse_jsonl_target.name
-    frame_details = stage / frame_details_target.name
-    manifest_path = stage / manifest_target.name
-    provenance_path = stage / provenance_target.name
-    npz_path = stage / npz_target.name
-    evolution_path = stage / evolution_target.name
+    try:
+        staged = {key: stage / target.name for key, target in target_map.items()}
+        _write_csv(
+            staged["frame_summary"],
+            _frame_summary_rows(results),
+            columns=list(_CANONICAL_FRAME_SUMMARY_COLUMNS),
+        )
 
-    _write_csv(
-        frame_summary,
-        _frame_summary_rows(results),
-        columns=list(_CANONICAL_FRAME_SUMMARY_COLUMNS),
-    )
-
-    parameter_rows: list[dict[str, Any]] = []
-    for index, item in enumerate(results):
-        base = _frame_base(item, index)
-        result_flags = _result_flags(item.result)
-        for parameter in _parameters(item.result):
-            row = {
-                **base,
-                **parameter,
-                "scientific_flags": _json_text(result_flags),
-            }
-            parameter_rows.append(row)
-    _write_csv(
-        parameters_long,
-        parameter_rows,
-        columns=[
-            "frame_index",
-            "frame_id",
-            "path",
-            "frame_selector",
-            "dataset",
-            "time",
-            "status",
-            "parameter",
-            "value",
-            "stderr",
-            "uncertainty",
-            "fixed",
-            "unit",
-            "flags",
-            "bound_flags",
-            "scientific_flags",
-            "candidate_value",
-            "publication_status",
-            "identifiability_status",
-            "identifiability_reason",
-            "parameter_source",
-            "confidence",
-            "confidence_reason",
-        ],
-    )
-
-    ridge_rows: list[dict[str, Any]] = []
-    for index, item in enumerate(results):
-        for point_index, point in enumerate(_ridge_points(item.result)):
-            ridge_rows.append({
-                **_frame_base(item, index),
-                "point_index": point_index,
-                **point,
-            })
-    _write_csv(ridge_points, ridge_rows)
-
-    lobe_rows: list[dict[str, Any]] = []
-    for index, item in enumerate(results):
-        lobe_rows.extend(_lobe_measurement_rows(item, index))
-    _write_csv(lobe_measurements, lobe_rows, columns=StreamingBatchExporter._LOBE_COLUMNS)
-
-    ellipse_rows = [
-        _batch_ellipse_row(item, index) for index, item in enumerate(results)
-    ]
-    ellipse_fit.write_text(
-        json.dumps({"frames": ellipse_rows}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    with ellipse_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in ellipse_rows:
-            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
-
-    with frame_details.open("w", encoding="utf-8", newline="\n") as handle:
+        parameter_rows: list[dict[str, Any]] = []
         for index, item in enumerate(results):
-            arrays: dict[str, Any] = {}
-            _walk_arrays(item.result, f"frame_{index:04d}", arrays)
-            detail = _frame_detail_record(item, index, array_names=list(arrays))
-            handle.write(
-                json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-                + "\n"
-            )
+            base = _frame_base(item, index)
+            result_flags = _result_flags(item.result)
+            for parameter in _parameters(item.result):
+                parameter_rows.append(
+                    {
+                        **base,
+                        **parameter,
+                        "scientific_flags": _json_text(result_flags),
+                    }
+                )
+        _write_csv(
+            staged["parameters_long"],
+            parameter_rows,
+            columns=list(PARAMETER_BASE_COLUMNS),
+        )
 
-    if isinstance(batch, BatchRunResult):
-        batch_manifest = batch.manifest
-        input_hash = batch.input_hash
-        config_hash = batch.config_hash
-        mode = batch.mode
-    else:
-        batch_manifest = None
-        input_hash = None
-        config_hash = None
-        mode = "independent"
-    created_at = datetime.now(timezone.utc).isoformat()
-    provenance_value = _provenance_payload(
-        created_at=created_at,
-        mode=mode,
-        input_hash=input_hash,
-        config_hash=config_hash,
-        source_count=len(results),
-        user_provenance=provenance,
-        resolved_config=(batch.resolved_config if isinstance(batch, BatchRunResult) else None),
-    )
-    manifest_value = {
-        "created_at": created_at,
-        "mode": mode,
-        "input_hash": input_hash,
-        "config_hash": config_hash,
-        "frames": [_json_safe(item.frame.to_dict()) for item in results],
-        "user_manifest": _json_safe(batch_manifest),
-        "provenance": provenance_value,
-    }
-    manifest_path.write_text(json.dumps(manifest_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        ridge_rows: list[dict[str, Any]] = []
+        for index, item in enumerate(results):
+            for point_index, point in enumerate(_ridge_points(item.result)):
+                ridge_rows.append(
+                    {
+                        **_frame_base(item, index),
+                        "point_index": point_index,
+                        **point,
+                    }
+                )
+        _write_csv(staged["ridge_points"], ridge_rows)
 
-    provenance_path.write_text(json.dumps(provenance_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        lobe_rows: list[dict[str, Any]] = []
+        for index, item in enumerate(results):
+            lobe_rows.extend(_lobe_measurement_rows(item, index))
+        _write_csv(
+            staged["lobe_measurements"],
+            lobe_rows,
+            columns=list(CANONICAL_LOBE_COLUMNS),
+        )
 
-    _write_npz(npz_path, results)
-    _write_evolution(evolution_path, results)
-    published = _publish_staged_bundle(
-        stage,
-        {
-            "frame_summary": frame_summary_target,
-            "parameters_long": parameters_long_target,
-            "ridge_points": ridge_points_target,
-            "lobe_measurements": lobe_measurements_target,
-            "ellipse_fit": ellipse_fit_target,
-            "ellipse_fit_jsonl": ellipse_jsonl_target,
-            "frame_details": frame_details_target,
-            "manifest": manifest_target,
-            "provenance": provenance_target,
-            "npz": npz_target,
-            "evolution_png": evolution_target,
-        },
-        force=force,
-    )
-    # Keep the historical regular-export iteration stable.  The additional
-    # lobe CSV and commit marker remain addressable through mapping lookup and
-    # ``items()`` for new callers.
+        ellipse_rows = [
+            _batch_ellipse_row(item, index) for index, item in enumerate(results)
+        ]
+        staged["ellipse_fit"].write_text(
+            json.dumps({"frames": ellipse_rows}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        with staged["ellipse_fit_jsonl"].open("w", encoding="utf-8", newline="\n") as handle:
+            for row in ellipse_rows:
+                handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+        with staged["frame_details"].open("w", encoding="utf-8", newline="\n") as handle:
+            for index, item in enumerate(results):
+                arrays: dict[str, Any] = {}
+                _walk_arrays(item.result, f"frame_{index:04d}", arrays)
+                detail = _frame_detail_record(item, index, array_names=list(arrays))
+                handle.write(
+                    json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+                    + "\n"
+                )
+
+        if isinstance(batch, BatchRunResult):
+            batch_manifest = batch.manifest
+            input_hash = batch.input_hash
+            config_hash = batch.config_hash
+            mode = batch.mode
+        else:
+            batch_manifest = None
+            input_hash = None
+            config_hash = None
+            mode = "independent"
+        created_at = datetime.now(timezone.utc).isoformat()
+        provenance_value = _provenance_payload(
+            created_at=created_at,
+            mode=mode,
+            input_hash=input_hash,
+            config_hash=config_hash,
+            source_count=len(results),
+            user_provenance=provenance,
+            resolved_config=(batch.resolved_config if isinstance(batch, BatchRunResult) else None),
+        )
+        manifest_value = {
+            "created_at": created_at,
+            "mode": mode,
+            "input_hash": input_hash,
+            "config_hash": config_hash,
+            "frames": [_json_safe(item.frame.to_dict()) for item in results],
+            "user_manifest": _json_safe(batch_manifest),
+            "provenance": provenance_value,
+        }
+        staged["manifest"].write_text(
+            json.dumps(manifest_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        staged["provenance"].write_text(
+            json.dumps(provenance_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+        _write_npz(staged["npz"], results)
+        _write_evolution(staged["evolution_png"], results)
+        published = _publish_staged_bundle(stage, target_map, force=force)
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
     return _CompatExportMapping(
         published,
         hidden={"lobe_measurements", "commit_marker"},

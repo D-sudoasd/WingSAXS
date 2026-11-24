@@ -10,7 +10,6 @@ model or to select a candidate.
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import json
 import math
@@ -25,8 +24,12 @@ import numpy as np
 
 from .batch import FrameRef, build_frame_refs
 from .csv_utils import read_csv_rows, safe_csv_cell
+from .file_identity import sha256_bytes, sha256_file
+from .figure_support import save_agg_figure
 from .io import load_image
 from .path_contract import PathContractError, display_path, resolve_authorized_path
+from .path_utils import canonical_path as _canonical_path
+from .serialization import write_json_atomic, write_text_atomic
 
 
 ANNOTATION_PACK_SCHEMA_VERSION = "lamellarsaxs2d.annotation_pack.v2"
@@ -131,11 +134,6 @@ class _Candidate:
         )
 
 
-def _canonical_path(path: str | os.PathLike[str] | Path) -> str:
-    resolved = Path(path).expanduser().resolve(strict=False)
-    return os.path.normcase(resolved.as_posix()).replace("\\", "/")
-
-
 def _display_path(path: Path, package: Path) -> str:
     """Return package-relative paths and absolute paths for authorized externals."""
 
@@ -162,19 +160,11 @@ def _resolve_input_path(
         raise AnnotationPackError(str(exc)) from exc
 
 
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
     try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+        return sha256_file(path)
     except OSError as exc:
         raise AnnotationPackError(f"无法计算输入文件 SHA-256：{path}: {exc}") from exc
-    return digest.hexdigest()
 
 
 def _hashable(value: Any) -> Any:
@@ -193,7 +183,7 @@ def _hashable(value: Any) -> Any:
         return {
             "dtype": str(array.dtype),
             "shape": list(array.shape),
-            "sha256": _sha256_bytes(array.tobytes()),
+            "sha256": sha256_bytes(array.tobytes()),
         }
     if isinstance(value, np.generic):
         return _hashable(value.item())
@@ -210,7 +200,7 @@ def _hash_inline(value: Any) -> str:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
-    return _sha256_bytes(encoded)
+    return sha256_bytes(encoded)
 
 
 def _relative_or_inline_path(
@@ -706,28 +696,23 @@ def _write_csv(path: Path, columns: Sequence[str], rows: Sequence[Mapping[str, A
 
 def _write_blind_png(path: Path, array: np.ndarray, vmin: float, vmax: float) -> None:
     import matplotlib as mpl
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
     cmap = mpl.colormaps.get_cmap("magma").with_extremes(bad="black")
     figure = Figure(figsize=(4.0, 4.0), dpi=150)
-    FigureCanvasAgg(figure)
-    try:
-        axis = figure.add_subplot(1, 1, 1)
-        axis.imshow(
-            np.ma.masked_invalid(np.asarray(array, dtype=float)),
-            origin="lower",
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            interpolation="nearest",
-            aspect="equal",
-        )
-        axis.axis("off")
-        figure.subplots_adjust(0, 0, 1, 1)
-        figure.savefig(path, format="png", dpi=150, pad_inches=0)
-    finally:
-        figure.clear()
+    axis = figure.add_subplot(1, 1, 1)
+    axis.imshow(
+        np.ma.masked_invalid(np.asarray(array, dtype=float)),
+        origin="lower",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+        aspect="equal",
+    )
+    axis.axis("off")
+    figure.subplots_adjust(0, 0, 1, 1)
+    save_agg_figure(figure, path, clear=True, format="png", dpi=150, pad_inches=0)
 
 
 def _global_display_scale(candidates: Sequence[_Candidate]) -> tuple[float, float]:
@@ -1085,7 +1070,7 @@ def build_annotation_pack(
         for candidate in selected
     ]
     _write_csv(output_root / "annotation_manifest.csv", _MANIFEST_COLUMNS, manifest_rows)
-    (payload_root / "annotation_protocol.md").write_text(_make_protocol(), encoding="utf-8")
+    write_text_atomic(payload_root / "annotation_protocol.md", _make_protocol())
     blind_image_hashes = {
         candidate.blind_id: _sha256_file(payload_root / f"{candidate.blind_id}.png")
         for candidate in selected
@@ -1150,11 +1135,7 @@ def build_annotation_pack(
         *(f"blind_payload/{candidate.blind_id}.png" for candidate in selected),
     ]
     status["immutable_output_hashes"] = _output_hashes(output_root, immutable_names)
-    (output_root / "annotation_status.json").write_text(
-            json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
-            + "\n",
-            encoding="utf-8",
-        )
+    write_json_atomic(output_root / "annotation_status.json", status)
     output_names = [
         *immutable_names,
         "blind_payload/annotator_a.csv",

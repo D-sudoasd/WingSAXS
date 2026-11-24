@@ -10,14 +10,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import csv
-import hashlib
 import html
 import importlib.metadata
 import json
 import os
 from pathlib import Path
-import shutil
-import tempfile
 from typing import Any
 
 import matplotlib as mpl
@@ -26,8 +23,7 @@ from matplotlib.figure import Figure
 import numpy as np
 
 from .cancellation import raise_if_cancelled
-from .serialization import json_safe
-
+from .file_identity import sha256_file
 from .figure_support import (
     _EXPORT_LOCK,
     _FIGURE_RC,
@@ -37,7 +33,10 @@ from .figure_support import (
     _point_display_status,
     _prepare_inputs,
     _supported_arc_segments,
+    save_agg_figure,
 )
+from .path_utils import atomic_stage_dir
+from .serialization import json_safe, write_json_atomic, write_text_atomic
 
 
 FIGURE_METHOD_VERSION = "butterfly-measurement-figure-v1"
@@ -831,27 +830,6 @@ def _write_source_data(path: Path, data: Mapping[str, Any]) -> None:
     )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _write_json(path: Path, payload: Any) -> None:
-    with path.open("w", encoding="utf-8", newline="\n") as stream:
-        json.dump(
-            json_safe(payload),
-            stream,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-            allow_nan=False,
-        )
-        stream.write("\n")
-
-
 def export_butterfly_figure(
     target: str | os.PathLike[str],
     *,
@@ -899,11 +877,6 @@ def export_butterfly_figure(
         dpi=dpi,
     )
     raise_if_cancelled(cancel_event, "butterfly-figure:render")
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(
-        tempfile.mkdtemp(prefix=f".{target_path.name}.staging-", dir=target_path.parent)
-    )
-    committed = False
     output_names = {
         "svg": "butterfly_figure.svg",
         "pdf": "butterfly_figure.pdf",
@@ -919,41 +892,46 @@ def export_butterfly_figure(
         "index": "index.html",
         "manifest": "manifest.json",
     }
-    staged = {key: stage / name for key, name in output_names.items()}
-    try:
+    with atomic_stage_dir(
+        target_path,
+        existing_message=f"figure target already exists: {target_path}",
+    ) as stage:
+        staged = {key: stage / name for key, name in output_names.items()}
         _notify(progress, 5, "render")
         raise_if_cancelled(cancel_event, "butterfly-figure:render")
         with _EXPORT_LOCK, mpl.rc_context(effective_rc):
             figure = _build_figure(data, cmap=cmap)
             figure.canvas.draw()
             raise_if_cancelled(cancel_event, "butterfly-figure:save-vector")
-            figure.savefig(
-                staged["svg"], format="svg", facecolor="white", transparent=False
+            save_agg_figure(
+                figure, staged["svg"], format="svg", facecolor="white", transparent=False
             )
-            figure.savefig(
-                staged["pdf"], format="pdf", facecolor="white", transparent=False
+            save_agg_figure(
+                figure, staged["pdf"], format="pdf", facecolor="white", transparent=False
             )
             raise_if_cancelled(cancel_event, "butterfly-figure:save-raster")
-            figure.savefig(
+            save_agg_figure(
+                figure,
                 staged["tiff"],
                 format="tiff",
                 dpi=data["dpi"],
                 facecolor="white",
                 transparent=False,
             )
-            figure.savefig(
+            save_agg_figure(
+                figure,
                 staged["png"],
+                clear=True,
                 format="png",
                 dpi=data["dpi"],
                 facecolor="white",
                 transparent=False,
             )
-            figure.clear()
         _notify(progress, 35, "source_data")
         raise_if_cancelled(cancel_event, "butterfly-figure:source-data")
         _write_source_data(staged["source_data"], data)
         _write_ridge_csv(staged["ridge_points"], data["points"], data["point_overlay"])
-        _write_json(staged["result"], data["result_safe"])
+        write_json_atomic(staged["result"], data["result_safe"])
         _notify(progress, 55, "comparison")
         raise_if_cancelled(cancel_event, "butterfly-figure:comparison")
         from .butterfly_comparison import export_butterfly_comparison
@@ -1047,7 +1025,7 @@ def export_butterfly_figure(
         figure_settings["peak_landmarks"] = peak_metadata
         if sector_metadata:
             figure_settings["sector_peaks"] = sector_metadata
-        _write_json(staged["settings"], figure_settings)
+        write_json_atomic(staged["settings"], figure_settings)
         caption = _caption(data)
         caption += "\n\nComparison assets: see comparison_caption.txt."
         if model is not None:
@@ -1056,12 +1034,12 @@ def export_butterfly_figure(
             caption += "\n\nSector-integrated primary peaks: see sector_caption.txt. Pixel-brightness landmark diagnostics remain ancillary and are not sector peak positions."
         if annular_outputs:
             caption += "\n\nFixed-q annular trajectories: see annular_caption.txt. Angular peak positions trace each petal outwards; the sampled ring radii are not radial reflection peaks."
-        staged["caption"].write_text(caption + "\n", encoding="utf-8")
+        write_text_atomic(staged["caption"], caption + "\n")
         _notify(progress, 68, "package")
         raise_if_cancelled(cancel_event, "butterfly-figure:package")
         _write_radial_profile_csv(staged["radial_profile"], data)
         figure_qa = _figure_qa(data, model_supplied=model is not None)
-        _write_json(staged["figure_qa"], figure_qa)
+        write_json_atomic(staged["figure_qa"], figure_qa)
         all_staged = {
             **staged,
             **comparison_outputs,
@@ -1080,7 +1058,7 @@ def export_butterfly_figure(
         _notify(progress, 72, "hash")
         raise_if_cancelled(cancel_event, "butterfly-figure:hash")
         file_hashes = {
-            path.name: _sha256(path)
+            path.name: sha256_file(path)
             for key, path in all_staged.items()
             if key != "manifest"
         }
@@ -1118,22 +1096,10 @@ def export_butterfly_figure(
         if annular_outputs:
             manifest["annular_manifest_file"] = "annular_manifest.json"
             manifest["annular_peak_figure_method_version"] = annular_metadata.get("method_version")
-        _write_json(staged["manifest"], manifest)
+        write_json_atomic(staged["manifest"], manifest)
         _notify(progress, 100, "publish")
         raise_if_cancelled(cancel_event, "butterfly-figure:publish")
-        if target_path.exists():
-            raise FileExistsError(f"figure target already exists: {target_path}")
-        # The staging directory is a sibling, so this rename is an atomic
-        # same-volume publish on supported local filesystems.
-        os.rename(stage, target_path)
-        committed = True
-        return {key: target_path / path.name for key, path in all_staged.items()}
-    finally:
-        if not committed and stage.exists():
-            try:
-                shutil.rmtree(stage)
-            except OSError:
-                pass
+    return {key: target_path / path.name for key, path in all_staged.items()}
 
 
 __all__ = [

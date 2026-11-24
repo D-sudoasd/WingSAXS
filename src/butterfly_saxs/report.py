@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack
 import csv
 import hashlib
 import html
@@ -16,7 +17,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -24,9 +24,10 @@ from urllib.parse import quote
 import numpy as np
 
 from .csv_utils import iter_csv_rows, safe_csv_cell
-from .serialization import json_safe
 from .file_identity import file_version
+from .path_utils import atomic_stage_dir
 from .producer import producer_identity
+from .serialization import json_safe, write_json_atomic, write_text_atomic
 
 if TYPE_CHECKING:
     from .lamellar_models import LamellarSettings
@@ -61,8 +62,7 @@ def _plot_parameter_rows(path: Path) -> list[dict[str, Any]]:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(json_safe(value), ensure_ascii=False, indent=2,
-                               allow_nan=False) + "\n", encoding="utf-8")
+    write_json_atomic(path, value, sort_keys=False)
 
 
 def _receipt_seal(value: Mapping[str, Any]) -> str:
@@ -582,8 +582,6 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                         break
                 if valid and _source_state(folder, prefix, verified_sources) == state:
                     return {**old, "operation_status": "reused", "outputs": {"index": str(target / "index.html"), "summary": str(receipt)}}
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=".analysis-report-", dir=target.parent))
     tables: dict[str, _Table] = {}
     frames = _read_rows(summary_path)
     with np.load(archive_path, allow_pickle=False) as archive:
@@ -598,7 +596,11 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
     base_columns = ("frame_index", "frame_id", "time", "time_unit", "status", "q_unit")
     lamellar_base_columns = ("frame_index", "frame_id", "time", "time_unit", "frame_status", "q_unit")
     profile_columns = ("mean", "sum", "std", "sem", "count", "candidate_count", "coverage", "sem_kind")
-    try:
+    with ExitStack() as exit_stack:
+        stage = exit_stack.enter_context(
+            atomic_stage_dir(target, prefix=".analysis-report-", overwrite=True)
+        )
+        exit_stack.callback(lambda: [table.close() for table in tables.values()])
         for name, columns in {
             "radial_profiles": (*base_columns, "bin_index", "q_min", "q_max", "q_center", *profile_columns),
             "angular_profiles": (*base_columns, "bin_index", "angle_min_deg", "angle_max_deg", "angle_center_deg", *profile_columns),
@@ -806,25 +808,7 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
         _write_json(stage / "report_summary.json", report)
         if _source_state(folder, prefix, verified_sources) != state:
             raise ValueError("Batch outputs changed during reporting; finish the export then retry report --resume.")
-        backup = target.with_name(f".{target.name}-previous")
-        if backup.exists():
-            raise FileExistsError(f"Previous report backup exists: {backup}; recover it before replacing the report.")
-        if target.exists():
-            os.replace(target, backup)
-        try:
-            os.replace(stage, target)
-        except BaseException:
-            if backup.exists():
-                os.replace(backup, target)
-            raise
-        if backup.exists():
-            shutil.rmtree(backup)
-        return {**report, "outputs": {"index": str(target / "index.html"), "summary": str(target / "report_summary.json")}}
-    finally:
-        for table in tables.values():
-            table.close()
-        if stage.exists():
-            shutil.rmtree(stage)
+    return {**report, "outputs": {"index": str(target / "index.html"), "summary": str(target / "report_summary.json")}}
 
 
 def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "", force: bool = False, resume: bool = False,
@@ -880,22 +864,6 @@ def build_analysis_report(output_dir: str | os.PathLike[str], *, prefix: str = "
 
     with output_lock(root):
         return _build_reports(root, prefix=prefix, force=force, resume=resume, settings=settings, progress=progress)
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
 
 
 def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
@@ -1004,7 +972,7 @@ def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
     table_links = " · ".join(_link(path, label.replace("_", " ")) for label, path in collection_tables.items())
     document = _page("WingSAXS sample reports", f'<section><h2>All samples</h2><p>{table_links}</p></section>' + comparison_section + body)
     if not collection.exists() or collection.read_text(encoding="utf-8") != document:
-        _write_text_atomic(collection, document)
+        write_text_atomic(collection, document)
     combined_outputs = {
         "index": str(collection),
         "summary": str(root / "analysis_report_summary.json"),
@@ -1023,9 +991,9 @@ def _build_reports(root: Path, *, prefix: str, force: bool, resume: bool,
     if comparison_summary is not None:
         combined["comparison_report"] = comparison_summary
     summary = root / "analysis_report_summary.json"
-    text = json.dumps(combined, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    text = json.dumps(json_safe(combined), ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     if not summary.exists() or summary.read_text(encoding="utf-8") != text:
-        _write_text_atomic(summary, text)
+        write_text_atomic(summary, text)
     return combined
 
 

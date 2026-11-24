@@ -52,8 +52,17 @@ def _package_version(name: str) -> str | None:
 
 
 def code_hashes():
-    return {str(p.relative_to(REPO)).replace("\\", "/"): digest(p)
-            for p in sorted((REPO / "src" / "butterfly_saxs").glob("*.py"))}
+    pkg_root = REPO / "src" / "butterfly_saxs"
+    entries = []
+    for p in pkg_root.rglob("*.py"):
+        if not p.is_file():
+            continue
+        rel_parts = p.relative_to(pkg_root).parts
+        if any(part == "__pycache__" or part.startswith(".") for part in rel_parts):
+            continue
+        entries.append((p.relative_to(REPO).as_posix(), p))
+    entries.sort(key=lambda item: item[0])
+    return {rel_posix: digest(p) for rel_posix, p in entries}
 
 
 def record_fit(name, data, qmap, mask, window, options, reference, multistart, analysis=None):

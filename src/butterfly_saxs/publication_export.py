@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import json
 import os
-import shutil
-import tempfile
 import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -17,9 +14,13 @@ from typing import Any
 import numpy as np
 from matplotlib import rc_context
 
+from .file_identity import sha256_file
+from .figure_support import save_agg_figure
 from .lamellar_export import _jsonable, _parameter_rows, _scene_arrays
+from .path_utils import atomic_stage_dir
 from .publication_models import PublicationFigureSpec, PublicationRenderResult, PublicationStyle
 from .publication_render import _as_render_result, _scene_status, render_publication_figure
+from .serialization import write_json_atomic, write_text_atomic
 
 
 PUBLICATION_EXPORT_FORMAT = "lamellarsaxs2d.publication-export.v1"
@@ -58,18 +59,6 @@ def _report_progress(callback: Any, current: int, total: int) -> None:
         callback(current, total)
     except TypeError:
         callback(current)
-
-
-def _hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(_jsonable(payload), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def _write_parameter_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -121,22 +110,6 @@ def _native_render(
         cancel_event=cancel_event,
     )
     return _as_render_result(rendered)
-
-
-def _new_stage(destination: str | os.PathLike[str] | Path) -> tuple[Path, Path]:
-    raw = Path(destination).expanduser()
-    target = raw.resolve()
-    if os.path.lexists(raw) or os.path.lexists(target):
-        raise FileExistsError(f"publication export target already exists: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
-    return target, stage
-
-
-def _publish(stage: Path, target: Path) -> None:
-    if os.path.lexists(target):
-        raise FileExistsError(f"publication export target already exists: {target}")
-    os.rename(stage, target)
 
 
 def _geometry_metrics(scene: Any) -> dict[str, Any]:
@@ -275,7 +248,7 @@ def _caption(scene: Any, spec: PublicationFigureSpec) -> str:
 def _manifest(stage: Path, *, scene: Any, spec: PublicationFigureSpec, rendered: PublicationRenderResult) -> dict[str, Any]:
     artifacts = []
     for path in sorted(item for item in stage.iterdir() if item.is_file() and item.name != "manifest.json"):
-        artifacts.append({"name": path.name, "size": path.stat().st_size, "sha256": _hash(path)})
+        artifacts.append({"name": path.name, "size": path.stat().st_size, "sha256": sha256_file(path)})
     return {
         "format_version": PUBLICATION_EXPORT_FORMAT,
         "scene_status": _scene_status(scene),
@@ -292,7 +265,7 @@ def _manifest(stage: Path, *, scene: Any, spec: PublicationFigureSpec, rendered:
 def _verify_manifest(stage: Path, manifest: Mapping[str, Any]) -> None:
     for item in manifest.get("artifacts", ()):
         path = stage / str(item["name"])
-        if not path.is_file() or _hash(path) != str(item["sha256"]):
+        if not path.is_file() or sha256_file(path) != str(item["sha256"]):
             raise OSError(f"publication manifest hash mismatch: {path.name}")
     readback = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
     if readback.get("file_hashes") != manifest.get("file_hashes"):
@@ -309,7 +282,16 @@ def _save_figure(fig: Any, path: Path, spec: PublicationFigureSpec, fmt: str) ->
             fig.set_size_inches(np.asarray(spec.pixel_size) / spec.dpi)
         destination = io.BytesIO() if raster else path
         with rc_context({"svg.fonttype": "none", "pdf.fonttype": 42, "ps.fonttype": 42}):
-            fig.savefig(destination, format=fmt, dpi=spec.dpi, bbox_inches=None, pad_inches=0, facecolor=facecolor, transparent=spec.background == "transparent")
+            save_agg_figure(
+                fig,
+                destination,
+                format=fmt,
+                dpi=spec.dpi,
+                bbox_inches=None,
+                pad_inches=0,
+                facecolor=facecolor,
+                transparent=spec.background == "transparent",
+            )
         if raster:
             from PIL import Image
 
@@ -361,8 +343,11 @@ def export_publication_figure(
     _check_cancel(cancel_event)
     progress_total = 11
     progress_current = 0
-    target, stage = _new_stage(destination)
-    try:
+    target = Path(destination).expanduser().resolve()
+    with atomic_stage_dir(
+        destination,
+        existing_message=f"publication export target already exists: {target}",
+    ) as stage:
         native = _as_render_result(rendered_scene) if rendered_scene is not None else _native_render(scene, resolved_style, resolved_spec, camera=camera, cancel_event=cancel_event)
         renderer_declaration = _native_contract(scene, resolved_style, resolved_spec, native)
         _check_cancel(cancel_event)
@@ -382,17 +367,17 @@ def export_publication_figure(
         _check_cancel(cancel_event)
         progress_current += 1
         _report_progress(progress, progress_current, progress_total)
-        _write_json(stage / "source_settings.json", {
+        write_json_atomic(stage / "source_settings.json", _jsonable({
             "format_version": PUBLICATION_EXPORT_FORMAT,
             "figure_spec": resolved_spec.to_dict(),
             "style": resolved_style.to_dict(),
             "camera": _jsonable(native.camera),
             "native_render_provenance": native.provenance,
-        })
+        }))
         _check_cancel(cancel_event)
         progress_current += 1
         _report_progress(progress, progress_current, progress_total)
-        (stage / "figure_caption.txt").write_text(_caption(scene, resolved_spec), encoding="utf-8")
+        write_text_atomic(stage / "figure_caption.txt", _caption(scene, resolved_spec))
         _check_cancel(cancel_event)
         progress_current += 1
         _report_progress(progress, progress_current, progress_total)
@@ -419,7 +404,7 @@ def export_publication_figure(
             "camera": native.camera,
             "bounds": native.bounds,
         }
-        _write_json(stage / "provenance.json", provenance)
+        write_json_atomic(stage / "provenance.json", _jsonable(provenance))
         _check_cancel(cancel_event)
         progress_current += 1
         _report_progress(progress, progress_current, progress_total)
@@ -429,19 +414,13 @@ def export_publication_figure(
         progress_current += 1
         _report_progress(progress, progress_current, progress_total)
         manifest = _manifest(stage, scene=scene, spec=resolved_spec, rendered=native)
-        _write_json(stage / "manifest.json", manifest)
+        write_json_atomic(stage / "manifest.json", _jsonable(manifest))
         _verify_manifest(stage, manifest)
         _check_cancel(cancel_event)
         progress_current += 1
         _report_progress(progress, progress_current, progress_total)
         _check_cancel(cancel_event)
-        _publish(stage, target)
-        output = _output_paths(target)
-        return output
-    except BaseException:
-        if stage.exists():
-            shutil.rmtree(stage, ignore_errors=True)
-        raise
+    return _output_paths(target)
 
 
 __all__ = ["PUBLICATION_EXPORT_FORMAT", "PublicationExportCancelled", "export_publication_figure"]

@@ -9,6 +9,29 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+def sha256_bytes(data: bytes | bytearray | memoryview) -> str:
+    """Return the hex SHA-256 digest for in-memory bytes."""
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(
+    path: str | os.PathLike[str] | Path,
+    *,
+    chunk_size: int = 1024 * 1024,
+    check_cancel: Callable[[], None] | None = None,
+) -> str:
+    """Stream ``path`` in bounded chunks and return its hex SHA-256 digest."""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(chunk_size), b""):
+            if check_cancel is not None:
+                check_cancel()
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def stream_digest(
     handle: Any, *, check_cancel: Callable[[], None] | None = None,
 ) -> tuple[int, str]:
@@ -89,3 +112,11 @@ def file_version(path: Path, info: os.stat_result) -> tuple[int | None, ...]:
         info.st_dev, info.st_ino, info.st_size,
         info.st_mtime_ns, info.st_ctime_ns, revision,
     )
+
+
+__all__ = [
+    "file_version",
+    "sha256_bytes",
+    "sha256_file",
+    "stream_digest",
+]

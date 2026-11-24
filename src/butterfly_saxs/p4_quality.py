@@ -16,6 +16,8 @@ from typing import Any
 
 import numpy as np
 
+from .settings import canonical_q_unit
+
 
 ENGINEERING_THRESHOLDS_VERSION = "p4-engineering-provisional-v1"
 
@@ -56,30 +58,8 @@ def _finite(value: Any) -> float | None:
 
 
 def _physical_q_unit(value: Any) -> bool:
-    normalized = (
-        str(value or "unknown")
-        .strip()
-        .casefold()
-        .replace(" ", "")
-        .replace("⁻¹", "^-1")
-        .replace("−", "-")
-        .replace("å", "a")
-        .replace("Å", "a")
-    )
-    return normalized in {
-        "1/nm",
-        "nm^-1",
-        "nm-1",
-        "nm**-1",
-        "1/a",
-        "a^-1",
-        "a-1",
-        "a**-1",
-        "1/angstrom",
-        "angstrom^-1",
-        "angstrom-1",
-        "angstrom**-1",
-    }
+    cleaned = str(value or "unknown").replace("**-1", "^-1")
+    return canonical_q_unit(cleaned) in {"nm⁻¹", "Å⁻¹"}
 
 
 def _point_rows(ridge: Any) -> list[Any]:

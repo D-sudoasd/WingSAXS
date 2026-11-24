@@ -1,48 +1,42 @@
-"""Command line entry points for the shared WingSAXS pipeline."""
+"""Command line parser and lazy dispatcher for the shared WingSAXS pipeline.
+
+``import butterfly_saxs.cli``, ``bsaxs --help``, and ``bsaxs describe`` must
+remain strictly free of scientific and UI imports (``numpy``, ``scipy``,
+``matplotlib``, ``pyFAI``, ``h5py``, ``fabio``, ``PySide6``).  Subcommand
+handlers live under :mod:`butterfly_saxs._cli` and are imported only inside
+:func:`main` after argument parsing succeeds.
+"""
 
 from __future__ import annotations
 
 import argparse
-import glob
-import json
-import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-import os
-import sys
-import tomllib
-from typing import Any, Sequence
+from typing import Any
 
-from .cancellation import AnalysisCancelled
-from .cli_contract import (
-    agent_manifest,
-    annotate_report,
-    cli_error_payload,
-    usage_error_payload,
+from ._cli.common import (
+    _BRIGHT_AXIS_CONVENTIONS,
+    _INTENSITY_MODES,
+    _JOURNAL_STYLES,
+    _REPORT_DEFAULT_FORMATS,
+    _REPORT_FORMATS,
+    _BatchFrameAnalyzer,
+    add_refinement_options as _add_refinement_options,
+    analysis_overrides as _analysis_overrides,
+    emit_error as _emit_error,
+    filter_supported_kwargs as _filter_supported_kwargs,
+    integer_at_least as _integer_at_least,
+    parse_beamstop_radius as _beamstop_radius,
+    parse_shape as _shape,
+    pipeline_symbol as _pipeline_symbol,
+    print_json as _print_json,
 )
+from .cancellation import AnalysisCancelled
+from .cli_contract import usage_error_payload
 from .errors import PipelineError
-from .path_utils import filter_supported_image_paths
-from .project import ProjectConfig, ProjectConfigError, load_project
-from .settings import deep_merge_mapping
+from .project import ProjectConfigError
 
-
-def _pipeline_symbol(name: str) -> Any:
-    """Return a pipeline object, honouring test monkeypatches on this module.
-
-    ``bsaxs describe`` / ``bsaxs doctor`` / ``--help`` must not import NumPy.
-    Handlers load ``pipeline`` on demand.  Tests patch ``cli.analyze_frame``
-    and ``cli.run_project``; those names win over the live pipeline symbols.
-    """
-
-    patched = globals().get(name)
-    if patched is not None:
-        return patched
-    from . import pipeline as pipeline_module
-
-    return getattr(pipeline_module, name)
-
-
-# Patch seams for tests.  ``None`` means "import from pipeline on demand".
+# Patch seams for tests. ``None`` means "import from target module on demand".
 analyze_frame = None
 inspect_frame = None
 run_project = None
@@ -51,541 +45,37 @@ launch_gui = None
 advise_frame = None
 run_campaign = None
 
-_WORKFLOW_PRESETS = ("annular", "curvature", "sector", "butterfly_pub")
-_JOURNAL_STYLES = ("default", "nature", "nature_comm", "science", "macromolecules")
-_BRIGHT_AXIS_CONVENTIONS = ("draw", "reference")
-_INTENSITY_MODES = ("calibrated", "raw")
-
-
-def _advisor_callable() -> Any:
-    """Return ``advise_frame`` lazily, honouring monkeypatches on this module."""
-
-    patched = globals().get("advise_frame")
-    if patched is not None:
-        return patched
-    try:
-        from .auto_advisor import advise_frame as live_advise
-    except ModuleNotFoundError as exc:
-        raise PipelineError(
-            "auto_advisor module is unavailable in this installation"
-        ) from exc
-    return live_advise
-
-
-def _campaign_runner() -> Any:
-    """Return ``run_campaign`` lazily, honouring monkeypatches on this module."""
-
-    patched = globals().get("run_campaign")
-    if patched is not None:
-        return patched
-    from .campaign import run_campaign as live_run_campaign
-
-    return live_run_campaign
-
-
-def _shape(value: str) -> tuple[int, int]:
-    pieces = [item for item in value.replace("×", "x").replace(",", "x").split("x") if item]
-    if len(pieces) != 2:
-        raise argparse.ArgumentTypeError("shape 应为 HxW，例如 256x256")
-    try:
-        result = tuple(int(item) for item in pieces)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("shape 应为 HxW，例如 256x256") from exc
-    if any(item < 4 for item in result):
-        raise argparse.ArgumentTypeError("shape 的两个尺寸必须至少为 4")
-    return result  # type: ignore[return-value]
-
-
-def _integer_at_least(minimum: int, label: str):
-    def parse(value: str) -> int:
-        try:
-            result = int(value)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(f"{label} 必须是整数") from exc
-        if result < minimum:
-            raise argparse.ArgumentTypeError(f"{label} 必须至少为 {minimum}")
-        return result
-
-    return parse
-
-
-def _beamstop_radius(value: str) -> float | str:
-    """Parse ``--beamstop-radius-px`` as a non-negative finite float or ``'auto'``."""
-
-    text = str(value).strip()
-    if text.lower() == "auto":
-        return "auto"
-    try:
-        parsed = float(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "beamstop-radius-px 必须是非负有限数值（像素）或 auto"
-        ) from exc
-    if not math.isfinite(parsed) or parsed < 0.0:
-        raise argparse.ArgumentTypeError(
-            "beamstop-radius-px 必须是非负有限数值（像素）或 auto"
-        )
-    return parsed
-
-
-def _filter_supported_kwargs(
-    func: Any,
-    optional_kwargs: Mapping[str, Any],
-    *,
-    aliases: Mapping[str, Sequence[str]] | None = None,
-) -> tuple[dict[str, Any], list[str]]:
-    """Filter optional kwargs against ``func``'s signature without heavy imports."""
-
-    if not optional_kwargs:
-        return {}, []
-    import inspect as _inspect
-
-    try:
-        sig = _inspect.signature(func)
-        params = sig.parameters
-        accepts_var_kw = any(
-            p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
-    except (TypeError, ValueError):
-        return dict(optional_kwargs), []
-    if accepts_var_kw:
-        return dict(optional_kwargs), []
-    accepted: dict[str, Any] = {}
-    unsupported: list[str] = []
-    alias_map = aliases or {}
-    for key, value in optional_kwargs.items():
-        if key in params:
-            accepted[key] = value
-            continue
-        matched = next((alt for alt in alias_map.get(key, ()) if alt in params), None)
-        if matched is not None:
-            accepted[matched] = value
-        else:
-            unsupported.append(key)
-    return accepted, unsupported
-
-
-class _BatchFrameAnalyzer:
-    """Picklable per-frame adapter for ``batch`` (safe for Windows spawn pools)."""
-
-    def __init__(
-        self,
-        *,
-        poni: Any = None,
-        full2d: bool = False,
-        frame: int | None = None,
-        dataset: str | None = None,
-        mask: Any = None,
-        mask_frame: int | None = None,
-        mask_dataset: str | None = None,
-        valid_mask: Any = None,
-        beamstop_radius_px: float | str | None = None,
-    ) -> None:
-        self.poni = poni
-        self.full2d = full2d
-        self.frame = frame
-        self.dataset = dataset
-        self.mask = mask
-        self.mask_frame = mask_frame
-        self.mask_dataset = mask_dataset
-        self.valid_mask = valid_mask
-        self.beamstop_radius_px = beamstop_radius_px
-        self._geometry_cache: dict[Any, Any] = {}
-
-    def __getstate__(self) -> dict[str, Any]:
-        state = dict(self.__dict__)
-        state["_geometry_cache"] = {}
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__dict__.update(state)
-        if "_geometry_cache" not in self.__dict__:
-            self._geometry_cache = {}
-
-    def __call__(
-        self,
-        frame_ref: Any,
-        initial_parameters: Any = None,
-        config: Any = None,
-    ) -> Any:
-        source = getattr(frame_ref, "path", frame_ref)
-        selected_frame = self.frame
-        if selected_frame is None:
-            selected_frame = getattr(frame_ref, "frame_selector", None)
-        selected_dataset = self.dataset
-        if selected_dataset is None:
-            selected_dataset = getattr(frame_ref, "dataset", None)
-            if selected_dataset is None:
-                selected_dataset = getattr(frame_ref, "dataset_id", None) or None
-        analyze_fn = _pipeline_symbol("analyze_frame")
-        call_kwargs: dict[str, Any] = {
-            "poni": self.poni,
-            "config": config,
-            "full2d": self.full2d,
-            "initial_parameters": initial_parameters,
-            "frame": selected_frame,
-            "dataset": selected_dataset,
-            "mask": self.mask,
-            "mask_frame": self.mask_frame,
-            "mask_dataset": self.mask_dataset,
-            "valid_mask": self.valid_mask,
-            "geometry_cache": self._geometry_cache,
-        }
-        if self.beamstop_radius_px is not None:
-            accepted, _ = _filter_supported_kwargs(
-                analyze_fn, {"beamstop_radius_px": self.beamstop_radius_px}
-            )
-            call_kwargs.update(accepted)
-        return analyze_fn(source, **call_kwargs)
-
-
-_REPORT_FORMATS = ("png", "svg", "pdf", "tiff")
-_REPORT_DEFAULT_FORMATS = ("png", "svg", "pdf")
 _REPORT_BIN_COUNT = _integer_at_least(2, "report bin 数")
 _REPORT_DPI = _integer_at_least(1, "report dpi")
-_REPORT_MAX_GRID_CELLS = 1_000_000
 
 
-def _validate_report_options(radial_bins: int, angular_bins: int) -> None:
-    if radial_bins * angular_bins > _REPORT_MAX_GRID_CELLS:
-        raise ValueError(
-            "report radial_bins * angular_bins must not exceed "
-            f"{_REPORT_MAX_GRID_CELLS}"
-        )
-
-
-def _report_resume_command(
+def _build_analysis_report(
     output_dir: str | Path,
     *,
-    radial_bins: int,
-    angular_bins: int,
-    formats: Sequence[str],
-    dpi: int,
-    lamellar_settings_path: str | os.PathLike[str] | None = None,
-) -> list[str]:
-    command = ["bsaxs", "report", os.fspath(output_dir), "--resume"]
-    if radial_bins != 128:
-        command.extend(("--radial-bins", str(radial_bins)))
-    if angular_bins != 72:
-        command.extend(("--angular-bins", str(angular_bins)))
-    if tuple(formats) != _REPORT_DEFAULT_FORMATS:
-        command.extend(("--formats", *(str(value) for value in formats)))
-    if dpi != 180:
-        command.extend(("--dpi", str(dpi)))
-    if lamellar_settings_path is not None:
-        command.extend(("--lamellar-settings", os.fspath(lamellar_settings_path)))
-    return command
+    resume: bool = False,
+    force: bool = False,
+    radial_bins: int = 128,
+    angular_bins: int = 72,
+    formats: Sequence[str] = ("png", "svg", "pdf"),
+    dpi: int = 180,
+    lamellar_settings: Mapping[str, Any] | None = None,
+    journal_style: str | None = None,
+) -> Mapping[str, Any]:
+    """Load the optional report pipeline only when a report is requested."""
 
+    from ._cli.reporting_cmd import build_analysis_report_cmd
 
-def _load_lamellar_settings(path: str | os.PathLike[str] | None) -> dict[str, Any] | None:
-    """Load and validate one JSON/TOML lamellar geometry settings mapping."""
-
-    if path is None:
-        return None
-    source = Path(path).expanduser()
-    raw = source.read_text(encoding="utf-8-sig")
-    suffix = source.suffix.lower()
-    try:
-        if suffix == ".json":
-            value = json.loads(raw)
-        elif suffix == ".toml":
-            value = tomllib.loads(raw)
-        elif suffix:
-            raise ValueError("lamellar settings file must use .json or .toml")
-        else:
-            try:
-                value = json.loads(raw)
-            except json.JSONDecodeError:
-                value = tomllib.loads(raw)
-    except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise ValueError(f"invalid lamellar settings file {source}: {exc}") from exc
-    if not isinstance(value, Mapping):
-        raise ValueError("lamellar settings file must contain a mapping")
-
-    from .lamellar_models import LamellarSettings
-
-    try:
-        settings_mapping: Mapping[str, Any] = value
-        for key in ("lamellar", "lamellar_settings", "settings"):
-            nested = value.get(key)
-            if isinstance(nested, Mapping):
-                settings_mapping = nested
-                break
-        allowed_fields = set(LamellarSettings().to_dict())
-        unknown_fields = sorted(set(settings_mapping) - allowed_fields)
-        if unknown_fields:
-            supported = ", ".join(sorted(allowed_fields))
-            names = ", ".join(str(name) for name in unknown_fields)
-            raise ValueError(
-                f"unknown lamellar setting(s): {names}; supported fields: {supported}"
-            )
-        # LamellarSettings' general-purpose defaults serve interactive use;
-        # reports deliberately default to ellipse-derived period and multiple
-        # stacks. Merge those report defaults before applying user overrides.
-        normalized = {"mode": "multi", "period_source": "ellipse"}
-        normalized.update(settings_mapping)
-        return LamellarSettings.from_mapping(normalized).to_dict()
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid lamellar settings in {source}: {exc}") from exc
-
-
-def _config(value: str | None) -> ProjectConfig | None:
-    if not value:
-        return None
-    source = Path(value)
-    return load_project(source).resolve_paths(source.parent)
-
-
-def _unattended_source_path(value: str | os.PathLike[str], package_root: Path) -> str:
-    """Resolve a CLI source path once for preflight and batch fitting."""
-
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute() and not candidate.exists():
-        candidate = package_root / candidate
-    return str(candidate.resolve(strict=False))
-
-
-def _analysis_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """Collect explicit CLI refinement controls without overriding TOML defaults."""
-
-    mapping: dict[str, Any] = {}
-    for argument, key in (
-        ("q_min", "q_min"),
-        ("q_max", "q_max"),
-        ("q_window", "q_window"),
-        ("ridge_method", "ridge_method"),
-        ("ridge_snr_threshold", "ridge_snr_threshold"),
-        ("ridge_min_peak_fraction", "ridge_min_peak_fraction"),
-        ("ridge_min_coverage", "ridge_min_coverage"),
-        ("full2d_multistart", "full2d_multistart"),
-        ("mask", "mask"),
-        ("valid_mask", "valid_mask"),
-        ("mask_frame", "mask_frame"),
-        ("mask_dataset", "mask_dataset"),
-    ):
-        value = getattr(args, argument, None)
-        if value is not None:
-            mapping[key] = value
-    ellipse: dict[str, Any] = {}
-    for argument, key in (
-        ("ellipse_preset", "preset"),
-        ("ellipse_ratio_min", "axis_ratio_min"),
-        ("ellipse_ratio_max", "axis_ratio_max"),
-        ("ellipse_a", "a"),
-        ("ellipse_b", "b"),
-        ("ellipse_ratio", "axis_ratio"),
-        ("ellipse_a_min", "a_min"),
-        ("ellipse_a_max", "a_max"),
-        ("ellipse_b_min", "b_min"),
-        ("ellipse_b_max", "b_max"),
-        ("ellipse_angle_min", "theta_min_deg"),
-        ("ellipse_angle_max", "theta_max_deg"),
-        ("ellipse_fixed_center", "fixed_center"),
-        ("ellipse_fixed_a", "fixed_a"),
-        ("ellipse_fixed_ratio", "fixed_axis_ratio"),
-        ("ellipse_center_qx", "center_qx"),
-        ("ellipse_center_qy", "center_qy"),
-        ("ellipse_fixed_angle", "fixed_angle"),
-        ("ellipse_angle_deg", "angle_deg"),
-        ("ellipse_residual", "residual"),
-        ("ellipse_multistart", "multistart"),
-    ):
-        value = getattr(args, argument, None)
-        if value is not None:
-            ellipse[key] = value
-    if ellipse:
-        mapping["ellipse"] = ellipse
-    butterfly = {}
-    for argument, key in (("butterfly_stage", "stage"), ("butterfly_resamples", "resamples"),
-                          ("butterfly_seed", "seed"), ("butterfly_sensitivity", "sensitivity"),
-                          ("butterfly_trace_method", "trace_method"),
-                          ("sector_width", "sector_width_deg"), ("sector_step", "sector_step_deg"),
-                          ("annular_rings", "annular_radial_bins"), ("annular_angles", "annular_angle_bins")):
-        value = getattr(args, argument, None)
-        if value is not None:
-            butterfly[key] = value
-    if butterfly:
-        mapping["butterfly"] = butterfly
-    if getattr(args, "butterfly_trace_method", None) is not None:
-        selected = mapping.get("ridge_method")
-        if selected is not None and selected != "butterfly_curvature":
-            raise ValueError("--butterfly-trace-method requires the butterfly workflow; omit --ridge-method or use butterfly_curvature")
-        mapping["ridge_method"] = "butterfly_curvature"
-    preset = getattr(args, "preset", None)
-    if preset is not None:
-        from .campaign import workflow_preset_analysis
-
-        preset_defaults = workflow_preset_analysis(preset)
-        mapping = deep_merge_mapping(preset_defaults, mapping)
-    return mapping
-
-
-def _with_analysis(config: ProjectConfig | None, overrides: Mapping[str, Any]) -> Any:
-    """Return a config carrying explicit CLI overrides with TOML precedence."""
-
-    if not overrides:
-        return config
-    if config is None:
-        return ProjectConfig(analysis=dict(overrides))
-    return ProjectConfig(
-        input_paths=config.input_paths,
-        poni_path=config.poni_path,
-        output_dir=config.output_dir,
-        q_unit=config.q_unit,
-        full2d=config.full2d,
-        analysis=deep_merge_mapping(config.analysis, overrides),
-        export=config.export,
-        metadata=config.metadata,
+    return build_analysis_report_cmd(
+        output_dir,
+        resume=resume,
+        force=force,
+        radial_bins=radial_bins,
+        angular_bins=angular_bins,
+        formats=formats,
+        dpi=dpi,
+        lamellar_settings=lamellar_settings,
+        journal_style=journal_style,
     )
-
-
-def _add_refinement_options(parser: argparse.ArgumentParser) -> None:
-    """Add the common flat-ellipse/ridge controls to a CLI subcommand."""
-
-    parser.add_argument(
-        "--preset",
-        choices=_WORKFLOW_PRESETS,
-        default=None,
-        help="工作流参数预设（annular/curvature/sector/butterfly_pub；省略时保持原有默认行为）",
-    )
-    parser.add_argument(
-        "--q-window",
-        type=float,
-        nargs=2,
-        metavar=("Q_MIN", "Q_MAX"),
-        help="analysis q window in the active q-map unit",
-    )
-    parser.add_argument("--q-min", type=float, help="analysis q lower bound")
-    parser.add_argument("--q-max", type=float, help="analysis q upper bound")
-    parser.add_argument(
-        "--ridge-method",
-        choices=("radial_peak", "azimuthal_peak", "surface_curvature", "butterfly_curvature"),
-        help="observed ridge method, including side-aware butterfly_curvature",
-    )
-    parser.add_argument("--butterfly-stage", choices=("trace", "evaluate"), default=None)
-    parser.add_argument("--butterfly-trace-method", choices=("curvature", "radial_sector", "annular_peak"),
-                        help="butterfly observable: fixed-q angular tracks, radial sector peaks, or curvature candidates")
-    parser.add_argument("--sector-width", type=float, help="radial-sector full angular width in degrees (default 10)")
-    parser.add_argument("--annular-rings", type=int, help="number of fixed-q annuli (default 40; limited by pixel q sampling)")
-    parser.add_argument("--annular-angles", type=int, help="angular bins per q annulus (default 72)")
-    parser.add_argument("--sector-step", type=float, help="radial-sector angular sampling step in degrees (default 5)")
-    parser.add_argument("--butterfly-resamples", type=int, default=None,
-                        help="image-level resampling count; zero skips empirical intervals")
-    parser.add_argument("--butterfly-seed", type=int, default=None)
-    parser.add_argument("--butterfly-no-sensitivity", dest="butterfly_sensitivity", action="store_false", default=None)
-    parser.add_argument("--ridge-snr-threshold", type=float, help="minimum ridge SNR")
-    parser.add_argument(
-        "--ridge-min-peak-fraction",
-        type=float,
-        help="minimum valid support fraction for a ridge candidate [0, 1]",
-    )
-    parser.add_argument(
-        "--ridge-min-coverage",
-        type=float,
-        help="minimum detector coverage for a ridge candidate [0, 1]",
-    )
-    parser.add_argument(
-        "--ellipse-preset",
-        choices=("standard", "flat_ellipse", "very_flat_ellipse"),
-        help="constrained measured-ellipse preset",
-    )
-    parser.add_argument("--ellipse-ratio-min", type=float, help="measured ellipse b/a lower bound")
-    parser.add_argument("--ellipse-ratio-max", type=float, help="measured ellipse b/a upper bound")
-    parser.add_argument("--ellipse-a", type=float, help="measured ellipse a starting value")
-    parser.add_argument("--ellipse-b", type=float, help="measured ellipse b starting value")
-    parser.add_argument("--ellipse-ratio", type=float, help="measured ellipse b/a starting value")
-    parser.add_argument("--ellipse-a-min", type=float, help="measured ellipse a lower bound")
-    parser.add_argument("--ellipse-a-max", type=float, help="measured ellipse a upper bound")
-    parser.add_argument("--ellipse-b-min", type=float, help="derived measured ellipse b lower bound")
-    parser.add_argument("--ellipse-b-max", type=float, help="derived measured ellipse b upper bound")
-    parser.add_argument("--ellipse-angle-min", type=float, help="measured ellipse angle lower bound (deg)")
-    parser.add_argument("--ellipse-angle-max", type=float, help="measured ellipse angle upper bound (deg)")
-    parser.add_argument(
-        "--ellipse-fixed-center",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="fix measured ellipse centre at ellipse-center-qx/qy",
-    )
-    parser.add_argument(
-        "--ellipse-fixed-a",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="fix measured ellipse a at its explicit value",
-    )
-    parser.add_argument(
-        "--ellipse-fixed-ratio",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="fix measured ellipse b/a at its explicit value",
-    )
-    parser.add_argument("--ellipse-center-qx", type=float, help="measured ellipse centre qx")
-    parser.add_argument("--ellipse-center-qy", type=float, help="measured ellipse centre qy")
-    parser.add_argument(
-        "--ellipse-fixed-angle",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="fix the measured ellipse angle at ellipse-angle-deg",
-    )
-    parser.add_argument("--ellipse-angle-deg", type=float, help="measured ellipse angle initial value (deg)")
-    parser.add_argument(
-        "--ellipse-residual",
-        choices=("sampson", "geometric"),
-        help="residual used by measured ellipse fit",
-    )
-    parser.add_argument("--ellipse-multistart", type=int, help="deterministic measured ellipse starts")
-    parser.add_argument("--full2d-multistart", type=int, help="deterministic full2d starts")
-
-
-def _print_json(value: Any) -> None:
-    # Console encodings on Windows are often GBK/CP936, which cannot encode
-    # every scientific unit symbol (for example ``Å``).  Escaping non-ASCII
-    # characters keeps stdout valid JSON on every terminal; exported files
-    # remain human-readable UTF-8 through their dedicated writers.
-    print(json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False))
-
-
-def _emit_error(
-    exc: BaseException,
-    *,
-    exit_code: int,
-    command: str | None = None,
-    code: str | None = None,
-) -> None:
-    """Human stderr line plus a strict JSON envelope on stdout for agents."""
-
-    print(f"错误：{exc}", file=sys.stderr)
-    _print_json(
-        cli_error_payload(exc, exit_code=exit_code, command=command, code=code)
-    )
-
-
-def _write_synthetic(array: Any, qmap: dict[str, Any], output: str | os.PathLike[str], *, force: bool) -> Path:
-    import numpy as np
-
-    destination = Path(output)
-    if destination.exists() and not force:
-        raise FileExistsError(f"输出已存在，未覆盖：{destination}（需要 --force）")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    suffix = destination.suffix.lower()
-    if suffix == ".npy":
-        np.save(destination, array)
-    elif suffix == ".npz":
-        payload = {
-            key: value for key, value in qmap.items() if isinstance(value, np.ndarray)
-        }
-        # Unit metadata is part of the numerical contract.  In particular,
-        # the built-in synthetic grid is pixel-q and must never be reopened
-        # later as though it were calibrated nm^-1 data.
-        if qmap.get("q_unit") is not None:
-            payload["q_unit"] = np.asarray(str(qmap["q_unit"]))
-        np.savez_compressed(destination, data=array, **payload)
-    elif suffix in {".tif", ".tiff"}:
-        import tifffile
-
-        tifffile.imwrite(destination, array)
-    else:
-        raise PipelineError("synthetic 输出格式支持 .npy、.npz、.tif/.tiff")
-    return destination
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -598,15 +88,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=False)
 
-    describe_parser = sub.add_parser("describe", help="打印机器可读的命令、退出码与科学边界清单")
-    describe_parser.add_argument("topic", nargs="?", help="只返回指定命令的契约，例如 describe batch")
+    describe_parser = sub.add_parser(
+        "describe", help="打印机器可读的命令、退出码与科学边界清单"
+    )
+    describe_parser.add_argument(
+        "topic", nargs="?", help="只返回指定命令的契约，例如 describe batch"
+    )
     describe_parser.add_argument(
         "--text",
         action="store_true",
         help="同时在 stderr 打印简短人类可读摘要；stdout 仍是 JSON",
     )
 
-    doctor_parser = sub.add_parser("doctor", help="检查 Python 与依赖（同 bsaxs-doctor）")
+    doctor_parser = sub.add_parser(
+        "doctor", help="检查 Python 与依赖（同 bsaxs-doctor）"
+    )
     doctor_parser.add_argument(
         "--require-ui",
         action="store_true",
@@ -625,7 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_parser = sub.add_parser("inspect", help="检查图像、q 空间和基础观测量")
     inspect_parser.add_argument("input", nargs="?", help="CBF/EDF/TIF/NPY/NPZ/HDF5 图像")
-    inspect_parser.add_argument("-i", "--input-file", dest="input_file", help="输入图像（input 的显式别名）")
+    inspect_parser.add_argument(
+        "-i", "--input-file", dest="input_file", help="输入图像（input 的显式别名）"
+    )
     inspect_parser.add_argument("-c", "--config", help="TOML 项目配置")
     inspect_parser.add_argument("--poni", help="PONI 几何文件")
     inspect_parser.add_argument("--frame", type=int, help="多帧文件中的零基帧索引")
@@ -633,7 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
     inspect_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     inspect_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
-    inspect_parser.add_argument("--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）")
+    inspect_parser.add_argument(
+        "--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）"
+    )
     inspect_parser.add_argument(
         "--recommend",
         action="store_true",
@@ -657,7 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     analyze_parser = sub.add_parser("analyze", help="分析单帧并拟合对称双椭圆")
     analyze_parser.add_argument("input", nargs="?", help="输入图像")
-    analyze_parser.add_argument("-i", "--input-file", dest="input_file", help="输入图像（input 的显式别名）")
+    analyze_parser.add_argument(
+        "-i", "--input-file", dest="input_file", help="输入图像（input 的显式别名）"
+    )
     analyze_parser.add_argument("-c", "--config", help="TOML 项目配置")
     analyze_parser.add_argument("--poni", help="PONI 几何文件")
     analyze_parser.add_argument("--frame", type=int, help="多帧文件中的零基帧索引")
@@ -665,7 +167,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
     analyze_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     analyze_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
-    analyze_parser.add_argument("--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）")
+    analyze_parser.add_argument(
+        "--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）"
+    )
     analyze_parser.add_argument(
         "--beamstop-radius-px",
         type=_beamstop_radius,
@@ -692,36 +196,84 @@ def build_parser() -> argparse.ArgumentParser:
         help="强度标定模式（calibrated 或 raw；raw 模式下不报告无物理尺度的 Q_win）",
     )
     analyze_parser.add_argument("-o", "--output", help="JSON/NPZ 文件或输出目录")
-    analyze_parser.add_argument("--full2d", action="store_true", help="调用可选的 full2d 精修模块")
+    analyze_parser.add_argument(
+        "--full2d", action="store_true", help="调用可选的 full2d 精修模块"
+    )
     analyze_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
     analyze_parser.add_argument(
-        "--figure-output", help="另存基于测量数组的科研图包到新目录（SVG/PDF/TIFF/PNG 与源数据）"
+        "--figure-output",
+        help="另存基于测量数组的科研图包到新目录（SVG/PDF/TIFF/PNG 与源数据）",
     )
-    analyze_parser.add_argument("--figure-width", type=float, choices=(89.0, 183.0), default=183.0,
-                                help="科研图画板宽度，单位 mm（默认双栏 183）")
-    analyze_parser.add_argument("--figure-dpi", type=int, choices=(300, 600, 1200), default=600,
-                                help="科研图中栅格内容的分辨率（默认 600 dpi）")
+    analyze_parser.add_argument(
+        "--figure-width",
+        type=float,
+        choices=(89.0, 183.0),
+        default=183.0,
+        help="科研图画板宽度，单位 mm（默认双栏 183）",
+    )
+    analyze_parser.add_argument(
+        "--figure-dpi",
+        type=int,
+        choices=(300, 600, 1200),
+        default=600,
+        help="科研图中栅格内容的分辨率（默认 600 dpi）",
+    )
     _add_refinement_options(analyze_parser)
 
-    package_parser = sub.add_parser("package", help="汇总已有批次的数据和图，无需重新拟合或绘图")
-    package_parser.add_argument("output_dir", help="单批次输出或包含各样品输出的父目录")
-    package_parser.add_argument("--resume", action="store_true", help="续做交付；复用未改变的 ZIP")
-    package_parser.add_argument("--force", action="store_true", help="重建已生成的交付索引和 ZIP")
-    package_parser.add_argument("--no-archive", "--no-archives", action="store_true", help="只建立导航；明确跳过 ZIP")
+    package_parser = sub.add_parser(
+        "package", help="汇总已有批次的数据和图，无需重新拟合或绘图"
+    )
+    package_parser.add_argument(
+        "output_dir", help="单批次输出或包含各样品输出的父目录"
+    )
+    package_parser.add_argument(
+        "--resume", action="store_true", help="续做交付；复用未改变的 ZIP"
+    )
+    package_parser.add_argument(
+        "--force", action="store_true", help="重建已生成的交付索引和 ZIP"
+    )
+    package_parser.add_argument(
+        "--no-archive",
+        "--no-archives",
+        action="store_true",
+        help="只建立导航；明确跳过 ZIP",
+    )
 
-    report_parser = sub.add_parser("report", help="从已有批次 NPZ 导出统计和图表，不重新拟合")
-    report_parser.add_argument("output_dir", help="单批次输出目录或包含多个样品输出的父目录")
-    report_parser.add_argument("--resume", action="store_true", help="续做报告；复用设置和输入未改变的输出")
+    report_parser = sub.add_parser(
+        "report", help="从已有批次 NPZ 导出统计和图表，不重新拟合"
+    )
+    report_parser.add_argument(
+        "output_dir", help="单批次输出目录或包含多个样品输出的父目录"
+    )
+    report_parser.add_argument(
+        "--resume", action="store_true", help="续做报告；复用设置和输入未改变的输出"
+    )
     report_parser.add_argument("--force", action="store_true", help="重建已有报告")
-    report_parser.add_argument("--radial-bins", type=_REPORT_BIN_COUNT, default=128,
-                                help="径向汇总箱数（默认 128，至少 2）")
-    report_parser.add_argument("--angular-bins", type=_REPORT_BIN_COUNT, default=72,
-                                help="角向汇总箱数（默认 72，至少 2）")
-    report_parser.add_argument("--formats", nargs="+", choices=_REPORT_FORMATS,
-                                default=_REPORT_DEFAULT_FORMATS,
-                                help="图表格式（可选 png、svg、pdf、tiff；默认 png svg pdf）")
-    report_parser.add_argument("--dpi", type=_REPORT_DPI, default=180,
-                                help="栅格图分辨率（默认 180）")
+    report_parser.add_argument(
+        "--radial-bins",
+        type=_REPORT_BIN_COUNT,
+        default=128,
+        help="径向汇总箱数（默认 128，至少 2）",
+    )
+    report_parser.add_argument(
+        "--angular-bins",
+        type=_REPORT_BIN_COUNT,
+        default=72,
+        help="角向汇总箱数（默认 72，至少 2）",
+    )
+    report_parser.add_argument(
+        "--formats",
+        nargs="+",
+        choices=_REPORT_FORMATS,
+        default=_REPORT_DEFAULT_FORMATS,
+        help="图表格式（可选 png、svg、pdf、tiff；默认 png svg pdf）",
+    )
+    report_parser.add_argument(
+        "--dpi",
+        type=_REPORT_DPI,
+        default=180,
+        help="栅格图分辨率（默认 180）",
+    )
     report_parser.add_argument(
         "--lamellar-settings",
         help="JSON/TOML 片层示意参数；椭圆派生周期和绘制假设可在此设置",
@@ -733,55 +285,103 @@ def build_parser() -> argparse.ArgumentParser:
         help="期刊出版风格预设（default/nature/nature_comm/science/macromolecules；默认保持原有风格）",
     )
 
-    delivery_check = sub.add_parser("verify-delivery", help="只读核对所选结项回执的当前文件绑定，不改写历史或科学状态")
-    delivery_check.add_argument("receipt", help="包含顶层 bindings 列表的现有结项 JSON")
-    delivery_check.add_argument("--root", help="绑定相对路径的输出根目录；默认回执所在目录")
+    delivery_check = sub.add_parser(
+        "verify-delivery",
+        help="只读核对所选结项回执的当前文件绑定，不改写历史或科学状态",
+    )
+    delivery_check.add_argument(
+        "receipt", help="包含顶层 bindings 列表的现有结项 JSON"
+    )
+    delivery_check.add_argument(
+        "--root", help="绑定相对路径的输出根目录；默认回执所在目录"
+    )
 
     batch_parser = sub.add_parser("batch", help="批量分析原位序列")
     batch_parser.add_argument("inputs", nargs="*", help="输入图像或通配符")
-    batch_parser.add_argument("-c", "--config", help="TOML 项目配置（可提供 inputs.files）")
+    batch_parser.add_argument(
+        "-c", "--config", help="TOML 项目配置（可提供 inputs.files）"
+    )
     batch_parser.add_argument("--poni", help="PONI 几何文件")
     batch_parser.add_argument("--frame", type=int, help="多帧文件中的零基帧索引")
     batch_parser.add_argument("--dataset", help="HDF5/NPZ 数据集或 TIFF series:N")
     batch_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
     batch_parser.add_argument("--mask-frame", type=int, help="多帧掩膜中的零基帧索引")
     batch_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集或键")
-    batch_parser.add_argument("--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）")
+    batch_parser.add_argument(
+        "--valid-mask", dest="valid_mask", help="有效像素掩膜路径（True=有效像素）"
+    )
     batch_parser.add_argument("-o", "--output", help="输出目录")
-    batch_parser.add_argument("--full2d", action="store_true", help="调用可选的 full2d 精修模块")
-    batch_parser.add_argument("--mode", choices=("independent", "warm_start"), help="序列拟合模式")
-    batch_parser.add_argument("--manifest", help="JSON/CSV 帧清单（含 time/frame_id 等元数据）")
+    batch_parser.add_argument(
+        "--full2d", action="store_true", help="调用可选的 full2d 精修模块"
+    )
+    batch_parser.add_argument(
+        "--mode", choices=("independent", "warm_start"), help="序列拟合模式"
+    )
+    batch_parser.add_argument(
+        "--manifest", help="JSON/CSV 帧清单（含 time/frame_id 等元数据）"
+    )
     batch_parser.add_argument("--checkpoint", help="批量检查点 JSON 路径")
-    batch_parser.add_argument("--package", action="store_true", help="导出后继续生成可浏览导航和交付 ZIP；交付失败可单独续做")
-    batch_parser.add_argument("--report", action="store_true", help="数据导出后从 NPZ 生成统计和图表报告")
-    batch_parser.add_argument("--report-radial-bins", type=_REPORT_BIN_COUNT, default=128,
-                               help="--report 的径向汇总箱数（默认 128，至少 2）")
-    batch_parser.add_argument("--report-angular-bins", type=_REPORT_BIN_COUNT, default=72,
-                               help="--report 的角向汇总箱数（默认 72，至少 2）")
-    batch_parser.add_argument("--report-formats", nargs="+", choices=_REPORT_FORMATS,
-                               default=_REPORT_DEFAULT_FORMATS,
-                               help="--report 的图表格式（默认 png svg pdf）")
-    batch_parser.add_argument("--report-dpi", type=_REPORT_DPI, default=180,
-                               help="--report 的栅格图分辨率（默认 180）")
+    batch_parser.add_argument(
+        "--package",
+        action="store_true",
+        help="导出后继续生成可浏览导航和交付 ZIP；交付失败可单独续做",
+    )
+    batch_parser.add_argument(
+        "--report", action="store_true", help="数据导出后从 NPZ 生成统计和图表报告"
+    )
+    batch_parser.add_argument(
+        "--report-radial-bins",
+        type=_REPORT_BIN_COUNT,
+        default=128,
+        help="--report 的径向汇总箱数（默认 128，至少 2）",
+    )
+    batch_parser.add_argument(
+        "--report-angular-bins",
+        type=_REPORT_BIN_COUNT,
+        default=72,
+        help="--report 的角向汇总箱数（默认 72，至少 2）",
+    )
+    batch_parser.add_argument(
+        "--report-formats",
+        nargs="+",
+        choices=_REPORT_FORMATS,
+        default=_REPORT_DEFAULT_FORMATS,
+        help="--report 的图表格式（默认 png svg pdf）",
+    )
+    batch_parser.add_argument(
+        "--report-dpi",
+        type=_REPORT_DPI,
+        default=180,
+        help="--report 的栅格图分辨率（默认 180）",
+    )
     batch_parser.add_argument(
         "--report-lamellar-settings",
         help="--report 使用的 JSON/TOML 片层示意参数；拟合前加载并校验",
     )
-    batch_parser.add_argument("--resume", action="store_true", help="从已有检查点恢复")
+    batch_parser.add_argument(
+        "--resume", action="store_true", help="从已有检查点恢复"
+    )
     batch_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
     batch_parser.add_argument(
-        "--unattended", metavar="PACKAGE",
+        "--unattended",
+        metavar="PACKAGE",
         help="先预检数据包，再以流式导出和自动检查点运行；预检红灯阻止拟合",
     )
-    batch_parser.add_argument("--preflight-context", help="无人值守预检的 project_context.yaml/yml")
+    batch_parser.add_argument(
+        "--preflight-context", help="无人值守预检的 project_context.yaml/yml"
+    )
     batch_parser.add_argument(
         "--stream",
         action="store_true",
         help="逐帧写出参数/脊线和 NPZ，释放已处理帧的 detector 数组",
     )
     batch_parser.add_argument("--series", help="只处理 manifest 中指定的 series/group")
-    batch_parser.add_argument("--start", type=int, help="选中有序序列的起始位置（含）")
-    batch_parser.add_argument("--stop", type=int, help="选中有序序列的结束位置（含）")
+    batch_parser.add_argument(
+        "--start", type=int, help="选中有序序列的起始位置（含）"
+    )
+    batch_parser.add_argument(
+        "--stop", type=int, help="选中有序序列的结束位置（含）"
+    )
     batch_parser.add_argument("--stride", type=int, default=None, help="有序序列步长")
     batch_parser.add_argument(
         "--range",
@@ -810,25 +410,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_refinement_options(batch_parser)
 
-    synthetic_parser = sub.add_parser("synthetic", help="生成可重复的蝴蝶状二维测试花样")
-    synthetic_parser.add_argument("-o", "--output", help=".npy/.npz/.tif 输出路径；不提供则只打印摘要")
-    synthetic_parser.add_argument("--shape", type=_shape, default=(128, 128), help="图像尺寸 HxW")
-    synthetic_parser.add_argument("--q0", type=float, default=28.0, help="椭圆特征 q 半径")
-    synthetic_parser.add_argument("--width", type=float, default=2.0, help="峰脊宽度")
-    synthetic_parser.add_argument("--ellipticity", type=float, default=2.0, help="椭圆长短轴比")
-    synthetic_parser.add_argument("--angle", type=float, default=28.0, help="对称椭圆角度（度）")
-    synthetic_parser.add_argument("--noise", type=float, default=0.0, help="高斯噪声标准差")
+    synthetic_parser = sub.add_parser(
+        "synthetic", help="生成可重复的蝴蝶状二维测试花样"
+    )
+    synthetic_parser.add_argument(
+        "-o", "--output", help=".npy/.npz/.tif 输出路径；不提供则只打印摘要"
+    )
+    synthetic_parser.add_argument(
+        "--shape", type=_shape, default=(128, 128), help="图像尺寸 HxW"
+    )
+    synthetic_parser.add_argument(
+        "--q0", type=float, default=28.0, help="椭圆特征 q 半径"
+    )
+    synthetic_parser.add_argument(
+        "--width", type=float, default=2.0, help="峰脊宽度"
+    )
+    synthetic_parser.add_argument(
+        "--ellipticity", type=float, default=2.0, help="椭圆长短轴比"
+    )
+    synthetic_parser.add_argument(
+        "--angle", type=float, default=28.0, help="对称椭圆角度（度）"
+    )
+    synthetic_parser.add_argument(
+        "--noise", type=float, default=0.0, help="高斯噪声标准差"
+    )
     synthetic_parser.add_argument("--seed", type=int, default=0, help="随机种子")
-    synthetic_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    synthetic_parser.add_argument(
+        "--force", action="store_true", help="允许覆盖已有输出"
+    )
 
-    gui_parser = sub.add_parser("gui", help="打开与 CLI 共用 pipeline seam 的交互界面")
+    gui_parser = sub.add_parser(
+        "gui", help="打开与 CLI 共用 pipeline seam 的交互界面"
+    )
     gui_parser.add_argument("input", nargs="?", help="可选输入图像")
     gui_parser.add_argument("-c", "--config", help="可选 TOML 项目配置")
     gui_parser.add_argument("--poni", help="PONI 几何文件")
 
     project_parser = sub.add_parser("project", help="执行 TOML 项目配置")
     project_parser.add_argument("config", help="项目 TOML 文件")
-    project_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    project_parser.add_argument(
+        "--force", action="store_true", help="允许覆盖已有输出"
+    )
     project_parser.add_argument(
         "--legacy-json",
         action="store_true",
@@ -845,9 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--context", help="project_context.yaml/yml")
     preflight_parser.add_argument("--image-glob", help="未使用清单时的图像通配符")
     preflight_parser.add_argument("--frame", type=int, help="图像多帧选择器")
-    preflight_parser.add_argument("--dataset", help="图像 HDF5/NPZ 数据集或 TIFF series:N")
+    preflight_parser.add_argument(
+        "--dataset", help="图像 HDF5/NPZ 数据集或 TIFF series:N"
+    )
     preflight_parser.add_argument("--mask-frame", type=int, help="掩膜多帧选择器")
-    preflight_parser.add_argument("--mask-dataset", help="掩膜 HDF5/NPZ 数据集或 TIFF series:N")
+    preflight_parser.add_argument(
+        "--mask-dataset", help="掩膜 HDF5/NPZ 数据集或 TIFF series:N"
+    )
     preflight_parser.add_argument(
         "--q-window", type=float, nargs=2, metavar=("Q_MIN", "Q_MAX")
     )
@@ -858,7 +484,9 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--correction-state")
     preflight_parser.add_argument("--uncertainty-state")
     preflight_parser.add_argument("-o", "--output", help="预检证据输出目录")
-    preflight_parser.add_argument("--force", action="store_true", help="允许覆盖已有预检输出")
+    preflight_parser.add_argument(
+        "--force", action="store_true", help="允许覆盖已有预检输出"
+    )
 
     benchmark_parser = sub.add_parser(
         "benchmark", help="生成 P3 的 T1 同模型或 T2 独立 FFT 基准证据"
@@ -866,39 +494,77 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument(
         "--suite", choices=("t1", "t2", "all"), default="all", help="要生成的基准套件"
     )
-    benchmark_parser.add_argument("-o", "--output", required=True, help="新的证据输出目录")
-    benchmark_parser.add_argument("--shape", type=_shape, help="可选统一图像尺寸 HxW")
+    benchmark_parser.add_argument(
+        "-o", "--output", required=True, help="新的证据输出目录"
+    )
+    benchmark_parser.add_argument(
+        "--shape", type=_shape, help="可选统一图像尺寸 HxW"
+    )
     benchmark_parser.add_argument("--seed", type=int, help="可选统一起始随机种子")
-    benchmark_parser.add_argument("--force", action="store_true", help="仅覆盖本命令的目标文件")
+    benchmark_parser.add_argument(
+        "--force", action="store_true", help="仅覆盖本命令的目标文件"
+    )
 
     annotation_parser = sub.add_parser(
         "annotation-pack", help="从 R0 清单生成 8 帧只读盲标包，不运行拟合"
     )
     annotation_parser.add_argument("package", help="真实数据包根目录")
-    annotation_parser.add_argument("--rt-manifest", required=True, help="室温参考帧清单")
-    annotation_parser.add_argument("--hold-manifest", required=True, help="保温序列帧清单")
-    annotation_parser.add_argument("--preflight", help="可选原始强度预检 JSON，用于困难帧排序")
-    annotation_parser.add_argument("--poni", help="PONI 文件，只记录来源而不参与选择")
-    annotation_parser.add_argument("--mask", help="mask 文件，只记录来源而不参与选择")
-    annotation_parser.add_argument("-o", "--output", required=True, help="新的盲标包输出目录")
+    annotation_parser.add_argument(
+        "--rt-manifest", required=True, help="室温参考帧清单"
+    )
+    annotation_parser.add_argument(
+        "--hold-manifest", required=True, help="保温序列帧清单"
+    )
+    annotation_parser.add_argument(
+        "--preflight", help="可选原始强度预检 JSON，用于困难帧排序"
+    )
+    annotation_parser.add_argument(
+        "--poni", help="PONI 文件，只记录来源而不参与选择"
+    )
+    annotation_parser.add_argument(
+        "--mask", help="mask 文件，只记录来源而不参与选择"
+    )
+    annotation_parser.add_argument(
+        "-o", "--output", required=True, help="新的盲标包输出目录"
+    )
 
     p3_parser = sub.add_parser("p3-status", help="只读评估 P3 Go/No-Go 证据门")
-    p3_parser.add_argument("--t1-manifest", required=True, help="T1 truth_manifest.json")
-    p3_parser.add_argument("--t2-manifest", required=True, help="T2 truth_manifest.json")
-    p3_parser.add_argument("--annotation-status", required=True, help="annotation_status.json")
-    p3_parser.add_argument("--thresholds", required=True, help="阈值 JSON（draft 或 frozen）")
+    p3_parser.add_argument(
+        "--t1-manifest", required=True, help="T1 truth_manifest.json"
+    )
+    p3_parser.add_argument(
+        "--t2-manifest", required=True, help="T2 truth_manifest.json"
+    )
+    p3_parser.add_argument(
+        "--annotation-status", required=True, help="annotation_status.json"
+    )
+    p3_parser.add_argument(
+        "--thresholds", required=True, help="阈值 JSON（draft 或 frozen）"
+    )
     p3_parser.add_argument("-o", "--output", help="可选门禁报告 JSON")
-    p3_parser.add_argument("--force", action="store_true", help="允许覆盖已有门禁报告")
+    p3_parser.add_argument(
+        "--force", action="store_true", help="允许覆盖已有门禁报告"
+    )
 
     p4_parser = sub.add_parser(
         "p4-evaluate", help="运行 P4 ridge/lobe/双椭圆工程证据（不冒充科学验收）"
     )
-    p4_parser.add_argument("--t1-manifest", required=True, help="T1 truth_manifest.json")
-    p4_parser.add_argument("--t2-manifest", required=True, help="T2 truth_manifest.json")
-    p4_parser.add_argument("--thresholds", required=True, help="draft/frozen 阈值 JSON")
-    p4_parser.add_argument("-o", "--output", required=True, help="新的 P4 证据输出目录")
+    p4_parser.add_argument(
+        "--t1-manifest", required=True, help="T1 truth_manifest.json"
+    )
+    p4_parser.add_argument(
+        "--t2-manifest", required=True, help="T2 truth_manifest.json"
+    )
+    p4_parser.add_argument(
+        "--thresholds", required=True, help="draft/frozen 阈值 JSON"
+    )
+    p4_parser.add_argument(
+        "-o", "--output", required=True, help="新的 P4 证据输出目录"
+    )
     p4_parser.add_argument("--r0-package", help="可选 R0 原始数据包根目录")
-    p4_parser.add_argument("--r0-manifest", help="可选固定 8 帧 annotation_manifest.csv")
+    p4_parser.add_argument(
+        "--r0-manifest", help="可选固定 8 帧 annotation_manifest.csv"
+    )
     p4_parser.add_argument("--poni", help="R0 使用的 PONI 文件")
     p4_parser.add_argument("--mask", help="R0 使用的外部 mask")
     p4_parser.add_argument(
@@ -932,8 +598,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出 manifest.csv 路径（与原始数据分开，未提供 --force 时不覆盖）",
     )
     init_manifest_parser.add_argument("--dataset", help="HDF5/NPZ 数据集路径")
-    init_manifest_parser.add_argument("--pattern", default="*", help="目录扫描通配符（默认 *）")
-    init_manifest_parser.add_argument("--recursive", action="store_true", help="递归扫描子目录")
+    init_manifest_parser.add_argument(
+        "--pattern", default="*", help="目录扫描通配符（默认 *）"
+    )
+    init_manifest_parser.add_argument(
+        "--recursive", action="store_true", help="递归扫描子目录"
+    )
     init_manifest_parser.add_argument(
         "--no-parse-metadata",
         dest="parse_metadata",
@@ -941,13 +611,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="关闭文件名元数据解析",
     )
-    init_manifest_parser.add_argument("--sha256", action="store_true", help="计算每个源文件的 SHA-256 摘要")
+    init_manifest_parser.add_argument(
+        "--sha256", action="store_true", help="计算每个源文件的 SHA-256 摘要"
+    )
     init_manifest_parser.add_argument(
         "--relative",
         action="store_true",
         help="在 manifest 中记录相对输出目录的路径",
     )
-    init_manifest_parser.add_argument("--force", action="store_true", help="允许覆盖已有 manifest")
+    init_manifest_parser.add_argument(
+        "--force", action="store_true", help="允许覆盖已有 manifest"
+    )
     init_manifest_parser.add_argument(
         "--json",
         action="store_true",
@@ -958,8 +632,12 @@ def build_parser() -> argparse.ArgumentParser:
         "advise",
         help="运行单帧智能参数、光束阻挡器与 Friedel 对称性诊断建议（只读，不拟合）",
     )
-    advise_parser.add_argument("image_pos", nargs="?", help="输入图像路径（也可用 --image）")
-    advise_parser.add_argument("-i", "--image", dest="image", help="输入二维图像路径")
+    advise_parser.add_argument(
+        "image_pos", nargs="?", help="输入图像路径（也可用 --image）"
+    )
+    advise_parser.add_argument(
+        "-i", "--image", dest="image", help="输入二维图像路径"
+    )
     advise_parser.add_argument("--poni", help="PONI 几何标定文件")
     advise_parser.add_argument("--mask", help="外部掩膜路径（True=无效像素）")
     advise_parser.add_argument(
@@ -976,7 +654,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="多帧图像中的零基帧索引",
     )
     advise_parser.add_argument("--mask-dataset", help="HDF5/NPZ 掩膜数据集路径")
-    advise_parser.add_argument("--mask-frame-index", "--mask-frame", dest="mask_frame_index", type=int, help="多帧掩膜中的零基帧索引")
+    advise_parser.add_argument(
+        "--mask-frame-index",
+        "--mask-frame",
+        dest="mask_frame_index",
+        type=int,
+        help="多帧掩膜中的零基帧索引",
+    )
     advise_parser.add_argument(
         "--nominal-draw-axis-deg",
         type=float,
@@ -990,7 +674,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="预期亮桥/对称轴约定：draw（默认，与拉伸轴一致）或 reference（垂直拉伸轴，适用于赤道翼）",
     )
     advise_parser.add_argument("-o", "--output", help="可选 JSON 输出路径")
-    advise_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    advise_parser.add_argument(
+        "--force", action="store_true", help="允许覆盖已有输出"
+    )
     advise_parser.add_argument(
         "--json",
         action="store_true",
@@ -1001,10 +687,20 @@ def build_parser() -> argparse.ArgumentParser:
         "campaign",
         help="执行多样品活动 TOML 配置，隔离单样品失败并输出严格 JSON 汇总",
     )
-    campaign_parser.add_argument("config_pos", nargs="?", help="活动 TOML 路径（也可用 --config）")
-    campaign_parser.add_argument("-c", "--config", dest="config", help="活动 TOML 配置文件路径")
-    campaign_parser.add_argument("-o", "--output", help="多样品输出根目录（未提供 --force 时不覆盖非空目录）")
-    campaign_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    campaign_parser.add_argument(
+        "config_pos", nargs="?", help="活动 TOML 路径（也可用 --config）"
+    )
+    campaign_parser.add_argument(
+        "-c", "--config", dest="config", help="活动 TOML 配置文件路径"
+    )
+    campaign_parser.add_argument(
+        "-o",
+        "--output",
+        help="多样品输出根目录（未提供 --force 时不覆盖非空目录）",
+    )
+    campaign_parser.add_argument(
+        "--force", action="store_true", help="允许覆盖已有输出"
+    )
     campaign_parser.add_argument(
         "--fail-fast",
         "--no-continue-on-error",
@@ -1053,1268 +749,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _pick_input(args: argparse.Namespace, config: ProjectConfig | None) -> Any:
-    value = args.input_file or args.input
-    if value:
-        return value
-    if config and config.input_paths:
-        return config.input_paths[0]
-    raise PipelineError("请提供输入图像，或在 TOML 中填写 inputs.files")
-
-
-def _handle_inspect(args: argparse.Namespace) -> int:
-    config = _config(args.config)
-    source = _pick_input(args, config)
-    poni = args.poni or (config.poni_path if config else None)
-    inspect_fn = _pipeline_symbol("inspect_frame")
-    inspect_kwargs: dict[str, Any] = {
-        "poni": poni,
-        "config": config,
-        "frame": args.frame,
-        "dataset": args.dataset,
-        "mask": args.mask,
-        "mask_frame": args.mask_frame,
-        "mask_dataset": args.mask_dataset,
-        "valid_mask": args.valid_mask,
-    }
-    beamstop_radius = getattr(args, "beamstop_radius_px", None)
-    if beamstop_radius is not None:
-        accepted_bs, unsupported_bs = _filter_supported_kwargs(
-            inspect_fn, {"beamstop_radius_px": beamstop_radius}
-        )
-        inspect_kwargs.update(accepted_bs)
-        if unsupported_bs:
-            print(
-                f"警告：当前 inspect_frame 尚不支持参数 ({', '.join(unsupported_bs)})，已跳过。",
-                file=sys.stderr,
-            )
-    recommend = bool(getattr(args, "recommend", False))
-    nominal_axis = getattr(args, "nominal_draw_axis_deg", None)
-    used_native_recommend = False
-    if recommend:
-        import inspect as _inspect
-
-        try:
-            sig = _inspect.signature(inspect_fn)
-            params = sig.parameters
-            accepts_var_kw = any(
-                p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
-            )
-            if accepts_var_kw or "recommend" in params:
-                inspect_kwargs["recommend"] = True
-                used_native_recommend = True
-                if nominal_axis is not None and (
-                    accepts_var_kw or "nominal_draw_axis_deg" in params
-                ):
-                    inspect_kwargs["nominal_draw_axis_deg"] = float(nominal_axis)
-        except (TypeError, ValueError):
-            pass
-
-    report = inspect_fn(source, **inspect_kwargs)
-    if recommend and not used_native_recommend and "advisor" not in report:
-        report = dict(report)
-        try:
-            advisor_fn = _advisor_callable()
-        except PipelineError as exc:
-            report["advisor"] = {
-                "available": False,
-                "reason": str(exc),
-            }
-        else:
-            advisor_kwargs: dict[str, Any] = {
-                "poni_path": poni,
-                "mask_path": args.mask,
-                "image_dataset": args.dataset,
-                "image_frame_index": args.frame,
-                "mask_dataset": args.mask_dataset,
-                "mask_frame_index": args.mask_frame,
-                "nominal_draw_axis_deg": 90.0 if nominal_axis is None else float(nominal_axis),
-            }
-            if isinstance(beamstop_radius, (int, float)):
-                accepted_adv, _ = _filter_supported_kwargs(
-                    advisor_fn, {"beamstop_radius_px": float(beamstop_radius)}
-                )
-                advisor_kwargs.update(accepted_adv)
-            report["advisor"] = advisor_fn(source, **advisor_kwargs)
-    report = annotate_report(report, command="inspect", exit_code=0)
-    if args.output:
-        destination = Path(args.output)
-        if destination.exists() and not args.force:
-            raise FileExistsError(f"输出已存在，未覆盖：{destination}（需要 --force）")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    _print_json(report)
-    return 0
-
-
-def _handle_analyze(args: argparse.Namespace) -> int:
-    config = _config(args.config)
-    overrides = _analysis_overrides(args)
-    figure_output = getattr(args, "figure_output", None)
-    if figure_output:
-        figure_target = Path(figure_output).expanduser().resolve()
-        if figure_target.exists():
-            raise FileExistsError(f"科研图目录已存在，未覆盖：{figure_output}")
-        if args.output:
-            analysis_target = Path(args.output).expanduser().resolve()
-            if analysis_target == figure_target or figure_target in analysis_target.parents:
-                raise PipelineError("分析输出会占用科研图目录；请为 --output 和 --figure-output 选择独立目录")
-            if analysis_target.suffix.lower() in {".json", ".npz", ".csv"} and analysis_target in figure_target.parents:
-                raise PipelineError("科研图目录不能放在分析输出文件内部；请选择独立目录")
-        selected_method = overrides.get("ridge_method", (config.analysis if config else {}).get("ridge_method"))
-        from .analysis_config import normalize_ridge_method
-
-        if selected_method is not None and normalize_ridge_method(selected_method) != "butterfly_curvature":
-            raise PipelineError("科研图导出需要 --ridge-method butterfly_curvature")
-        overrides["ridge_method"] = "butterfly_curvature"
-    config = _with_analysis(config, overrides)
-    source = _pick_input(args, config)
-    analyze_fn = _pipeline_symbol("analyze_frame")
-    analyze_kwargs: dict[str, Any] = {
-        "poni": args.poni or (config.poni_path if config else None),
-        "config": config,
-        "full2d": args.full2d or (config.full2d if config else False),
-        "frame": args.frame,
-        "dataset": args.dataset,
-        "mask": args.mask,
-        "mask_frame": args.mask_frame,
-        "mask_dataset": args.mask_dataset,
-        "valid_mask": args.valid_mask,
-        "output": None if figure_output else args.output,
-        "force": args.force,
-    }
-    optional_analyze_kwargs: dict[str, Any] = {}
-    if getattr(args, "beamstop_radius_px", None) is not None:
-        optional_analyze_kwargs["beamstop_radius_px"] = args.beamstop_radius_px
-    if getattr(args, "uncertainty_dataset", None) is not None:
-        optional_analyze_kwargs["uncertainty_dataset"] = args.uncertainty_dataset
-    if getattr(args, "include_physics", False):
-        optional_analyze_kwargs["include_physics"] = True
-    if getattr(args, "intensity_mode", None) is not None:
-        optional_analyze_kwargs["intensity_mode"] = args.intensity_mode
-    accepted_opt, unsupported_opt = _filter_supported_kwargs(analyze_fn, optional_analyze_kwargs)
-    analyze_kwargs.update(accepted_opt)
-    if unsupported_opt:
-        print(
-            f"警告：当前 analyze_frame 尚不支持参数 ({', '.join(unsupported_opt)})，已跳过。",
-            file=sys.stderr,
-        )
-    result = analyze_fn(source, **analyze_kwargs)
-    if figure_output:
-        from .butterfly_figure import export_butterfly_figure
-        from .pipeline import _coerce_qmap, _result_output_paths
-
-        if not isinstance(result.butterfly, Mapping):
-            raise PipelineError("当前分析没有可导出的蝴蝶观测结果")
-        if args.output:
-            analysis_paths = [path.expanduser().resolve() for path in _result_output_paths(result, args.output)]
-            if any(path == figure_target or figure_target in path.parents or path in figure_target.parents
-                   for path in analysis_paths):
-                raise PipelineError("分析文件与科研图目录冲突；请选择独立目录")
-            existing = [path for path in analysis_paths if path.exists()]
-            if any(path.is_dir() for path in existing):
-                raise PipelineError("分析输出文件的位置已有目录；科研图未写入，请选择独立目录")
-            if any(parent.exists() and not parent.is_dir() for path in analysis_paths for parent in path.parents):
-                raise PipelineError("分析输出的父目录位置已有文件；科研图未写入，请选择独立目录")
-            if existing and not args.force:
-                raise FileExistsError(f"分析输出已存在，科研图未写入：{existing[0]}")
-        coordinates = _coerce_qmap(result.qmap, result.image.shape)
-        pixel_fit = result.full2d if isinstance(result.full2d, Mapping) else {}
-        pixel_model = pixel_fit.get("model_image", pixel_fit.get("model"))
-        comparison_inputs = {} if pixel_model is None else {"model": pixel_model}
-        written = export_butterfly_figure(
-            figure_output, observed=result.image,
-            qx=coordinates["qx"], qy=coordinates["qy"],
-            valid_mask=result.valid_mask, result=result.butterfly,
-            q_unit=coordinates.get("q_unit", "unknown"),
-            context={
-                "metadata": result.metadata, "analysis": result.analysis,
-                "valid_mask_role": "analysis fit domain, including detector/external mask, q-window, ROI and weight validity",
-                "analysis_domain": None if result.analysis_domain is None else result.analysis_domain.to_summary(),
-                "pixel_model_source": "full2d fit output" if pixel_model is not None else None,
-                "pixel_model_status": pixel_fit.get("status"),
-                "pixel_model_parameters": pixel_fit.get("parameters"),
-                "pixel_model_reference_axis_deg": pixel_fit.get("reference_axis_deg"),
-                "pixel_model_bound_flags": pixel_fit.get("bound_flags"),
-                "pixel_model_condition_number": pixel_fit.get("condition_number"),
-                "pixel_model_rmse": pixel_fit.get("rmse"),
-                "pixel_model_effective_bounds": pixel_fit.get("effective_bounds"),
-            },
-            width_mm=args.figure_width, dpi=args.figure_dpi,
-            **comparison_inputs,
-        )
-        result.output_paths.extend(str(path) for path in written.values())
-        if args.output:
-            from .pipeline import export_result
-
-            analysis_paths = export_result(result, args.output, force=args.force)
-            result.output_paths.extend(str(path) for path in analysis_paths)
-    report = result.to_mapping()
-    from .batch import _quality_failure_reason, _quality_warning_reason
-
-    quality_reason = _quality_failure_reason(report) or _quality_warning_reason(report)
-    exit_code = 1 if quality_reason is not None else 0
-    report = annotate_report(
-        report,
-        command="analyze",
-        exit_code=exit_code,
-        quality_gate_reason=quality_reason,
-    )
-    _print_json(report)
-    return exit_code
-
-
-def _build_analysis_report(
-    output_dir: str | Path,
-    *,
-    resume: bool = False,
-    force: bool = False,
-    radial_bins: int = 128,
-    angular_bins: int = 72,
-    formats: Sequence[str] = ("png", "svg", "pdf"),
-    dpi: int = 180,
-    lamellar_settings: Mapping[str, Any] | None = None,
-    journal_style: str | None = None,
-) -> Mapping[str, Any]:
-    """Load the optional report pipeline only when a report is requested."""
-
-    from .report import build_analysis_report
-
-    options: dict[str, Any] = {
-        "resume": resume,
-        "force": force,
-        "radial_bins": radial_bins,
-        "angular_bins": angular_bins,
-        "formats": tuple(formats),
-        "dpi": dpi,
-        "progress": lambda message: print(message, file=sys.stderr, flush=True),
-    }
-    if lamellar_settings is not None:
-        options["lamellar_settings"] = dict(lamellar_settings)
-    if journal_style is not None and str(journal_style).strip() and str(journal_style) != "default":
-        import inspect as _inspect
-
-        try:
-            sig = _inspect.signature(build_analysis_report)
-            params = sig.parameters
-            accepts_style = "journal_style" in params or any(
-                p.kind == _inspect.Parameter.VAR_KEYWORD for p in params.values()
-            )
-        except (TypeError, ValueError):
-            accepts_style = True
-        if accepts_style:
-            options["journal_style"] = str(journal_style)
-        else:
-            print(
-                f"警告：当前报告模块尚不支持 --journal-style={journal_style}，已回退默认样式。",
-                file=sys.stderr,
-            )
-    return build_analysis_report(
-        output_dir,
-        **options,
-    )
-
-
-def _handle_report(args: argparse.Namespace) -> int:
-    _validate_report_options(args.radial_bins, args.angular_bins)
-    lamellar_settings = _load_lamellar_settings(args.lamellar_settings)
-    report_kwargs: dict[str, Any] = {
-        "resume": args.resume,
-        "force": args.force,
-        "radial_bins": args.radial_bins,
-        "angular_bins": args.angular_bins,
-        "formats": args.formats,
-        "dpi": args.dpi,
-        "lamellar_settings": lamellar_settings,
-    }
-    journal_style = getattr(args, "journal_style", "default")
-    if journal_style is not None and str(journal_style) != "default":
-        report_kwargs["journal_style"] = str(journal_style)
-    result = _build_analysis_report(args.output_dir, **report_kwargs)
-    _print_json(result)
-    return int(result.get("exit_code", 0))
-
-
-def _handle_batch(args: argparse.Namespace) -> int:
-    from .output_lock import output_lock
-
-    if args.report_lamellar_settings and not args.report:
-        raise PipelineError("--report-lamellar-settings requires --report")
-    lamellar_settings = _load_lamellar_settings(args.report_lamellar_settings)
-    if args.report:
-        _validate_report_options(args.report_radial_bins, args.report_angular_bins)
-    config = _with_analysis(_config(args.config), _analysis_overrides(args))
-    output_dir = Path(args.output or (config.output_dir if config else "results"))
-    analysis = config.analysis if config is not None else {}
-    manifest = args.manifest or analysis.get("manifest")
-    raw_inputs = list(args.inputs)
-    if not raw_inputs and config:
-        raw_inputs = list(config.input_paths)
-    if not raw_inputs and not manifest:
-        raise PipelineError("batch 没有输入；请提供路径、--manifest 或 TOML 的 inputs.files")
-    if isinstance(manifest, (str, os.PathLike)):
-        manifest_candidate = Path(manifest).expanduser()
-        if not manifest_candidate.is_file():
-            with manifest_candidate.open("rb"):
-                pass
-    if args.unattended is not None:
-        if not args.output and not (config and config.output_dir):
-            raise PipelineError("unattended batch requires an explicit output directory")
-        poni_precheck = args.poni or (config.poni_path if config else None)
-        if poni_precheck is None:
-            raise PipelineError("unattended batch requires a PONI calibration")
-        package_root = Path(args.unattended).expanduser().resolve(strict=False)
-        output_root = output_dir.expanduser().resolve(strict=False)
-        if output_root == package_root or output_root.is_relative_to(package_root):
-            raise PipelineError("unattended output must be outside the raw package")
-    cli_slice_precheck = (
-        args.start is not None or args.stop is not None or args.stride is not None
-    )
-    if args.frame_range is not None and cli_slice_precheck:
-        raise PipelineError("frame_range cannot be combined with start/stop/stride")
-    resume_precheck = bool(args.resume or analysis.get("resume", False))
-    if (
-        output_dir.exists()
-        and any(path.name != ".wingsaxs.lock" for path in output_dir.iterdir())
-        and not args.force
-        and not resume_precheck
-    ):
-        raise FileExistsError(f"输出目录已有内容，未覆盖：{output_dir}（需要 --force）")
-    with output_lock(output_dir, create=True):
-        return _handle_batch_locked(args, config, lamellar_settings)
-
-
-def _handle_batch_locked(args: argparse.Namespace, config: ProjectConfig | None, lamellar_settings: Any) -> int:
-    from . import batch as batch_module
-    from . import export as export_module
-
-    analysis = config.analysis if config is not None else {}
-    manifest = args.manifest or analysis.get("manifest")
-    inputs = list(args.inputs)
-    if not inputs and config:
-        inputs = list(config.input_paths)
-    if not inputs and not manifest:
-        raise PipelineError("batch 没有输入；请提供路径、--manifest 或 TOML 的 inputs.files")
-    # ``argparse`` receives quoted PowerShell globs literally.  Expand them
-    # before handing a list to run_batch (its single-string form already has
-    # this convenience, but a CLI naturally supplies a list).
-    expanded_inputs: list[str] = []
-    for value in inputs:
-        text = os.path.expanduser(os.fspath(value))
-        if any(char in text for char in "*?[]"):
-            expanded_inputs.extend(
-                os.fspath(item) for item in filter_supported_image_paths(glob.glob(text))
-            )
-        elif Path(text).is_dir():
-            expanded_inputs.extend(
-                os.fspath(item)
-                for item in filter_supported_image_paths(Path(text).iterdir())
-            )
-        else:
-            expanded_inputs.append(text)
-    inputs = expanded_inputs
-    if not inputs and not manifest:
-        raise PipelineError("batch 输入通配符没有匹配任何文件")
-    mode = args.mode or str(analysis.get("batch_mode", analysis.get("mode", "independent")))
-    checkpoint = args.checkpoint or analysis.get("checkpoint")
-    resume = bool(args.resume or analysis.get("resume", False))
-    unattended = args.unattended is not None
-    series = args.series if args.series is not None else analysis.get("series")
-    cli_slice = (
-        args.start is not None
-        or args.stop is not None
-        or args.stride is not None
-    )
-    cli_range = args.frame_range is not None
-    if cli_range and cli_slice:
-        start = args.start
-        stop = args.stop
-        stride = args.stride if args.stride is not None else 1
-        frame_range = args.frame_range
-    elif cli_range:
-        # CLI --range overrides any TOML start/stop/stride defaults.
-        start = None
-        stop = None
-        stride = 1
-        frame_range = args.frame_range
-    elif cli_slice:
-        # CLI --start/--stop/--stride overrides any TOML frame_range default.
-        if analysis.get("frame_range") is not None:
-            start = args.start
-            stop = args.stop
-            stride = args.stride if args.stride is not None else 1
-        else:
-            start = args.start if args.start is not None else analysis.get("start")
-            stop = args.stop if args.stop is not None else analysis.get("stop")
-            stride = args.stride if args.stride is not None else analysis.get("stride", 1)
-        frame_range = None
-    else:
-        start = analysis.get("start")
-        stop = analysis.get("stop")
-        stride = analysis.get("stride", 1)
-        frame_range = analysis.get("frame_range")
-    output_dir = Path(args.output or (config.output_dir if config else "results"))
-    poni = args.poni or (config.poni_path if config else None)
-    if unattended:
-        if not args.output and not (config and config.output_dir):
-            raise PipelineError("unattended batch requires an explicit output directory")
-        if poni is None:
-            raise PipelineError("unattended batch requires a PONI calibration")
-        package_root = Path(args.unattended).expanduser().resolve(strict=False)
-        poni = _unattended_source_path(poni, package_root)
-        output_root = output_dir.expanduser().resolve(strict=False)
-        if output_root == package_root or output_root.is_relative_to(package_root):
-            raise PipelineError("unattended output must be outside the raw package")
-        if checkpoint is None:
-            checkpoint = output_dir / "checkpoint.json"
-        checkpoint_root = Path(checkpoint).expanduser().resolve(strict=False)
-        if not checkpoint_root.is_relative_to(output_root):
-            raise PipelineError("unattended checkpoint must be inside the output directory")
-    stream = bool(args.stream or unattended)
-    # A resumed run has already validated input/config/mode hashes before its
-    # exports are written.  It may therefore refresh its own known bundle
-    # targets; a fresh run still refuses a non-empty directory by default.
-    if (output_dir.exists() and any(path.name != ".wingsaxs.lock" for path in output_dir.iterdir())
-            and not args.force and not resume):
-        raise FileExistsError(f"输出目录已有内容，未覆盖：{output_dir}（需要 --force）")
-
-    full2d = args.full2d or (config.full2d if config else False)
-
-    # CLI path overrides are part of the batch configuration identity.  This
-    # binds PONI/mask content fingerprints in ``config_fingerprint`` so a
-    # resume cannot silently reuse results after calibration or mask changes.
-    path_analysis = dict(config.analysis) if isinstance(config, ProjectConfig) else {}
-    for name, value in (
-        ("mask", args.mask),
-        ("valid_mask", args.valid_mask),
-        ("mask_frame", args.mask_frame),
-        ("mask_dataset", args.mask_dataset),
-        ("beamstop_radius_px", getattr(args, "beamstop_radius_px", None)),
-    ):
-        if value is not None:
-            path_analysis[name] = value
-    if unattended:
-        for name in ("mask", "valid_mask"):
-            source_path = path_analysis.get(name)
-            if isinstance(source_path, (str, os.PathLike)):
-                path_analysis[name] = _unattended_source_path(source_path, package_root)
-    if cli_slice and not cli_range:
-        path_analysis.pop("frame_range", None)
-    elif cli_range and not cli_slice:
-        for key in ("start", "stop", "stride"):
-            path_analysis.pop(key, None)
-    for name, value in (
-        ("series", args.series),
-        ("start", start if cli_slice else None),
-        ("stop", stop if cli_slice else None),
-        ("stride", stride if cli_slice else None),
-        ("frame_range", frame_range if cli_range else None),
-    ):
-        if value is not None:
-            path_analysis[name] = value
-    if unattended:
-        selected_method = path_analysis.setdefault("ridge_method", "butterfly_curvature")
-        if selected_method != "butterfly_curvature":
-            raise PipelineError("unattended butterfly analysis requires ridge_method=butterfly_curvature")
-        configured_recipe = path_analysis.get("butterfly") or {}
-        if not isinstance(configured_recipe, Mapping):
-            raise PipelineError("analysis.butterfly must be a mapping")
-        butterfly_recipe = dict(configured_recipe)
-        butterfly_recipe.setdefault("stage", "evaluate")
-        butterfly_recipe.setdefault("trace_method", "annular_peak")
-        butterfly_recipe.setdefault("resamples", 0)
-        if butterfly_recipe["stage"] != "evaluate":
-            raise PipelineError("unattended butterfly analysis requires butterfly.stage=evaluate")
-        path_analysis["butterfly"] = butterfly_recipe
-    path_analysis["stage"] = "full2d" if full2d else "geometry"
-    if isinstance(config, ProjectConfig) and (
-        poni != config.poni_path or path_analysis != config.analysis
-    ):
-        batch_config = ProjectConfig(
-            input_paths=config.input_paths,
-            poni_path=poni,
-            output_dir=config.output_dir,
-            q_unit=config.q_unit,
-            full2d=full2d,
-            analysis=path_analysis,
-            export=config.export,
-            metadata=config.metadata,
-        )
-    elif config is None and (poni is not None or path_analysis):
-        batch_config = ProjectConfig(poni_path=poni, analysis=path_analysis)
-    else:
-        batch_config = config
-
-    batch_inputs: Any = inputs
-    batch_manifest: Any = manifest
-    if args.frame is not None or args.dataset is not None:
-        # Resolve the manifest before applying CLI overrides so the selected
-        # frame/dataset become part of the FrameRef identity and input hash.
-        resolved_refs = batch_module.build_frame_refs(
-            inputs,
-            manifest=manifest,
-            allow_mixed_series=series is not None,
-        )
-        resolved_with_cli_selectors = []
-        for ref in resolved_refs:
-            resolved_with_cli_selectors.append(
-                batch_module.FrameRef(
-                    ref.path,
-                    time=ref.time,
-                    frame_id=ref.frame_id,
-                    metadata=ref.metadata,
-                    order=ref.order,
-                    source=ref.source,
-                    dataset=args.dataset if args.dataset is not None else ref.dataset,
-                    frame=args.frame if args.frame is not None else ref.frame,
-                )
-            )
-        batch_inputs = resolved_with_cli_selectors
-        # Feed the resolved records back as the manifest so an existing
-        # manifest's acquisition order/time remains authoritative after the
-        # CLI selector override.
-        batch_manifest = [
-            {**ref.to_dict(), "order": index}
-            for index, ref in enumerate(resolved_with_cli_selectors)
-        ]
-        selector_config = {
-            name: value
-            for name, value in (("frame", args.frame), ("dataset", args.dataset))
-            if value is not None
-        }
-        if isinstance(batch_config, ProjectConfig):
-            batch_config = ProjectConfig(
-                input_paths=batch_config.input_paths,
-                poni_path=batch_config.poni_path,
-                output_dir=batch_config.output_dir,
-                q_unit=batch_config.q_unit,
-                full2d=full2d,
-                analysis=deep_merge_mapping(batch_config.analysis, selector_config),
-                export=batch_config.export,
-                metadata=batch_config.metadata,
-            )
-        else:
-            batch_config = {"analysis": deep_merge_mapping(path_analysis, selector_config)}
-
-    preflight_summary: dict[str, Any] | None = None
-    if unattended:
-        from .service import ButterflyAnalysisService
-
-        allow_mixed = bool(
-            series is not None
-            or path_analysis.get("allow_mixed_series", path_analysis.get("independent_series", False))
-        )
-        selected_refs = batch_module.build_frame_refs(
-            batch_inputs, manifest=batch_manifest, allow_mixed_series=allow_mixed,
-        )
-        preflight_start, preflight_stop, preflight_stride = start, stop, stride
-        if frame_range is not None:
-            preflight_start, preflight_stop, preflight_stride = batch_module.parse_frame_range(frame_range)
-            if start is not None or stop is not None or stride != 1:
-                raise ValueError("frame_range cannot be combined with start/stop/stride")
-        selected_refs = batch_module.select_frame_refs(
-            selected_refs,
-            series=series, start=preflight_start, stop=preflight_stop,
-            stride=preflight_stride,
-        )
-        if not selected_refs:
-            raise ValueError("batch selection matched no frames")
-        mask = path_analysis.get("mask")
-        valid_mask = path_analysis.get("valid_mask")
-        if mask is not None and valid_mask is not None:
-            raise PipelineError("unattended preflight cannot represent mask and valid_mask together")
-        q_window = path_analysis.get("q_window")
-        if q_window is None and path_analysis.get("q_min") is not None and path_analysis.get("q_max") is not None:
-            q_window = (path_analysis["q_min"], path_analysis["q_max"])
-        if q_window is None and (path_analysis.get("q_min") is None) != (path_analysis.get("q_max") is None):
-            raise PipelineError("unattended preflight requires both q_min and q_max when q_window is absent")
-        preflight_dir = output_dir / "preflight"
-        preflight_report = ButterflyAnalysisService().preflight(
-            args.unattended,
-            manifest=[
-                {**ref.to_dict(), "path": str(ref.path.expanduser().resolve(strict=False))}
-                for ref in selected_refs
-            ],
-            poni=poni,
-            mask=mask if mask is not None else valid_mask,
-            mask_convention=("1_valid_0_invalid" if valid_mask is not None else "0_valid_1_invalid"),
-            mask_frame=path_analysis.get("mask_frame"),
-            mask_dataset=path_analysis.get("mask_dataset"),
-            q_window=q_window,
-            context=(
-                _unattended_source_path(args.preflight_context, package_root)
-                if args.preflight_context else None
-            ),
-            output=preflight_dir,
-            force=bool(args.force or resume),
-        )
-        if not isinstance(preflight_report, Mapping):
-            raise PipelineError("preflight returned no report")
-        preflight_status = preflight_report.get("status")
-        if not isinstance(preflight_status, Mapping):
-            raise PipelineError("preflight returned no status envelope")
-        preflight_color = preflight_status.get("status_color")
-        preflight_code = preflight_status.get("exit_code")
-        if {"green": 0, "yellow": 1, "red": 2}.get(preflight_color) != preflight_code:
-            raise PipelineError("preflight returned an inconsistent status envelope")
-        selector = preflight_report.get("selector")
-        selected_mask = selector.get("mask") if isinstance(selector, Mapping) else None
-        if isinstance(selected_mask, Mapping):
-            selected_mask_path = selected_mask.get("path")
-            expected_mask = mask if mask is not None else valid_mask
-            if expected_mask is None and selected_mask_path is not None:
-                raise PipelineError("preflight context selected a mask absent from the batch recipe")
-            if expected_mask is not None:
-                if selected_mask_path is None:
-                    raise PipelineError("preflight did not apply the batch mask")
-                actual = Path(selected_mask_path)
-                actual = actual if actual.is_absolute() else package_root / actual
-                if actual.resolve(strict=False) != Path(expected_mask).expanduser().resolve(strict=False):
-                    raise PipelineError("preflight mask differs from the batch mask")
-        geometry = preflight_report.get("geometry")
-        if isinstance(geometry, Mapping) and q_window is None:
-            observed_window = geometry.get("q_window")
-            full_range = geometry.get("q_range")
-            if isinstance(observed_window, Mapping) and isinstance(full_range, Mapping):
-                for edge in ("min", "max"):
-                    observed = float(observed_window[edge])
-                    expected = float(full_range[edge])
-                    if abs(observed - expected) > max(1e-9, 1e-6 * abs(expected)):
-                        raise PipelineError("preflight context q_window differs from the batch recipe")
-        preflight_summary = {
-            "status_color": preflight_color,
-            "scientific_status": preflight_status.get("scientific_status"),
-            "exit_code": preflight_code,
-            "report": str(preflight_dir / "preflight.json"),
-            "selected_frames": len(selected_refs),
-        }
-        if preflight_color == "red":
-            blocked = annotate_report(
-                {"unattended": True, "blocked_stage": "preflight", "preflight": preflight_summary,
-                 "n_frames": 0, "n_success": 0, "n_failed": 0,
-                 "outputs": {"preflight": str(preflight_dir / "preflight.json")}},
-                command="batch", exit_code=2,
-            )
-            _print_json(blocked)
-            return 2
-
-    effective_beamstop = (
-        getattr(args, "beamstop_radius_px", None)
-        if getattr(args, "beamstop_radius_px", None) is not None
-        else path_analysis.get("beamstop_radius_px")
-    )
-    analyze_for_batch = _BatchFrameAnalyzer(
-        poni=poni,
-        full2d=full2d,
-        frame=args.frame,
-        dataset=args.dataset,
-        mask=path_analysis.get("mask") if unattended else args.mask,
-        mask_frame=path_analysis.get("mask_frame") if unattended else args.mask_frame,
-        mask_dataset=path_analysis.get("mask_dataset") if unattended else args.mask_dataset,
-        valid_mask=path_analysis.get("valid_mask") if unattended else args.valid_mask,
-        beamstop_radius_px=effective_beamstop,
-    )
-
-    optional_batch_kwargs: dict[str, Any] = {}
-    if getattr(args, "deduplicate_frames", False):
-        optional_batch_kwargs["deduplicate_identical_frames"] = True
-    if getattr(args, "workers", None) is not None:
-        optional_batch_kwargs["max_workers"] = int(args.workers)
-    if effective_beamstop is not None:
-        optional_batch_kwargs["beamstop_radius_px"] = effective_beamstop
-    accepted_batch_kwargs, unsupported_batch_kwargs = _filter_supported_kwargs(
-        batch_module.run_batch,
-        optional_batch_kwargs,
-        aliases={"deduplicate_identical_frames": ("deduplicate_frames",)},
-    )
-    if unsupported_batch_kwargs:
-        warn_names = [name for name in unsupported_batch_kwargs if name != "beamstop_radius_px"]
-        if warn_names:
-            print(
-                f"警告：当前 run_batch 尚不支持参数 ({', '.join(warn_names)})，已回退默认执行。",
-                file=sys.stderr,
-            )
-
-    stream_writer = None
-    if stream:
-        stream_writer = export_module.StreamingBatchExporter(
-            output_dir,
-            provenance={"command": "bsaxs batch", "full2d": full2d, "stream": True},
-            force=bool(args.force or resume),
-            resume=resume,
-            analyzer_identity="butterfly_saxs.pipeline.analyze_frame",
-        )
-    try:
-        run = batch_module.run_batch(
-            batch_inputs,
-            analyze_for_batch,
-            mode=mode,
-            config=batch_config,
-            manifest=batch_manifest,
-            checkpoint=checkpoint,
-            resume=resume,
-            series=series,
-            start=start,
-            stop=stop,
-            stride=stride,
-            frame_range=frame_range,
-            progress=lambda update: print(
-                f"batch progress {update.get('completed', 0)}/{update.get('total', 0)}",
-                file=sys.stderr,
-                flush=True,
-            ),
-            result_sink=None if stream_writer is None else stream_writer.write,
-            retain_results=stream_writer is None,
-            analyzer_identity="butterfly_saxs.pipeline.analyze_frame",
-            restore_frame=None if stream_writer is None else stream_writer.can_restore,
-            **accepted_batch_kwargs,
-        )
-        exports = (
-            stream_writer.finalize(run)
-            if stream_writer is not None
-            else export_module.export_batch(
-                run,
-                output_dir,
-                provenance={"command": "bsaxs batch", "full2d": full2d},
-                force=bool(args.force or resume),
-            )
-        )
-    except BaseException:
-        if stream_writer is not None:
-            stream_writer.abort()
-        raise
-    compact_records = []
-    for item in run.frame_results:
-        # The result is replaced by the compact public mapping below, or
-        # omitted entirely for unattended runs. Do not expand detector arrays
-        # only to discard that copy at this boundary.
-        record = item.to_record(include_result=False)
-        if hasattr(item.result, "to_mapping"):
-            # Avoid printing/duplicating full detector arrays at the CLI
-            # boundary; lossless arrays remain in results.npz and the object
-            # returned by the Python API.
-            result_mapping = item.result.to_mapping()
-            if stream and isinstance(result_mapping, Mapping):
-                # Stream mode already writes detector/profile arrays to NPZ;
-                # keep stdout bounded to longitudinal diagnostics and rows.
-                result_mapping = {
-                    key: result_mapping.get(key)
-                    for key in (
-                        "metadata", "flags", "parameters", "ridges", "ridge_points",
-                        "ellipse_fit", "butterfly", "lobe_radial_profiles", "lobe_radial_peaks",
-                        "saxs_physics", "full2d", "analysis", "analysis_domain", "valid_mask",
-                    )
-                    if key in result_mapping
-                }
-            record["result"] = result_mapping
-        elif stream and isinstance(item.result, Mapping):
-            record["result"] = {
-                key: item.result.get(key)
-                for key in (
-                    "metadata", "flags", "parameters", "ridges", "ridge_points",
-                    "ellipse_fit", "butterfly", "lobe_radial_profiles", "lobe_radial_peaks",
-                    "saxs_physics", "full2d", "analysis", "analysis_domain",
-                )
-                if key in item.result
-            }
-        else:
-            record["result"] = item.to_record()["result"]
-        if unattended:
-            # The streamed bundle is the evidence archive.  Keep headless
-            # stdout bounded to per-frame control state for long acquisitions.
-            record.pop("result", None)
-        compact_records.append(record)
-    report = {
-        "mode": run.mode,
-        "input_hash": run.input_hash,
-        "config_hash": run.config_hash,
-        "frames": compact_records,
-        "n_frames": len(run.frame_results),
-        "n_success": sum(frame.status == "ok" for frame in run.frame_results),
-        "n_warning": sum(frame.status == "warning" for frame in run.frame_results),
-        "n_completed": len(run.successful),
-        "n_failed": len(run.failures),
-        "checkpoint": str(run.checkpoint) if run.checkpoint is not None else None,
-        "selection": run.selection,
-        "cancelled": run.cancelled,
-        "elapsed_s": run.elapsed_s,
-        "processed_count": run.processed_count,
-        "total_count": run.total_count,
-        "outputs": {key: str(path) for key, path in exports.items()},
-    }
-    if unattended:
-        report["unattended"] = True
-        report["preflight"] = preflight_summary
-        report["outputs"]["preflight"] = str(output_dir / "preflight" / "preflight.json")
-    from .batch import _quality_warning_reason
-
-    warning_reason = next((reason for frame in run.frame_results
-                           if frame.result is not None
-                           if (reason := _quality_warning_reason(frame.result)) is not None), None)
-    exit_code = 1 if (run.failures or run.cancelled or warning_reason or report["n_warning"] or
-                      (preflight_summary is not None and preflight_summary["status_color"] != "green")) else 0
-    if args.report:
-        report_resume = bool(resume)
-        next_command = _report_resume_command(
-            output_dir,
-            radial_bins=args.report_radial_bins,
-            angular_bins=args.report_angular_bins,
-            formats=args.report_formats,
-            dpi=args.report_dpi,
-            lamellar_settings_path=args.report_lamellar_settings,
-        )
-        try:
-            report_result = _build_analysis_report(
-                output_dir,
-                resume=report_resume,
-                force=bool(args.force),
-                radial_bins=args.report_radial_bins,
-                angular_bins=args.report_angular_bins,
-                formats=args.report_formats,
-                dpi=args.report_dpi,
-                lamellar_settings=lamellar_settings,
-            )
-            status = report_result.get("status", report_result.get("operation_status", "completed"))
-            report_summary = {
-                "status": status,
-                "counts": report_result.get("counts", {}),
-                "outputs": report_result.get("outputs", {}),
-            }
-            report_exit_code = int(report_result.get("exit_code", 0))
-            if report_exit_code != 0:
-                report_summary["next_command"] = next_command
-                exit_code = 1
-            report["analysis_report"] = report_summary
-        except Exception as exc:
-            # Keep the completed analysis exports; report generation can be
-            # retried directly without fitting the frames again.
-            report["analysis_report"] = {
-                "status": "incomplete",
-                "counts": {},
-                "outputs": {},
-                "error": str(exc),
-                "next_command": next_command,
-            }
-            print(
-                f"Analysis exports saved; report incomplete: {exc}. "
-                "Use the reported report command to continue without refitting.",
-                file=sys.stderr,
-            )
-            exit_code = 1
-    if args.package:
-        from .delivery import package_batch
-
-        try:
-            delivery = package_batch(
-                output_dir, resume=resume, force=bool(args.force),
-                progress=lambda message: print(message, file=sys.stderr, flush=True),
-            )
-            report["delivery"] = {key: delivery[key] for key in (
-                "status", "operation_status", "counts", "archive", "outputs", "next_action"
-            )}
-            if delivery["exit_code"]:
-                exit_code = 1
-        except (OSError, ValueError) as exc:
-            # The fit and its native exports have already completed. A ZIP or
-            # index fault must not misreport them as a crashed analysis, nor
-            # require rerunning it just to finish delivery.
-            report["delivery"] = {
-                "operation_status": "incomplete", "error": str(exc),
-                "next_command": ["bsaxs", "package", str(output_dir), "--resume"],
-            }
-            print(f"Analysis exports saved; delivery incomplete: {exc}. "
-                  "Use the reported package command to finish without refitting.", file=sys.stderr)
-            exit_code = 1
-    report = annotate_report(report, command="batch", exit_code=exit_code,
-                             quality_gate_reason=warning_reason)
-    _print_json(report)
-    # Partial exports remain available for inspection, while automation gets
-    # an honest non-zero status when any frame failed its load/fit quality gate.
-    return exit_code
-
-
-def _handle_synthetic(args: argparse.Namespace) -> int:
-    import numpy as np
-
-    array, qmap = _pipeline_symbol("synthetic_butterfly")(
-        args.shape,
-        q0=args.q0,
-        width=args.width,
-        ellipticity=args.ellipticity,
-        angle_deg=args.angle,
-        noise=args.noise,
-        seed=args.seed,
-        return_qmap=True,
-    )
-    destination = _write_synthetic(array, qmap, args.output, force=args.force) if args.output else None
-    report = annotate_report(
-        {
-            "shape": list(array.shape),
-            "dtype": str(array.dtype),
-            "output": os.fspath(destination) if destination else None,
-            "intensity_min": float(np.min(array)),
-            "intensity_max": float(np.max(array)),
-            "seed": args.seed,
-            "flags": {
-                "empirical_model_only": True,
-                "mechanism_under_determined": True,
-                "forward_simulation_only": True,
-                "nonunique_inverse_problem": True,
-                "uncalibrated_pixel_q": True,
-            },
-        },
-        command="synthetic",
-        exit_code=0,
-    )
-    _print_json(report)
-    return 0
-
-
-def _handle_gui(args: argparse.Namespace) -> int:
-    config = _config(args.config)
-    return int(
-        _pipeline_symbol("launch_gui")(
-            input_path=args.input,
-            poni=args.poni or (config.poni_path if config else None),
-            config=config,
-            config_path=args.config,
-        )
-        or 0
-    )
-
-
-def _handle_preflight(args: argparse.Namespace) -> int:
-    from .service import ButterflyAnalysisService
-
-    report = ButterflyAnalysisService().preflight(
-        args.package,
-        manifest=args.manifest,
-        poni=args.poni,
-        mask=args.mask,
-        context=args.context,
-        image_glob=args.image_glob,
-        frame=args.frame,
-        dataset=args.dataset,
-        mask_frame=args.mask_frame,
-        mask_dataset=args.mask_dataset,
-        q_window=args.q_window,
-        mask_convention=args.mask_convention,
-        correction_state=args.correction_state,
-        uncertainty_state=args.uncertainty_state,
-        output=args.output,
-        force=args.force,
-    )
-    _print_json(report)
-    status = report.get("status")
-    if isinstance(status, Mapping):
-        return int(status["exit_code"])
-    return 0 if status == "green" else 1
-
-
-def _handle_benchmark(args: argparse.Namespace) -> int:
-    from . import benchmark_t1, benchmark_t2
-
-    output = Path(args.output)
-    manifests: dict[str, str] = {}
-    if args.suite in {"t1", "all"}:
-        destination = output / "t1" if args.suite == "all" else output
-        manifest = benchmark_t1.write_evidence_directory(
-            destination,
-            shape=args.shape,
-            seed=args.seed,
-            force=args.force,
-        )
-        manifests["t1"] = manifest.as_posix()
-    if args.suite in {"t2", "all"}:
-        destination = output / "t2" if args.suite == "all" else output
-        manifest = benchmark_t2.write_evidence_directory(
-            destination,
-            shape=args.shape or benchmark_t2.DEFAULT_SHAPE,
-            seed=args.seed,
-            force=args.force,
-        )
-        manifests["t2"] = manifest.as_posix()
-    _print_json({"suite": args.suite, "manifests": manifests})
-    return 0
-
-
-def _handle_annotation_pack(args: argparse.Namespace) -> int:
-    from .annotation_pack import build_annotation_pack
-
-    result = build_annotation_pack(
-        args.package,
-        args.rt_manifest,
-        args.hold_manifest,
-        args.output,
-        preflight_json=args.preflight,
-        poni=args.poni,
-        mask=args.mask,
-    )
-    _print_json(
-        {
-            "output_directory": Path(result["output_directory"]).as_posix(),
-            "candidate_count": result["candidate_count"],
-            "status": result["status"]["status"],
-            "human_consensus": result["status"]["human_consensus"],
-        }
-    )
-    return 0
-
-
-def _handle_p3_status(args: argparse.Namespace) -> int:
-    from .p3_gate import evaluate_p3_gate, write_p3_gate_report
-
-    if args.output:
-        report = write_p3_gate_report(
-            args.output,
-            args.t1_manifest,
-            args.t2_manifest,
-            args.annotation_status,
-            args.thresholds,
-            force=args.force,
-        )
-    else:
-        report = evaluate_p3_gate(
-            args.t1_manifest,
-            args.t2_manifest,
-            args.annotation_status,
-            args.thresholds,
-        )
-    _print_json(report)
-    return int(report["exit_code"])
-
-
-def _handle_p4_evaluate(args: argparse.Namespace) -> int:
-    from .p4_validation import run_p4_engineering
-
-    report = run_p4_engineering(
-        t1_manifest=args.t1_manifest,
-        t2_manifest=args.t2_manifest,
-        thresholds=args.thresholds,
-        output=args.output,
-        r0_package=args.r0_package,
-        r0_manifest=args.r0_manifest,
-        poni=args.poni,
-        mask=args.mask,
-        ridge_method=args.ridge_method,
-        run_sensitivity=not args.skip_sensitivity,
-        progress=lambda message: print(message, file=sys.stderr, flush=True),
-    )
-    _print_json(
-        {
-            "stage": report["stage"],
-            "engineering_status": report["engineering_status"],
-            "scientific_status": report["scientific_status"],
-            "p4_go_no_go": report["p4_go_no_go"],
-            "outputs": report["outputs"],
-        }
-    )
-    return 0 if report["p4_go_no_go"] == "GO" else 1
-
-
-def _handle_init_manifest(args: argparse.Namespace) -> int:
-    from .campaign import discover_manifest, write_manifest_csv
-
-    source = args.input_dir or args.input_path
-    if not source:
-        raise PipelineError("init-manifest 需要输入目录或 HDF5/图像文件（--input）")
-    output_path = Path(args.output).expanduser()
-    rows = discover_manifest(
-        source,
-        pattern=args.pattern,
-        recursive=bool(args.recursive),
-        dataset=args.dataset,
-        parse_metadata=bool(args.parse_metadata),
-        compute_sha256=bool(args.sha256),
-        relative_to=output_path.parent if args.relative else None,
-    )
-    if not rows:
-        raise PipelineError(f"未发现受支持的图像或数据集帧：{source}")
-    written = write_manifest_csv(rows, output_path, force=bool(args.force))
-    report = annotate_report(
-        {
-            "ok": True,
-            "input": str(Path(source).expanduser().resolve(strict=False)),
-            "output": str(written.resolve(strict=False)),
-            "n_frames": len(rows),
-            "dataset": rows[0].get("dataset") if rows else args.dataset,
-            "sha256_computed": bool(args.sha256),
-            "parse_metadata": bool(args.parse_metadata),
-            "rows_preview": rows[:5],
-        },
-        command="init-manifest",
-        exit_code=0,
-    )
-    _print_json(report)
-    return 0
-
-
-def _handle_advise(args: argparse.Namespace) -> int:
-    image = args.image or args.image_pos
-    if not image:
-        raise PipelineError("advise 需要输入图像路径（--image）")
-    advisor_fn = _advisor_callable()
-    advise_kwargs: dict[str, Any] = {
-        "poni_path": args.poni,
-        "mask_path": args.mask,
-        "image_dataset": args.image_dataset,
-        "image_frame_index": args.image_frame_index,
-        "mask_dataset": args.mask_dataset,
-        "mask_frame_index": args.mask_frame_index,
-        "nominal_draw_axis_deg": float(args.nominal_draw_axis_deg),
-        "bright_axis_convention": str(getattr(args, "bright_axis_convention", "draw")),
-    }
-    advice = advisor_fn(image, **advise_kwargs)
-    report = annotate_report(advice, command="advise", exit_code=0)
-    if args.output:
-        destination = Path(args.output).expanduser()
-        if destination.exists() and not args.force:
-            raise FileExistsError(f"输出已存在，未覆盖：{destination}（需要 --force）")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-    _print_json(report)
-    return 0
-
-
-def _handle_campaign(args: argparse.Namespace) -> int:
-    config_path = args.config or args.config_pos
-    if not config_path:
-        raise PipelineError("campaign 需要活动 TOML 配置文件（--config）")
-    output_root = args.output
-    if not output_root:
-        from .campaign import load_campaign_config
-
-        loaded = load_campaign_config(config_path)
-        output_root = loaded.get("output_root")
-    if not output_root:
-        raise PipelineError("campaign 需要输出根目录（--output）")
-
-    runner = _campaign_runner()
-    kwargs: dict[str, Any] = {
-        "force": bool(args.force),
-        "continue_on_error": bool(args.continue_on_error),
-    }
-    if args.report is not None:
-        kwargs["report"] = bool(args.report)
-    if args.journal_style and args.journal_style != "default":
-        kwargs["journal_style"] = str(args.journal_style)
-
-    optional_campaign_kwargs: dict[str, Any] = {}
-    if getattr(args, "beamstop_radius_px", None) is not None:
-        optional_campaign_kwargs["beamstop_radius_px"] = args.beamstop_radius_px
-    if getattr(args, "deduplicate_frames", False):
-        optional_campaign_kwargs["deduplicate_identical_frames"] = True
-    if getattr(args, "workers", None) is not None:
-        optional_campaign_kwargs["max_workers"] = int(args.workers)
-
-    base_accepted, _ = _filter_supported_kwargs(runner, kwargs)
-    opt_accepted, opt_unsupported = _filter_supported_kwargs(
-        runner,
-        optional_campaign_kwargs,
-        aliases={"deduplicate_identical_frames": ("deduplicate_frames",)},
-    )
-    if opt_unsupported:
-        print(
-            f"警告：当前 run_campaign 尚不支持参数 ({', '.join(opt_unsupported)})，已回退默认执行。",
-            file=sys.stderr,
-        )
-    call_kwargs = {**base_accepted, **opt_accepted}
-    progress_accepted, _ = _filter_supported_kwargs(
-        runner,
-        {"progress": lambda message: print(message, file=sys.stderr, flush=True)},
-    )
-    call_kwargs.update(progress_accepted)
-
-    result = runner(config_path, output_root, **call_kwargs)
-    exit_code = int(
-        result.get(
-            "exit_code",
-            1 if (result.get("n_failed", 0) or result.get("n_warning", 0)) else 0,
-        )
-    )
-    report = annotate_report(result, command="campaign", exit_code=exit_code)
-    _print_json(report)
-    return exit_code
-
-
-def _handle_describe(args: argparse.Namespace) -> int:
-    report = agent_manifest(getattr(args, "topic", None))
-    if getattr(args, "text", False):
-        tool = report["tool"]
-        print(
-            (
-                f"{tool['name']} {tool['version']} agent catalog\n"
-                "Run commands via `bsaxs <command>`. JSON stdout; exit 0/1/2.\n"
-                "success=True is not scientific acceptance. pixel-q is not a period."
-            ),
-            file=sys.stderr,
-        )
-    _print_json(report)
-    return 0
-
-
-def _handle_doctor(args: argparse.Namespace) -> int:
-    from .doctor import main as doctor_main
-
-    argv: list[str] = []
-    if args.require_ui:
-        argv.append("--require-ui")
-    if args.json:
-        argv.append("--json")
-    if args.quiet:
-        argv.append("--quiet")
-    return int(doctor_main(argv))
-
-
-def _handle_project(args: argparse.Namespace) -> int:
-    # Tests patch ``cli.run_project``.  Unpatched CLI uses the bounded runner.
-    project_runner = globals().get("run_project")
-    if project_runner is None:
-        project_runner = _pipeline_symbol("run_project_bounded")
-    run = project_runner(args.config, force=args.force)
-    compact_records = []
-    for item in run.frame_results:
-        has_to_mapping = hasattr(item.result, "to_mapping")
-        record = item.to_record(include_result=not has_to_mapping)
-        if has_to_mapping:
-            record["result"] = item.result.to_mapping()
-        compact_records.append(record)
-    has_warnings = any(item.status == "warning" for item in run.frame_results)
-    if args.legacy_json:
-        _print_json(compact_records)
-        return 1 if run.failures or run.cancelled or has_warnings else 0
-    exit_code = 1 if run.failures or run.cancelled or has_warnings else 0
-    report = annotate_report(
-        {
-            "schema_version": "lamellarsaxs2d.project_run.v2",
-            "mode": run.mode,
-            "input_hash": run.input_hash,
-            "config_hash": run.config_hash,
-            "frames": compact_records,
-            "n_frames": len(run.frame_results),
-            "n_success": sum(frame.status == "ok" for frame in run.frame_results),
-            "n_warning": sum(frame.status == "warning" for frame in run.frame_results),
-            "n_completed": len(run.successful),
-            "n_failed": len(run.failures),
-            "cancelled": run.cancelled,
-            "selection": run.selection,
-            "processed_count": run.processed_count,
-            "total_count": run.total_count,
-            "elapsed_s": run.elapsed_s,
-            "checkpoint": (
-                str(run.checkpoint) if run.checkpoint is not None else None
-            ),
-        },
-        command="project",
-        exit_code=exit_code,
-    )
-    _print_json(report)
-    return exit_code
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
@@ -2332,63 +766,73 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     command = args.command or "describe"
     try:
-        if command == "describe":
-            return _handle_describe(args)
-        if command == "doctor":
-            return _handle_doctor(args)
-        if command == "inspect":
-            return _handle_inspect(args)
-        if command == "analyze":
-            return _handle_analyze(args)
-        if command == "package":
-            from .delivery import package_batch
+        if command in {"describe", "doctor", "inspect", "analyze", "advise", "synthetic", "gui"}:
+            from ._cli import single
 
-            report = package_batch(
-                args.output_dir, archive=not args.no_archive, resume=args.resume, force=args.force,
-                progress=lambda message: print(message, file=sys.stderr, flush=True),
-            )
-            _print_json(report)
-            return report["exit_code"]
-        if command == "report":
-            return _handle_report(args)
-        if command == "verify-delivery":
-            from .delivery_bindings import verify_delivery_bindings
+            single_handlers = {
+                "describe": single.handle_describe,
+                "doctor": single.handle_doctor,
+                "inspect": single.handle_inspect,
+                "analyze": single.handle_analyze,
+                "advise": single.handle_advise,
+                "synthetic": single.handle_synthetic,
+                "gui": single.handle_gui,
+            }
+            return single_handlers[command](args)
+        if command in {"preflight", "package", "verify-delivery"}:
+            from ._cli import delivery_cmd
 
-            report = verify_delivery_bindings(Path(args.receipt), root=Path(args.root) if args.root else None)
-            _print_json(report)
-            return report["exit_code"]
-        if command == "batch":
-            return _handle_batch(args)
-        if command == "synthetic":
-            return _handle_synthetic(args)
-        if command == "gui":
-            return _handle_gui(args)
-        if command == "project":
-            return _handle_project(args)
-        if command == "preflight":
-            return _handle_preflight(args)
-        if command == "benchmark":
-            return _handle_benchmark(args)
-        if command == "annotation-pack":
-            return _handle_annotation_pack(args)
-        if command == "p3-status":
-            return _handle_p3_status(args)
-        if command == "p4-evaluate":
-            return _handle_p4_evaluate(args)
-        if command == "init-manifest":
-            return _handle_init_manifest(args)
-        if command == "advise":
-            return _handle_advise(args)
-        if command == "campaign":
-            return _handle_campaign(args)
+            delivery_handlers = {
+                "preflight": delivery_cmd.handle_preflight,
+                "package": delivery_cmd.handle_package,
+                "verify-delivery": delivery_cmd.handle_verify_delivery,
+            }
+            return delivery_handlers[command](args)
+        if command in {"batch", "project", "init-manifest", "campaign"}:
+            from ._cli import batch_cmd
+
+            batch_handlers = {
+                "batch": batch_cmd.handle_batch,
+                "project": batch_cmd.handle_project,
+                "init-manifest": batch_cmd.handle_init_manifest,
+                "campaign": batch_cmd.handle_campaign,
+            }
+            return batch_handlers[command](args)
+        if command in {"report", "benchmark", "annotation-pack", "p3-status", "p4-evaluate"}:
+            from ._cli import reporting_cmd
+
+            reporting_handlers = {
+                "report": reporting_cmd.handle_report,
+                "benchmark": reporting_cmd.handle_benchmark,
+                "annotation-pack": reporting_cmd.handle_annotation_pack,
+                "p3-status": reporting_cmd.handle_p3_status,
+                "p4-evaluate": reporting_cmd.handle_p4_evaluate,
+            }
+            return reporting_handlers[command](args)
         parser.error(f"未知命令：{command}")
     except AnalysisCancelled as exc:
         _emit_error(exc, exit_code=1, command=command, code="cancelled")
         return 1
-    except (PipelineError, ProjectConfigError, FileExistsError, OSError, ValueError) as exc:
+    except (
+        PipelineError,
+        ProjectConfigError,
+        FileExistsError,
+        OSError,
+        ValueError,
+    ) as exc:
         _emit_error(exc, exit_code=2, command=command)
         return 2
     return 2
 
 
-__all__ = ["build_parser", "main", "PipelineError"]
+__all__ = [
+    "PipelineError",
+    "_BatchFrameAnalyzer",
+    "_analysis_overrides",
+    "_build_analysis_report",
+    "_filter_supported_kwargs",
+    "_pipeline_symbol",
+    "_print_json",
+    "build_parser",
+    "main",
+]

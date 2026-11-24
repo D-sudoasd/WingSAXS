@@ -9,9 +9,7 @@ seven files defined by the single-frame evidence contract.
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
-import json
 import math
 import platform
 from collections.abc import Iterable, Mapping, Sequence
@@ -23,6 +21,9 @@ from typing import Any
 import numpy as np
 
 from .csv_utils import safe_csv_cell
+from .file_identity import sha256_file
+from .figure_support import save_agg_figure
+from .serialization import dumps_strict_json, json_safe
 
 
 OUTPUT_NAMES = (
@@ -92,37 +93,26 @@ def _safe_float(value: Any, field_name: str, *, allow_none: bool = True) -> floa
 def _json_safe(value: Any) -> Any:
     """Convert metadata to strict JSON without embedding detector-sized arrays."""
 
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, (float, np.floating)):
-        numeric = float(value)
-        return numeric if math.isfinite(numeric) else None
-    if isinstance(value, Path):
-        return str(value)
     if isinstance(value, np.ndarray):
         if value.ndim == 0:
-            return _json_safe(value.item())
+            return json_safe(value.item())
         summary: dict[str, Any] = {"shape": list(value.shape), "dtype": str(value.dtype)}
         if np.issubdtype(value.dtype, np.number):
             finite = np.isfinite(value)
             summary["finite_count"] = int(np.count_nonzero(finite))
             if np.any(finite):
                 finite_values = np.asarray(value[finite], dtype=float)
-                summary["min"] = _json_safe(float(np.min(finite_values)))
-                summary["max"] = _json_safe(float(np.max(finite_values)))
+                summary["min"] = json_safe(float(np.min(finite_values)))
+                summary["max"] = json_safe(float(np.max(finite_values)))
         else:
             summary["size"] = int(value.size)
         return summary
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return _json_safe(item())
-        except (TypeError, ValueError, OverflowError):
-            pass
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_json_safe(item) for item in value]
+    if is_dataclass(value):
+        return {field.name: _json_safe(getattr(value, field.name)) for field in fields(value)}
     for method_name in ("to_mapping", "as_dict", "to_dict"):
         method = getattr(value, method_name, None)
         if callable(method):
@@ -135,15 +125,13 @@ def _json_safe(value: Any) -> Any:
                     continue
             if converted is not value:
                 return _json_safe(converted)
-    if is_dataclass(value):
-        return {field.name: _json_safe(getattr(value, field.name)) for field in fields(value)}
     if hasattr(value, "__dict__"):
         return _json_safe({key: item for key, item in vars(value).items() if not str(key).startswith("_")})
-    return str(value)
+    return json_safe(value)
 
 
 def _strict_json_bytes(value: Any) -> bytes:
-    return (json.dumps(_json_safe(value), ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    return dumps_strict_json(_json_safe(value), sort_keys=False).encode("utf-8")
 
 
 def _coerce_image(value: Any, name: str, shape: tuple[int, int] | None = None) -> np.ndarray:
@@ -488,51 +476,46 @@ def _render_png(
     ellipses: Iterable[np.ndarray] = (),
     model_ellipses: Iterable[np.ndarray] = (),
 ) -> bytes:
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
     image = np.where(valid, array, np.nan)
     figure = Figure(figsize=(5.0, 4.4), layout="constrained")
-    FigureCanvasAgg(figure)
     axis = figure.add_subplot(1, 1, 1)
-    try:
-        extent = _extent(qx, qy, valid)
-        cmap = "PuOr" if residual else "cividis"
-        shown = axis.imshow(
-            image,
-            origin="lower",
-            extent=extent,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            interpolation="nearest",
-            aspect="equal",
-        )
-        axis.set_title(title)
-        axis.set_xlabel(f"qx ({q_unit})")
-        axis.set_ylabel(f"qy ({q_unit})")
-        figure.colorbar(shown, ax=axis, shrink=0.84, label="Data - model" if residual else "Intensity")
-        if not residual:
-            if ridges is not None and ridges.size:
-                points = ridges[np.isfinite(ridges).all(axis=1)]
-                if points.size:
-                    axis.scatter(points[:, 0], points[:, 1], s=11, facecolors="none", edgecolors="#F0E442", linewidths=0.7, label="Observed ridge")
-            for index, curve in enumerate(ellipses):
-                points = np.asarray(curve, dtype=float)
-                if points.ndim == 2 and points.shape[1] == 2 and points.size:
-                    axis.plot(points[:, 0], points[:, 1], color="#E69F00", lw=1.2, label="Observed ellipse" if index == 0 else None)
-            for index, curve in enumerate(model_ellipses):
-                points = np.asarray(curve, dtype=float)
-                if points.ndim == 2 and points.shape[1] == 2 and points.size:
-                    axis.plot(points[:, 0], points[:, 1], color="#FFFFFF", lw=1.2, ls="--", label="Current model" if index == 0 else None)
-            handles, _ = axis.get_legend_handles_labels()
-            if handles:
-                axis.legend(frameon=False, fontsize=7, loc="best")
-        output = io.BytesIO()
-        figure.savefig(output, format="png", dpi=300, bbox_inches="tight")
-        return output.getvalue()
-    finally:
-        figure.clear()
+    extent = _extent(qx, qy, valid)
+    cmap = "PuOr" if residual else "cividis"
+    shown = axis.imshow(
+        image,
+        origin="lower",
+        extent=extent,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+        aspect="equal",
+    )
+    axis.set_title(title)
+    axis.set_xlabel(f"qx ({q_unit})")
+    axis.set_ylabel(f"qy ({q_unit})")
+    figure.colorbar(shown, ax=axis, shrink=0.84, label="Data - model" if residual else "Intensity")
+    if not residual:
+        if ridges is not None and ridges.size:
+            points = ridges[np.isfinite(ridges).all(axis=1)]
+            if points.size:
+                axis.scatter(points[:, 0], points[:, 1], s=11, facecolors="none", edgecolors="#F0E442", linewidths=0.7, label="Observed ridge")
+        for index, curve in enumerate(ellipses):
+            points = np.asarray(curve, dtype=float)
+            if points.ndim == 2 and points.shape[1] == 2 and points.size:
+                axis.plot(points[:, 0], points[:, 1], color="#E69F00", lw=1.2, label="Observed ellipse" if index == 0 else None)
+        for index, curve in enumerate(model_ellipses):
+            points = np.asarray(curve, dtype=float)
+            if points.ndim == 2 and points.shape[1] == 2 and points.size:
+                axis.plot(points[:, 0], points[:, 1], color="#FFFFFF", lw=1.2, ls="--", label="Current model" if index == 0 else None)
+        handles, _ = axis.get_legend_handles_labels()
+        if handles:
+            axis.legend(frameon=False, fontsize=7, loc="best")
+    output = io.BytesIO()
+    save_agg_figure(figure, output, clear=True, format="png", dpi=300, bbox_inches="tight")
+    return output.getvalue()
 
 
 def _csv_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
@@ -579,11 +562,7 @@ def _file_record(value: Any) -> dict[str, Any]:
     path = Path(value).expanduser().resolve(strict=False)
     record: dict[str, Any] = {"path": str(path), "exists": bool(path.exists() and path.is_file())}
     if record["exists"]:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        record["sha256"] = digest.hexdigest()
+        record["sha256"] = sha256_file(path)
     return record
 
 

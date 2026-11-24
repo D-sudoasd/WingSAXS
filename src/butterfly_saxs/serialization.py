@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
+import json
 import math
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 
@@ -96,9 +99,84 @@ def json_safe(value: Any) -> Any:
     return repr(value)
 
 
+def dumps_strict_json(
+    value: Any,
+    *,
+    indent: int | None = 2,
+    sort_keys: bool = True,
+    ensure_ascii: bool = False,
+    separators: tuple[str, str] | None = None,
+    trailing_newline: bool = True,
+) -> str:
+    """Serialize ``value`` as strict JSON (``allow_nan=False``) after ``json_safe``."""
+
+    text = json.dumps(
+        json_safe(value),
+        ensure_ascii=ensure_ascii,
+        indent=indent,
+        sort_keys=sort_keys,
+        separators=separators,
+        allow_nan=False,
+    )
+    return text + "\n" if trailing_newline else text
+
+
+def write_text_atomic(
+    path: str | os.PathLike[str] | Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+) -> Path:
+    """Write ``text`` through a sibling temporary file and atomic ``os.replace``."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def write_json_atomic(
+    path: str | os.PathLike[str] | Path,
+    payload: Any,
+    *,
+    indent: int | None = 2,
+    sort_keys: bool = True,
+    ensure_ascii: bool = False,
+) -> Path:
+    """Serialize ``payload`` strictly (``allow_nan=False``) and replace ``path`` atomically."""
+
+    text = dumps_strict_json(
+        payload,
+        indent=indent,
+        sort_keys=sort_keys,
+        ensure_ascii=ensure_ascii,
+        trailing_newline=True,
+    )
+    return write_text_atomic(path, text)
+
+
 # Descriptive alias for callers that want to make the strict boundary
 # explicit in their code without copying the implementation.
 strict_jsonable = json_safe
 
 
-__all__ = ["json_safe", "strict_jsonable"]
+__all__ = [
+    "dumps_strict_json",
+    "json_safe",
+    "strict_jsonable",
+    "write_json_atomic",
+    "write_text_atomic",
+]

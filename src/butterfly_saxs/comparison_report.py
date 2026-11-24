@@ -44,7 +44,7 @@ from .journal_style import (
     style_2d_axes,
 )
 from .saxs_physics import fit_arrhenius_rate, fit_power_law_coarsening
-from .serialization import json_safe
+from .serialization import json_safe, write_json_atomic, write_text_atomic
 
 
 COMPARISON_SCHEMA = "wingsaxs.comparison_report.v1"
@@ -1849,25 +1849,6 @@ def _render_html(
     )
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
-    import os
-    import tempfile
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
 def build_comparison_report(
     sample_entries: Sequence[Mapping[str, Any]],
     output_dir: str | Path,
@@ -2161,9 +2142,11 @@ def build_comparison_report(
             post_incubation_min_a4=post_incubation_min_a4,
         )
         kinetics_path = out_root / "kinetics_and_scaling_summary.json"
-        _write_text_atomic(
+        write_json_atomic(
             kinetics_path,
-            json.dumps(json_safe(kinetics_summary), ensure_ascii=True, indent=2, allow_nan=False) + "\n",
+            kinetics_summary,
+            sort_keys=False,
+            ensure_ascii=True,
         )
 
     evo_manifest = _build_evolution_figure(
@@ -2221,8 +2204,8 @@ def build_comparison_report(
     html_path = out_root / "comparison_index.html"
     json_path = out_root / "comparison_summary.json"
 
-    _write_text_atomic(md_path, _render_markdown(summary, endpoint_rows))
-    _write_text_atomic(html_path, _render_html(summary, endpoint_rows))
+    write_text_atomic(md_path, _render_markdown(summary, endpoint_rows))
+    write_text_atomic(html_path, _render_html(summary, endpoint_rows))
 
     outputs_map: dict[str, str] = {
         "html": str(html_path),
@@ -2237,9 +2220,11 @@ def build_comparison_report(
         outputs_map["kinetics_and_scaling_json"] = str(kinetics_path)
     summary["outputs"] = outputs_map
 
-    _write_text_atomic(
+    write_json_atomic(
         json_path,
-        json.dumps(json_safe(summary), ensure_ascii=True, indent=2, allow_nan=False) + "\n",
+        summary,
+        sort_keys=False,
+        ensure_ascii=True,
     )
     return summary
 

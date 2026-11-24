@@ -33,6 +33,8 @@ from .benchmark_t2 import GENERATOR_VERSION as T2_GENERATOR_VERSION
 from .benchmark_t2 import T2_Q_UNIT
 from .benchmark_t2 import generate_case as generate_t2_case
 from .csv_utils import read_csv_rows
+from .file_identity import sha256_file
+from .serialization import write_json_atomic
 
 
 P3_GATE_SCHEMA_VERSION = "lamellarsaxs2d.p3_gate.v3"
@@ -261,12 +263,7 @@ def _load_mapping(path: str | Path, label: str) -> tuple[Path, dict[str, Any]]:
     return source, dict(parsed)
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+_sha256_file = sha256_file
 
 
 def _artifact_hash_matches(path: Path, expected: Any) -> bool:
@@ -1282,11 +1279,7 @@ def write_p3_gate_report(
     if destination.exists() and not force:
         raise FileExistsError(f"P3 门禁报告已存在，未覆盖：{destination}")
     report = evaluate_p3_gate(t1_manifest, t2_manifest, annotation_status, thresholds)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(destination, report)
     return report
 
 
