@@ -1114,12 +1114,13 @@ class StreamingBatchExporter:
                     if not calculation_producers_compatible(self._old_producer, current_producer):
                         raise ValueError("Cannot retain arrays from a different calculation producer; rerun the affected frames.")
                     old_info = self._old_npz.getinfo(name)
-                    zinfo = zipfile.ZipInfo(name)
-                    zinfo.compress_type = old_info.compress_type
-                    if zinfo.compress_type == zipfile.ZIP_DEFLATED:
-                        zinfo._compresslevel = self._npz.compresslevel
+                    if old_info.compress_type != self._npz.compression:
+                        target_member: str | zipfile.ZipInfo = zipfile.ZipInfo(name)
+                        target_member.compress_type = old_info.compress_type
+                    else:
+                        target_member = name
                     with self._old_npz.open(name, "r") as source_handle:
-                        with self._npz.open(zinfo, "w", force_zip64=True) as target_handle:
+                        with self._npz.open(target_member, "w", force_zip64=True) as target_handle:
                             shutil.copyfileobj(source_handle, target_handle)
                     merged_names.append(name)
                 metadata["arrays"] = [name[:-4] for name in merged_names if name.endswith(".npy")] + self._array_names
