@@ -570,3 +570,61 @@ def test_advise_frame_loads_poni_once_and_supports_beamstop_and_geometry_cache(
     assert load_calls == 2  # zero additional PONI loads
     assert res_cached["beamstop"]["unmasked_beamstop"] is False
     assert res_cached["symmetry"]["morphology_class"] == "four_lobe_butterfly"
+
+
+def test_advise_outer_sparse_corner_shell_and_low_count_poisson_guard() -> None:
+    import numpy as np
+    from butterfly_saxs.auto_advisor import _detect_active_outer_q_cutoff, advise_from_arrays
+
+    grid = np.linspace(-7.2, 7.2, 128, dtype=np.float64)
+    qx, qy = np.meshgrid(grid, grid)
+    q = np.hypot(qx, qy)
+    chi = np.arctan2(qy, qx)
+    valid = q >= 0.15
+
+    # Case 1: unmasked outer corners (q > 5.5) are zero-padded except a sparse ~20% nonzero
+    # artifact in the outermost corner shell (zero_frac ~ 0.80 < 0.90), plus genuine active floor=5.0.
+    butterfly = 5.0 + 120.0 * np.exp(-0.5 * ((q - 0.70) / 0.14) ** 2) * (1.0 + 0.65 * np.cos(4.0 * (chi - np.deg2rad(35.0))))
+    img_sparse_outer = np.where(q <= 5.5, butterfly, 0.0)
+    yy, xx = np.indices(q.shape)
+    outer_artifact = (q >= 8.2) & (((yy + xx) % 5) == 0)
+    img_sparse_outer[outer_artifact] = 0.25
+
+    cutoff_q, trimmed = _detect_active_outer_q_cutoff(img_sparse_outer, q, valid, 0.11)
+    assert trimmed is True
+    assert cutoff_q < 6.0
+
+    adv = advise_from_arrays(
+        img_sparse_outer,
+        q,
+        np.degrees(chi),
+        valid,
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+    )
+    assert adv["q_window"]["diffuse_floor_estimate"] == pytest.approx(5.0, abs=1.0)
+    assert adv["q_window"]["q_max"] < 4.5
+    assert adv["symmetry"]["morphology_class"] != "streak_contaminated"
+
+    # Case 2: low-count 1 s Poisson exposure where interior active diffuse tail has ~52% zeros
+    # (median == 0.0, positive mean ~3.4) inside q <= 5.6, and >95% dead zero corners at q > 6.0.
+    rng = np.random.default_rng(19)
+    pattern = rng.choice([0.0, -0.5, 17.5], size=q.shape, p=[0.52, 0.28, 0.20]).astype(np.float64)
+    pattern += 180.0 * np.exp(-0.5 * ((q - 0.65) / 0.15) ** 2) * (1.0 + 0.5 * np.cos(4.0 * (chi - np.deg2rad(35.0))))
+    img_poisson = np.where(q <= 5.6, pattern, 0.0)
+
+    cutoff_p, trimmed_p = _detect_active_outer_q_cutoff(img_poisson, q, valid, 0.11)
+    assert trimmed_p is True
+    assert 4.8 <= cutoff_p <= 6.1
+
+    adv_p = advise_from_arrays(
+        img_poisson,
+        q,
+        np.degrees(chi),
+        valid,
+        q_unit="nm^-1",
+        nominal_draw_axis_deg=90.0,
+    )
+    assert adv_p["q_window"]["diffuse_floor_estimate"] > 1.0
+    assert adv_p["q_window"]["q_max"] < 4.0
+    assert adv_p["q_window"]["q_star_kratky_estimate"] is None or adv_p["q_window"]["q_star_kratky_estimate"] < 2.0

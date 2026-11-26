@@ -287,3 +287,57 @@ def test_public_projection_branch_swap_reuses_same_bounded_geometry() -> None:
         assert actual["distance_q"] == expected["distance_q"]
         assert actual["projected_qx"] == expected["projected_qx"]
         assert actual["projected_qy"] == expected["projected_qy"]
+
+
+def test_symmetric_arc_projection_cached_rectangles_match_uncached_scalar_within_1e12() -> None:
+    points, branch_ids, sides, interval_specs, values, reference_axis = _projection_fixture()
+    geometry = EllipseGeometry.from_values(values)
+    # Force multiple rows on the same branch to share the same rectangle support tuple
+    # while falling outside unconstrained feasibility so _branch_rect_intervals caching triggers.
+    rect_shared = (
+        _rectangle_at(np.array([0.85, 0.25]), component_id=10, segment_index=0, half_width=0.05),
+        _rectangle_at(np.array([0.80, -0.30]), component_id=11, segment_index=1, half_width=0.04),
+    )
+    shifted_points = points + np.array([[0.35, -0.15]])
+    shared_specs = [{"manual_intervals": None, "rectangles": rect_shared} for _ in range(len(points))]
+    cached = _symmetric_arc_projection(
+        shifted_points,
+        values,
+        branch_ids,
+        sides,
+        shared_specs,
+        reference_axis,
+        include_global_oracle=True,
+    )
+    for row in range(len(shifted_points)):
+        sign = 1.0 if int(branch_ids[row]) == 0 else -1.0
+        branch_geom = EllipseGeometry(
+            geometry.cx,
+            geometry.cy,
+            geometry.a,
+            geometry.axis_ratio,
+            reference_axis + sign * geometry.theta,
+        )
+        uncached = _project_point_to_support(
+            shifted_points[row],
+            branch_geom,
+            str(sides[row]),
+            None,
+            rect_shared,
+            include_global_oracle=True,
+            precomputed_unconstrained=None,
+            _branch_state=None,
+        )
+        for name in ("t", "distance", "global_distance", "support_violation_q", "objective_distance"):
+            np.testing.assert_allclose(cached[name][row], uncached[name], rtol=0.0, atol=1.0e-12, equal_nan=True)
+        for name in (
+            "at_endpoint",
+            "endpoint_clipped",
+            "support_endpoint_clipped",
+            "manual_bound_clipped",
+            "projection_valid",
+            "support_infeasible",
+            "support_component_id",
+            "support_interval_index",
+        ):
+            assert cached[name][row] == uncached[name]

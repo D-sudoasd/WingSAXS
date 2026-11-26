@@ -19,7 +19,7 @@ import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from numbers import Integral
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -44,6 +44,96 @@ _TAU = 2.0 * math.pi
 _HALF_PI = 0.5 * math.pi
 _PROJECTION_GRID = 64
 _FLAT_PROJECTION_GRID = 128
+_PROJECTION_FRACTION = np.linspace(0.0, 1.0, _PROJECTION_GRID + 1, dtype=float)[None, :]
+_FLAT_PROJECTION_FRACTION = np.linspace(0.0, 1.0, _FLAT_PROJECTION_GRID + 1, dtype=float)[None, :]
+
+
+class _CompiledRect(NamedTuple):
+    ox: float
+    oy: float
+    tx: float
+    ty: float
+    nx: float
+    ny: float
+    t_lo: float
+    t_hi: float
+    n_lo: float
+    n_hi: float
+    component_id: Any
+    segment_index: int
+
+
+class _BranchRect(NamedTuple):
+    rect: _CompiledRect
+    base_t: float
+    cos_t: float
+    sin_t: float
+    amp_t: float
+    base_n: float
+    cos_n: float
+    sin_n: float
+    amp_n: float
+    reachable: bool
+
+
+def _compile_rectangle(rectangle: Mapping[str, Any]) -> _CompiledRect:
+    origin = rectangle["frame_origin_q"]
+    tangent = rectangle["tangent_q"]
+    normal = rectangle["normal_q"]
+    tangent_bounds = rectangle["tangent_bounds"]
+    normal_bounds = rectangle["normal_bounds"]
+    return _CompiledRect(
+        ox=float(origin[0]),
+        oy=float(origin[1]),
+        tx=float(tangent[0]),
+        ty=float(tangent[1]),
+        nx=float(normal[0]),
+        ny=float(normal[1]),
+        t_lo=float(tangent_bounds[0]),
+        t_hi=float(tangent_bounds[1]),
+        n_lo=float(normal_bounds[0]),
+        n_hi=float(normal_bounds[1]),
+        component_id=rectangle.get("component_id"),
+        segment_index=int(rectangle.get("segment_index", 0)),
+    )
+
+
+def _prepare_branch_rect(
+    geometry: EllipseGeometry,
+    rect: _CompiledRect,
+    *,
+    gcos: float,
+    gsin: float,
+    reach_tol: float,
+) -> _BranchRect:
+    dx = geometry.cx - rect.ox
+    dy = geometry.cy - rect.oy
+    base_t = rect.tx * dx + rect.ty * dy
+    cos_t = geometry.a * (rect.tx * gcos + rect.ty * gsin)
+    sin_t = geometry.b * (-rect.tx * gsin + rect.ty * gcos)
+    amp_t = math.hypot(cos_t, sin_t)
+    base_n = rect.nx * dx + rect.ny * dy
+    cos_n = geometry.a * (rect.nx * gcos + rect.ny * gsin)
+    sin_n = geometry.b * (-rect.nx * gsin + rect.ny * gcos)
+    amp_n = math.hypot(cos_n, sin_n)
+    reachable = not (
+        base_t + amp_t < rect.t_lo - reach_tol
+        or base_t - amp_t > rect.t_hi + reach_tol
+        or base_n + amp_n < rect.n_lo - reach_tol
+        or base_n - amp_n > rect.n_hi + reach_tol
+    )
+    return _BranchRect(
+        rect=rect,
+        base_t=float(base_t),
+        cos_t=float(cos_t),
+        sin_t=float(sin_t),
+        amp_t=float(amp_t),
+        base_n=float(base_n),
+        cos_n=float(cos_n),
+        sin_n=float(sin_n),
+        amp_n=float(amp_n),
+        reachable=reachable,
+    )
 
 
 
@@ -220,21 +310,48 @@ def _q_inside_rectangle(point: Sequence[float], rectangle: Mapping[str, Any]) ->
 
 
 def _q_rectangle_violation(point: Sequence[float], rectangles: Sequence[Mapping[str, Any]]) -> float | None:
-    distances: list[float] = []
+    best: float | None = None
     try:
-        q = np.asarray([float(point[0]), float(point[1])], dtype=float)
+        qx, qy = float(point[0]), float(point[1])
         for rectangle in rectangles:
-            origin = np.asarray(rectangle["frame_origin_q"], dtype=float)
-            tangent = np.asarray(rectangle["tangent_q"], dtype=float)
-            normal = np.asarray(rectangle["normal_q"], dtype=float)
-            values = (float(np.dot(tangent, q - origin)), float(np.dot(normal, q - origin)))
-            delta_t = max(rectangle["tangent_bounds"][0] - values[0], 0.0, values[0] - rectangle["tangent_bounds"][1])
-            delta_n = max(rectangle["normal_bounds"][0] - values[1], 0.0, values[1] - rectangle["normal_bounds"][1])
-            distances.append(float(math.hypot(delta_t, delta_n)))
+            origin = rectangle["frame_origin_q"]
+            tangent = rectangle["tangent_q"]
+            normal = rectangle["normal_q"]
+            t_b = rectangle["tangent_bounds"]
+            n_b = rectangle["normal_bounds"]
+            dx = qx - float(origin[0])
+            dy = qy - float(origin[1])
+            vt = float(tangent[0]) * dx + float(tangent[1]) * dy
+            vn = float(normal[0]) * dx + float(normal[1]) * dy
+            delta_t = max(float(t_b[0]) - vt, 0.0, vt - float(t_b[1]))
+            delta_n = max(float(n_b[0]) - vn, 0.0, vn - float(n_b[1]))
+            dist = math.hypot(delta_t, delta_n)
+            if math.isfinite(dist) and (best is None or dist < best):
+                best = dist
     except (TypeError, ValueError, KeyError, IndexError):
         return None
-    finite = [distance for distance in distances if np.isfinite(distance)]
-    return float(min(finite)) if finite else None
+    return float(best) if best is not None else None
+
+
+def _compiled_q_rectangle_violation(
+    qx: float,
+    qy: float,
+    rect_idxs: tuple[int, ...],
+    compiled_rects: tuple[_CompiledRect, ...],
+) -> float | None:
+    best: float | None = None
+    for ri in rect_idxs:
+        r = compiled_rects[ri]
+        dx = qx - r.ox
+        dy = qy - r.oy
+        vt = r.tx * dx + r.ty * dy
+        vn = r.nx * dx + r.ny * dy
+        delta_t = max(r.t_lo - vt, 0.0, vt - r.t_hi)
+        delta_n = max(r.n_lo - vn, 0.0, vn - r.n_hi)
+        dist = math.hypot(delta_t, delta_n)
+        if math.isfinite(dist) and (best is None or dist < best):
+            best = dist
+    return float(best) if best is not None else None
 
 
 def _parse_points(
@@ -605,9 +722,8 @@ def _project_ellipse_arc(
     t_max = t_max.ravel()
     width = np.maximum(0.0, t_max - t_min)
     ratio = float(b / a)
-    grid_size = _FLAT_PROJECTION_GRID if ratio < 0.08 else _PROJECTION_GRID
-    fraction = np.linspace(0.0, 1.0, grid_size + 1, dtype=float)
-    grid = t_min[:, None] + width[:, None] * fraction[None, :]
+    fraction = _FLAT_PROJECTION_FRACTION if ratio < 0.08 else _PROJECTION_FRACTION
+    grid = t_min[:, None] + width[:, None] * fraction
     cosine = np.cos(grid)
     sine = np.sin(grid)
     squared = (a * cosine - u[:, None]) ** 2 + (b * sine - v[:, None]) ** 2
@@ -680,30 +796,34 @@ def _projection_domain(
 
 def _ellipse_linear_coefficients(
     geometry: EllipseGeometry,
-    tangent: np.ndarray,
-    origin: np.ndarray,
+    tangent: Sequence[float] | np.ndarray,
+    origin: Sequence[float] | np.ndarray,
 ) -> tuple[float, float, float]:
     """Return ``base, A, B`` for ``w·(P(t)-origin)=base+A cos(t)+B sin(t)``."""
 
     cosine, sine = math.cos(geometry.theta), math.sin(geometry.theta)
-    base = float(np.dot(tangent, np.asarray([geometry.cx, geometry.cy], dtype=float) - origin))
-    coefficient_cos = float(geometry.a * (tangent[0] * cosine + tangent[1] * sine))
-    coefficient_sin = float(geometry.b * (-tangent[0] * sine + tangent[1] * cosine))
-    return base, coefficient_cos, coefficient_sin
+    tx, ty = float(tangent[0]), float(tangent[1])
+    base = tx * (geometry.cx - float(origin[0])) + ty * (geometry.cy - float(origin[1]))
+    coefficient_cos = geometry.a * (tx * cosine + ty * sine)
+    coefficient_sin = geometry.b * (-tx * sine + ty * cosine)
+    return float(base), float(coefficient_cos), float(coefficient_sin)
 
 
 def _sinusoid_roots(a_coefficient: float, b_coefficient: float, target: float, lo: float, hi: float) -> list[float]:
     """Solve ``A*cos(t)+B*sin(t)=target`` on a bounded interval."""
 
-    rho = float(math.hypot(a_coefficient, b_coefficient))
+    rho = math.hypot(a_coefficient, b_coefficient)
     scale = max(1.0, abs(target), rho)
     tolerance = 2.0e-12 * scale
     if rho <= 1.0e-15:
         return []
-    ratio = float(target / rho)
+    ratio = target / rho
     if ratio > 1.0 + tolerance or ratio < -1.0 - tolerance:
         return []
-    ratio = float(np.clip(ratio, -1.0, 1.0))
+    if ratio < -1.0:
+        ratio = -1.0
+    elif ratio > 1.0:
+        ratio = 1.0
     phase = math.atan2(b_coefficient, a_coefficient)
     offset = math.acos(ratio)
     roots: list[float] = []
@@ -711,10 +831,13 @@ def _sinusoid_roots(a_coefficient: float, b_coefficient: float, target: float, l
     # integer range also handles manually unwrapped intervals safely.
     k_min = int(math.floor((lo - phase - offset) / _TAU)) - 1
     k_max = int(math.ceil((hi - phase + offset) / _TAU)) + 1
+    lo_tol = lo - 2.0e-12
+    hi_tol = hi + 2.0e-12
     for k in range(k_min, k_max + 1):
-        for root in (phase + offset + k * _TAU, phase - offset + k * _TAU):
-            if lo - 2.0e-12 <= root <= hi + 2.0e-12:
-                roots.append(float(np.clip(root, lo, hi)))
+        base_angle = k * _TAU
+        for root in (phase + offset + base_angle, phase - offset + base_angle):
+            if lo_tol <= root <= hi_tol:
+                roots.append(lo if root < lo else (hi if root > hi else float(root)))
     roots.sort()
     unique: list[float] = []
     for root in roots:
@@ -726,106 +849,82 @@ def _sinusoid_roots(a_coefficient: float, b_coefficient: float, target: float, l
 def _rectangle_value(
     geometry: EllipseGeometry,
     t: float,
-    vector: np.ndarray,
-    origin: np.ndarray,
+    vector: Sequence[float] | np.ndarray,
+    origin: Sequence[float] | np.ndarray,
 ) -> float:
     base, coefficient_cos, coefficient_sin = _ellipse_linear_coefficients(geometry, vector, origin)
     angle = float(t)
     return float(base + coefficient_cos * math.cos(angle) + coefficient_sin * math.sin(angle))
 
 
-def _rectangle_reachable(
-    geometry: EllipseGeometry,
-    rectangle: Mapping[str, Any],
-    *,
-    tolerance: float = 0.0,
-) -> bool:
-    """Return whether the ellipse can enter the rectangle's tangent/normal slab."""
-
-    origin = np.asarray(rectangle["frame_origin_q"], dtype=float)
-    for axis, bounds in (
-        (np.asarray(rectangle["tangent_q"], dtype=float), rectangle["tangent_bounds"]),
-        (np.asarray(rectangle["normal_q"], dtype=float), rectangle["normal_bounds"]),
-    ):
-        base, coefficient_cos, coefficient_sin = _ellipse_linear_coefficients(geometry, axis, origin)
-        amplitude = math.hypot(coefficient_cos, coefficient_sin)
-        low, high = float(bounds[0]), float(bounds[1])
-        if base + amplitude < low - tolerance or base - amplitude > high + tolerance:
-            return False
-    return True
-
-
-def _rectangle_contains(
-    geometry: EllipseGeometry,
-    t: float,
-    rectangle: Mapping[str, Any],
-) -> bool:
-    origin = np.asarray(rectangle["frame_origin_q"], dtype=float)
-    tangent = np.asarray(rectangle["tangent_q"], dtype=float)
-    normal = np.asarray(rectangle["normal_q"], dtype=float)
-    tangent_bounds = rectangle["tangent_bounds"]
-    normal_bounds = rectangle["normal_bounds"]
-    values = (
-        _rectangle_value(geometry, t, tangent, origin),
-        _rectangle_value(geometry, t, normal, origin),
-    )
-    scale = max(1.0, abs(geometry.a), abs(geometry.b), *(abs(value) for value in values))
+def _branch_rect_contains(br: _BranchRect, t: float, a_abs: float, b_abs: float) -> bool:
+    angle = float(t)
+    ct = math.cos(angle)
+    st = math.sin(angle)
+    v0 = br.base_t + br.cos_t * ct + br.sin_t * st
+    v1 = br.base_n + br.cos_n * ct + br.sin_n * st
+    av0 = -v0 if v0 < 0.0 else v0
+    av1 = -v1 if v1 < 0.0 else v1
+    scale = 1.0
+    if a_abs > scale:
+        scale = a_abs
+    if b_abs > scale:
+        scale = b_abs
+    if av0 > scale:
+        scale = av0
+    if av1 > scale:
+        scale = av1
     tolerance = 2.0e-10 * scale
+    r = br.rect
     return (
-        tangent_bounds[0] - tolerance <= values[0] <= tangent_bounds[1] + tolerance
-        and normal_bounds[0] - tolerance <= values[1] <= normal_bounds[1] + tolerance
+        r.t_lo - tolerance <= v0 <= r.t_hi + tolerance
+        and r.n_lo - tolerance <= v1 <= r.n_hi + tolerance
     )
 
 
-def _rectangle_at_boundary(
-    geometry: EllipseGeometry,
-    t: float,
-    rectangle: Mapping[str, Any],
-) -> bool:
-    origin = np.asarray(rectangle["frame_origin_q"], dtype=float)
-    scale = max(1.0, abs(geometry.a), abs(geometry.b))
-    tolerance = 2.0e-9 * scale
-    for vector, bounds in (
-        (np.asarray(rectangle["tangent_q"], dtype=float), rectangle["tangent_bounds"]),
-        (np.asarray(rectangle["normal_q"], dtype=float), rectangle["normal_bounds"]),
-    ):
-        value = _rectangle_value(geometry, t, vector, origin)
-        if abs(value - bounds[0]) <= tolerance or abs(value - bounds[1]) <= tolerance:
-            return True
-    return False
+def _branch_rect_at_boundary(br: _BranchRect, t: float, tolerance: float) -> bool:
+    angle = float(t)
+    ct = math.cos(angle)
+    st = math.sin(angle)
+    v0 = br.base_t + br.cos_t * ct + br.sin_t * st
+    r = br.rect
+    if abs(v0 - r.t_lo) <= tolerance or abs(v0 - r.t_hi) <= tolerance:
+        return True
+    v1 = br.base_n + br.cos_n * ct + br.sin_n * st
+    return abs(v1 - r.n_lo) <= tolerance or abs(v1 - r.n_hi) <= tolerance
 
 
-def _rectangle_intervals(
+def _branch_rect_intervals(
     geometry: EllipseGeometry,
-    rectangle: Mapping[str, Any],
+    br: _BranchRect,
     domain_intervals: Sequence[tuple[float, float]],
 ) -> list[dict[str, Any]]:
-    """Intersect one observed rectangle and manual/domain intervals analytically."""
-
-    scale = max(1.0, abs(geometry.a), abs(geometry.b))
-    if not _rectangle_reachable(geometry, rectangle, tolerance=2.0e-10 * scale):
+    if not br.reachable:
         return []
-    origin = np.asarray(rectangle["frame_origin_q"], dtype=float)
-    axes = (
-        (np.asarray(rectangle["tangent_q"], dtype=float), rectangle["tangent_bounds"]),
-        (np.asarray(rectangle["normal_q"], dtype=float), rectangle["normal_bounds"]),
+    r = br.rect
+    a_abs = abs(geometry.a)
+    b_abs = abs(geometry.b)
+    axes_info = (
+        (0, br.base_t, br.cos_t, br.sin_t, r.t_lo, r.t_hi),
+        (1, br.base_n, br.cos_n, br.sin_n, r.n_lo, r.n_hi),
     )
     intervals: list[dict[str, Any]] = []
     for domain_lo, domain_hi in domain_intervals:
         if domain_hi < domain_lo:
             continue
-        boundaries = [float(domain_lo), float(domain_hi)]
+        f_lo = float(domain_lo)
+        f_hi = float(domain_hi)
+        boundaries = [f_lo, f_hi]
         boundary_tags: dict[float, set[str]] = {
-            float(domain_lo): {"manual"},
-            float(domain_hi): {"manual"},
+            f_lo: {"manual"},
+            f_hi: {"manual"},
         }
-        for axis_index, (axis, bounds) in enumerate(axes):
-            base, coefficient_cos, coefficient_sin = _ellipse_linear_coefficients(geometry, axis, origin)
-            for bound_index, bound in enumerate(bounds):
-                for root in _sinusoid_roots(coefficient_cos, coefficient_sin, float(bound) - base, domain_lo, domain_hi):
+        for axis_index, base, coef_cos, coef_sin, b_lo, b_hi in axes_info:
+            for bound_index, bound in ((0, b_lo), (1, b_hi)):
+                for root in _sinusoid_roots(coef_cos, coef_sin, bound - base, domain_lo, domain_hi):
                     boundaries.append(root)
                     boundary_tags.setdefault(root, set()).add(f"support_{axis_index}_{bound_index}")
-        boundaries = sorted(boundaries)
+        boundaries.sort()
         unique: list[float] = []
         for value in boundaries:
             if not unique or abs(value - unique[-1]) > 2.0e-11:
@@ -834,41 +933,36 @@ def _rectangle_intervals(
                 boundary_tags[unique[-1]].update(boundary_tags.get(value, set()))
         for left, right in zip(unique[:-1], unique[1:]):
             midpoint = 0.5 * (left + right)
-            if _rectangle_contains(geometry, midpoint, rectangle):
+            if _branch_rect_contains(br, midpoint, a_abs, b_abs):
                 tags_left = boundary_tags.get(left, set())
                 tags_right = boundary_tags.get(right, set())
                 intervals.append(
                     {
                         "lo": float(left),
                         "hi": float(right),
-                        "component_id": rectangle.get("component_id"),
-                        "support_interval_index": rectangle.get("segment_index", 0),
+                        "component_id": r.component_id,
+                        "support_interval_index": r.segment_index,
                         "lo_support": any(tag.startswith("support_") for tag in tags_left),
                         "hi_support": any(tag.startswith("support_") for tag in tags_right),
                         "lo_manual": "manual" in tags_left,
                         "hi_manual": "manual" in tags_right,
                     }
                 )
-        # Preserve an isolated tangential contact, which has no positive-width
-        # midpoint basin but is still an observed endpoint/root.
         for value in unique:
-            if _rectangle_contains(geometry, value, rectangle):
+            if _branch_rect_contains(br, value, a_abs, b_abs):
                 tags = boundary_tags.get(value, set())
                 intervals.append(
                     {
                         "lo": float(value),
                         "hi": float(value),
-                        "component_id": rectangle.get("component_id"),
-                        "support_interval_index": rectangle.get("segment_index", 0),
+                        "component_id": r.component_id,
+                        "support_interval_index": r.segment_index,
                         "lo_support": any(tag.startswith("support_") for tag in tags),
                         "hi_support": any(tag.startswith("support_") for tag in tags),
                         "lo_manual": "manual" in tags,
                         "hi_manual": "manual" in tags,
                     }
                 )
-    # Merge only overlapping intervals from this same rectangle.  The caller
-    # never merges intervals from distinct support components, so a measured
-    # q-space gap cannot be bridged accidentally.
     intervals.sort(key=lambda item: (item["lo"], item["hi"]))
     merged: list[dict[str, Any]] = []
     for item in intervals:
@@ -879,6 +973,80 @@ def _rectangle_intervals(
         else:
             merged.append(dict(item))
     return merged
+
+
+def _rectangle_reachable(
+    geometry: EllipseGeometry,
+    rectangle: Mapping[str, Any],
+    *,
+    tolerance: float = 0.0,
+) -> bool:
+    """Return whether the ellipse can enter the rectangle's tangent/normal slab."""
+
+    compiled = _compile_rectangle(rectangle)
+    br = _prepare_branch_rect(
+        geometry,
+        compiled,
+        gcos=math.cos(geometry.theta),
+        gsin=math.sin(geometry.theta),
+        reach_tol=tolerance,
+    )
+    return br.reachable
+
+
+def _rectangle_contains(
+    geometry: EllipseGeometry,
+    t: float,
+    rectangle: Mapping[str, Any],
+) -> bool:
+    compiled = _compile_rectangle(rectangle)
+    br = _prepare_branch_rect(
+        geometry,
+        compiled,
+        gcos=math.cos(geometry.theta),
+        gsin=math.sin(geometry.theta),
+        reach_tol=0.0,
+    )
+    return _branch_rect_contains(br, t, abs(geometry.a), abs(geometry.b))
+
+
+def _rectangle_at_boundary(
+    geometry: EllipseGeometry,
+    t: float,
+    rectangle: Mapping[str, Any],
+) -> bool:
+    compiled = _compile_rectangle(rectangle)
+    br = _prepare_branch_rect(
+        geometry,
+        compiled,
+        gcos=math.cos(geometry.theta),
+        gsin=math.sin(geometry.theta),
+        reach_tol=0.0,
+    )
+    scale = max(1.0, abs(geometry.a), abs(geometry.b))
+    return _branch_rect_at_boundary(br, t, 2.0e-9 * scale)
+
+
+def _rectangle_intervals(
+    geometry: EllipseGeometry,
+    rectangle: Mapping[str, Any],
+    domain_intervals: Sequence[tuple[float, float]],
+) -> list[dict[str, Any]]:
+    """Intersect one observed rectangle and manual/domain intervals analytically."""
+
+    scale = max(1.0, abs(geometry.a), abs(geometry.b))
+    compiled = _compile_rectangle(rectangle)
+    br = _prepare_branch_rect(
+        geometry,
+        compiled,
+        gcos=math.cos(geometry.theta),
+        gsin=math.sin(geometry.theta),
+        reach_tol=2.0e-10 * scale,
+    )
+    # Merge only overlapping intervals from this same rectangle.  The caller
+    # never merges intervals from distinct support components, so a measured
+    # q-space gap cannot be bridged accidentally.
+    return _branch_rect_intervals(geometry, br, domain_intervals)
 
 
 def _support_violation_q(
@@ -931,6 +1099,7 @@ def _project_point_to_support(
     *,
     include_global_oracle: bool = False,
     precomputed_unconstrained: Sequence[Mapping[str, Any]] | None = None,
+    _branch_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     domain = _projection_domain(side, manual_intervals)
     candidates: list[dict[str, Any]] = []
@@ -941,10 +1110,6 @@ def _project_point_to_support(
         local_u, local_v = _local_coordinates(np.asarray([point], dtype=float), geometry)
     from_rectangle_intervals = False
     if rectangles:
-        # Fast path for the common case: the unconstrained closest point in a
-        # manual/side domain already lies inside an observed rectangle.  A
-        # point that is feasible for the global domain is necessarily the
-        # constrained optimum, so no sinusoid boundary enumeration is needed.
         if precomputed_unconstrained is None:
             u, v = local_u, local_v
             for domain_index, (domain_lo, domain_hi) in enumerate(domain):
@@ -967,37 +1132,108 @@ def _project_point_to_support(
                         "domain_index": domain_index,
                     }
                 )
-        scale = max(1.0, abs(geometry.a), abs(geometry.b))
-        reachable = [
-            rectangle
-            for rectangle in rectangles
-            if _rectangle_reachable(geometry, rectangle, tolerance=2.0e-10 * scale)
-        ]
-        for candidate in sorted(unconstrained, key=lambda item: (item["distance"], item["t"])):
-            for rectangle in reachable:
-                if _rectangle_contains(geometry, candidate["t"], rectangle):
+        a_abs = abs(geometry.a)
+        b_abs = abs(geometry.b)
+        scale = max(1.0, a_abs, b_abs)
+        bound_tol = 2.0e-9 * scale
+        if _branch_state is not None:
+            gcos = _branch_state["gcos"]
+            gsin = _branch_state["gsin"]
+            reach_tol = _branch_state["reach_tol"]
+            branch_rect_cache: dict[int, _BranchRect] = _branch_state["branch_rects"]
+            rects_obj_cache: dict[int, tuple[Any, tuple[int, ...], tuple[_BranchRect, ...]]] = _branch_state["rects_obj"]
+            reachable_cache: dict[tuple[int, ...], tuple[_BranchRect, ...]] = _branch_state["reachable"]
+            intervals_cache: dict[tuple[tuple[int, ...], tuple[tuple[float, float], ...]], list[tuple[float, float, dict[str, Any]]]] = _branch_state["intervals"]
+
+            rects_obj_id = id(rectangles)
+            cached_obj = rects_obj_cache.get(rects_obj_id)
+            if cached_obj is not None and cached_obj[0] is rectangles:
+                rect_ids, reachable_br = cached_obj[1], cached_obj[2]
+            else:
+                rect_ids = tuple(id(r) for r in rectangles)
+                reachable_br_cached = reachable_cache.get(rect_ids)
+                if reachable_br_cached is None:
+                    br_list: list[_BranchRect] = []
+                    for rectangle in rectangles:
+                        rid = id(rectangle)
+                        br = branch_rect_cache.get(rid)
+                        if br is None:
+                            br = _prepare_branch_rect(
+                                geometry,
+                                _compile_rectangle(rectangle),
+                                gcos=gcos,
+                                gsin=gsin,
+                                reach_tol=reach_tol,
+                            )
+                            branch_rect_cache[rid] = br
+                        if br.reachable:
+                            br_list.append(br)
+                    reachable_br = tuple(br_list)
+                    reachable_cache[rect_ids] = reachable_br
+                else:
+                    reachable_br = reachable_br_cached
+                rects_obj_cache[rects_obj_id] = (rectangles, rect_ids, reachable_br)
+        else:
+            gcos = math.cos(geometry.theta)
+            gsin = math.sin(geometry.theta)
+            reach_tol = 2.0e-10 * scale
+            rect_ids = ()
+            reachable_br = tuple(
+                br
+                for rectangle in rectangles
+                if (
+                    br := _prepare_branch_rect(
+                        geometry,
+                        _compile_rectangle(rectangle),
+                        gcos=gcos,
+                        gsin=gsin,
+                        reach_tol=reach_tol,
+                    )
+                ).reachable
+            )
+            intervals_cache = {}
+
+        ordered_unconstrained = (
+            unconstrained
+            if len(unconstrained) <= 1
+            else sorted(unconstrained, key=lambda item: (item["distance"], item["t"]))
+        )
+        for candidate in ordered_unconstrained:
+            cand_t = candidate["t"]
+            for br in reachable_br:
+                if _branch_rect_contains(br, cand_t, a_abs, b_abs):
                     return {
                         "projection_valid": True,
-                        "t": candidate["t"],
+                        "t": cand_t,
                         "distance": candidate["distance"],
                         "global_distance": candidate["global_distance"],
                         "at_endpoint": candidate["at_endpoint"],
                         "endpoint_clipped": candidate["endpoint_clipped"],
-                        "support_component_id": rectangle.get("component_id"),
-                        "support_interval_index": int(rectangle.get("segment_index", 0)),
-                        "support_endpoint_clipped": _rectangle_at_boundary(geometry, candidate["t"], rectangle),
+                        "support_component_id": br.rect.component_id,
+                        "support_interval_index": br.rect.segment_index,
+                        "support_endpoint_clipped": _branch_rect_at_boundary(br, cand_t, bound_tol),
                         "manual_bound_clipped": candidate["at_endpoint"],
                         "support_infeasible": False,
                         "support_violation_q": 0.0,
                         "objective_distance": candidate["distance"],
                     }
-        # The unconstrained closest point fell outside the observed rectangles,
-        # but one or more rectangles are slab-reachable.  Intersect only those
-        # reachable rectangles analytically so feasible boundary-clipped
-        # projections are retained instead of falsely declared infeasible.
-        for rectangle in reachable:
-            for interval in _rectangle_intervals(geometry, rectangle, domain):
-                local_candidates.append((interval["lo"], interval["hi"], interval))
+        if reachable_br:
+            if _branch_state is not None:
+                domain_key = tuple(domain)
+                iv_key = (rect_ids, domain_key)
+                cached_ivs = intervals_cache.get(iv_key)
+                if cached_ivs is None:
+                    cached_ivs = [
+                        (interval["lo"], interval["hi"], interval)
+                        for br in reachable_br
+                        for interval in _branch_rect_intervals(geometry, br, domain)
+                    ]
+                    intervals_cache[iv_key] = cached_ivs
+                local_candidates.extend(cached_ivs)
+            else:
+                for br in reachable_br:
+                    for interval in _branch_rect_intervals(geometry, br, domain):
+                        local_candidates.append((interval["lo"], interval["hi"], interval))
         from_rectangle_intervals = bool(local_candidates)
     elif manual_intervals is not None:
         for index, (lo, hi) in enumerate(domain):
@@ -1173,6 +1409,180 @@ def _batched_unconstrained_arc_projections(
     return grouped
 
 
+class _BranchProjectionPlan:
+    __slots__ = (
+        "rows",
+        "rows_list",
+        "n_rows",
+        "pts",
+        "unc_pos",
+        "unc_t_min",
+        "unc_t_max",
+        "unc_spans",
+        "row_rect_idxs",
+        "row_has_manual",
+        "row_domains",
+        "row_raw_rects",
+    )
+
+    def __init__(
+        self,
+        *,
+        rows: np.ndarray,
+        pts: np.ndarray,
+        unc_pos: np.ndarray,
+        unc_t_min: np.ndarray,
+        unc_t_max: np.ndarray,
+        unc_spans: list[tuple[int, int]],
+        row_rect_idxs: list[tuple[int, ...]],
+        row_has_manual: list[bool],
+        row_domains: list[tuple[tuple[float, float], ...]],
+        row_raw_rects: list[Sequence[Mapping[str, Any]]],
+    ) -> None:
+        self.rows = rows
+        self.rows_list = [int(r) for r in rows]
+        self.n_rows = int(rows.size)
+        self.pts = pts
+        self.unc_pos = unc_pos
+        self.unc_t_min = unc_t_min
+        self.unc_t_max = unc_t_max
+        self.unc_spans = unc_spans
+        self.row_rect_idxs = row_rect_idxs
+        self.row_has_manual = row_has_manual
+        self.row_domains = row_domains
+        self.row_raw_rects = row_raw_rects
+
+
+class _ArcProjectionPlan:
+    __slots__ = (
+        "points",
+        "compiled_rects",
+        "n_rects",
+        "ox",
+        "oy",
+        "tx",
+        "ty",
+        "nx",
+        "ny",
+        "t_lo",
+        "t_hi",
+        "n_lo",
+        "n_hi",
+        "row_rect_idxs",
+        "row_has_manual",
+        "row_domains",
+        "row_raw_rects",
+        "_branch_cache",
+    )
+
+    def __init__(
+        self,
+        points: np.ndarray,
+        sides: np.ndarray,
+        interval_specs: Sequence[Mapping[str, Any]],
+    ) -> None:
+        self.points = np.asarray(points, dtype=float)
+        n_points = self.points.shape[0]
+        rect_id_to_idx: dict[int, int] = {}
+        compiled_list: list[_CompiledRect] = []
+        _rect_keepalive: list[Mapping[str, Any]] = []
+        self.row_rect_idxs: list[tuple[int, ...]] = []
+        self.row_has_manual: list[bool] = []
+        self.row_domains: list[tuple[tuple[float, float], ...]] = []
+        self.row_raw_rects: list[Sequence[Mapping[str, Any]]] = []
+        for row in range(n_points):
+            spec = interval_specs[row]
+            manual = spec.get("manual_intervals")
+            rects = spec.get("rectangles", ())
+            self.row_has_manual.append(manual is not None)
+            self.row_domains.append(tuple(_projection_domain(str(sides[row]), manual)))
+            self.row_raw_rects.append(rects)
+            idxs: list[int] = []
+            for rect in rects:
+                rid = id(rect)
+                idx = rect_id_to_idx.get(rid)
+                if idx is None:
+                    idx = len(compiled_list)
+                    rect_id_to_idx[rid] = idx
+                    compiled_list.append(_compile_rectangle(rect))
+                    _rect_keepalive.append(rect)
+                idxs.append(idx)
+            self.row_rect_idxs.append(tuple(idxs))
+        self.compiled_rects = tuple(compiled_list)
+        self.n_rects = len(compiled_list)
+        if compiled_list:
+            self.ox = np.asarray([r.ox for r in compiled_list], dtype=float)
+            self.oy = np.asarray([r.oy for r in compiled_list], dtype=float)
+            self.tx = np.asarray([r.tx for r in compiled_list], dtype=float)
+            self.ty = np.asarray([r.ty for r in compiled_list], dtype=float)
+            self.nx = np.asarray([r.nx for r in compiled_list], dtype=float)
+            self.ny = np.asarray([r.ny for r in compiled_list], dtype=float)
+            self.t_lo = np.asarray([r.t_lo for r in compiled_list], dtype=float)
+            self.t_hi = np.asarray([r.t_hi for r in compiled_list], dtype=float)
+            self.n_lo = np.asarray([r.n_lo for r in compiled_list], dtype=float)
+            self.n_hi = np.asarray([r.n_hi for r in compiled_list], dtype=float)
+        else:
+            empty = np.empty(0, dtype=float)
+            self.ox = self.oy = self.tx = self.ty = self.nx = self.ny = empty
+            self.t_lo = self.t_hi = self.n_lo = self.n_hi = empty
+        self._branch_cache: dict[bytes, tuple[_BranchProjectionPlan | None, _BranchProjectionPlan | None]] = {}
+
+    def branch_plans(self, branch_ids: np.ndarray) -> tuple[_BranchProjectionPlan | None, _BranchProjectionPlan | None]:
+        key = np.asarray(branch_ids, dtype=np.int64).tobytes()
+        cached = self._branch_cache.get(key)
+        if cached is not None:
+            return cached
+        plans: list[_BranchProjectionPlan | None] = []
+        for branch in (0, 1):
+            rows = np.flatnonzero(branch_ids == branch)
+            if rows.size == 0:
+                plans.append(None)
+                continue
+            pts = np.asarray(self.points[rows], dtype=float)
+            unc_pos_list: list[int] = []
+            unc_los: list[float] = []
+            unc_his: list[float] = []
+            unc_spans: list[tuple[int, int]] = []
+            row_rect_idxs: list[tuple[int, ...]] = []
+            row_has_manual: list[bool] = []
+            row_domains: list[tuple[tuple[float, float], ...]] = []
+            row_raw_rects: list[Sequence[Mapping[str, Any]]] = []
+            for pos, raw_row in enumerate(rows):
+                r_int = int(raw_row)
+                has_manual = self.row_has_manual[r_int]
+                r_idxs = self.row_rect_idxs[r_int]
+                domain = self.row_domains[r_int]
+                start = len(unc_pos_list)
+                if has_manual or r_idxs:
+                    for lo, hi in domain:
+                        unc_pos_list.append(pos)
+                        unc_los.append(float(lo))
+                        unc_his.append(float(hi))
+                stop = len(unc_pos_list)
+                unc_spans.append((start, stop))
+                row_rect_idxs.append(r_idxs)
+                row_has_manual.append(has_manual)
+                row_domains.append(domain)
+                row_raw_rects.append(self.row_raw_rects[r_int])
+            plans.append(
+                _BranchProjectionPlan(
+                    rows=rows,
+                    pts=pts,
+                    unc_pos=np.asarray(unc_pos_list, dtype=np.intp),
+                    unc_t_min=np.asarray(unc_los, dtype=float),
+                    unc_t_max=np.asarray(unc_his, dtype=float),
+                    unc_spans=unc_spans,
+                    row_rect_idxs=row_rect_idxs,
+                    row_has_manual=row_has_manual,
+                    row_domains=row_domains,
+                    row_raw_rects=row_raw_rects,
+                )
+            )
+        pair = (plans[0], plans[1])
+        self._branch_cache[key] = pair
+        return pair
+
+
 def _symmetric_arc_projection(
     points: np.ndarray,
     values: Mapping[str, float],
@@ -1182,68 +1592,322 @@ def _symmetric_arc_projection(
     reference_axis: float,
     *,
     include_global_oracle: bool = False,
+    _plan: _ArcProjectionPlan | None = None,
 ) -> dict[str, Any]:
     geometry = EllipseGeometry.from_values(values)
     n_points = points.shape[0]
-    result: dict[str, Any] = {
-        "t": np.full(n_points, np.nan, dtype=float),
-        "distance": np.full(n_points, np.nan, dtype=float),
-        "global_distance": np.full(n_points, np.nan, dtype=float),
-        "at_endpoint": np.zeros(n_points, dtype=bool),
-        "endpoint_clipped": np.zeros(n_points, dtype=bool),
-        "support_endpoint_clipped": np.zeros(n_points, dtype=bool),
-        "manual_bound_clipped": np.zeros(n_points, dtype=bool),
-        "projection_valid": np.zeros(n_points, dtype=bool),
-        "support_infeasible": np.zeros(n_points, dtype=bool),
-        "support_violation_q": np.zeros(n_points, dtype=float),
-        "objective_distance": np.full(n_points, np.nan, dtype=float),
-        "support_component_id": np.full(n_points, None, dtype=object),
-        "support_interval_index": np.full(n_points, -1, dtype=int),
-        "implicit": np.full(n_points, np.nan, dtype=float),
-    }
-    for branch in (0, 1):
-        mask = branch_ids == branch
-        if not np.any(mask):
+    plan = _plan if _plan is not None else _ArcProjectionPlan(points, sides, interval_specs)
+    branch_pair = plan.branch_plans(branch_ids)
+
+    t_out = np.full(n_points, np.nan, dtype=float)
+    d_out = np.full(n_points, np.nan, dtype=float)
+    gd_out = np.full(n_points, np.nan, dtype=float)
+    at_ep_out = np.zeros(n_points, dtype=bool)
+    ep_clip_out = np.zeros(n_points, dtype=bool)
+    sup_ep_out = np.zeros(n_points, dtype=bool)
+    man_ep_out = np.zeros(n_points, dtype=bool)
+    valid_out = np.zeros(n_points, dtype=bool)
+    infeas_out = np.zeros(n_points, dtype=bool)
+    viol_out = np.zeros(n_points, dtype=float)
+    obj_out = np.full(n_points, np.nan, dtype=float)
+    comp_out = np.full(n_points, None, dtype=object)
+    iv_idx_out = np.full(n_points, -1, dtype=int)
+    imp_out = np.full(n_points, np.nan, dtype=float)
+
+    a_val = geometry.a
+    b_val = geometry.b
+    a_abs = abs(a_val)
+    b_abs = abs(b_val)
+    scale_geom = max(1.0, a_abs, b_abs)
+    reach_tol = 2.0e-10 * scale_geom
+    bound_tol = 2.0e-9 * scale_geom
+    compiled_rects = plan.compiled_rects
+
+    for branch, bp in ((0, branch_pair[0]), (1, branch_pair[1])):
+        if bp is None:
             continue
         sign = 1.0 if branch == 0 else -1.0
         branch_geometry = EllipseGeometry(
             geometry.cx,
             geometry.cy,
-            geometry.a,
+            a_val,
             geometry.axis_ratio,
             reference_axis + sign * geometry.theta,
         )
-        unconstrained_by_row = _batched_unconstrained_arc_projections(
-            points,
-            np.flatnonzero(mask),
-            branch_geometry,
-            sides,
-            interval_specs,
-            include_global_oracle=include_global_oracle,
-        )
-        for row in np.flatnonzero(mask):
-            spec = interval_specs[int(row)]
-            projection = _project_point_to_support(
-                np.asarray(points[row], dtype=float),
-                branch_geometry,
-                str(sides[row]),
-                spec.get("manual_intervals"),
-                spec.get("rectangles", ()),
+        branch_u, branch_v = _local_coordinates(bp.pts, branch_geometry)
+        if bp.unc_pos.size:
+            unc_proj = _project_ellipse_arc(
+                branch_u[bp.unc_pos],
+                branch_v[bp.unc_pos],
+                a_val,
+                b_val,
+                bp.unc_t_min,
+                bp.unc_t_max,
                 include_global_oracle=include_global_oracle,
-                precomputed_unconstrained=unconstrained_by_row.get(int(row)),
             )
-            for name in (
-                "t", "distance", "global_distance", "at_endpoint", "endpoint_clipped",
-                "support_endpoint_clipped", "manual_bound_clipped", "projection_valid",
-                "support_infeasible", "support_violation_q", "objective_distance",
-                "support_component_id", "support_interval_index",
-            ):
-                result[name][row] = projection[name]
-        result["implicit"][mask] = ellipse_implicit(points[mask], branch_geometry)
-    result["signed_distance"] = np.copysign(result["objective_distance"], result["implicit"])
-    result["signed_distance"] = np.nan_to_num(result["signed_distance"], nan=1.0e12, posinf=1.0e12, neginf=-1.0e12)
-    result["objective_distance"] = np.nan_to_num(result["objective_distance"], nan=1.0e12, posinf=1.0e12, neginf=1.0e12)
-    return result
+            u_t = unc_proj["t"].tolist()
+            u_d = unc_proj["distance"].tolist()
+            u_gd = unc_proj["global_distance"].tolist()
+            u_ep = unc_proj["at_endpoint"].tolist()
+            u_clip = unc_proj["endpoint_clipped"].tolist()
+        else:
+            u_t = u_d = u_gd = u_ep = u_clip = []
+
+        if plan.n_rects > 0:
+            gcos = math.cos(branch_geometry.theta)
+            gsin = math.sin(branch_geometry.theta)
+            dx_r = branch_geometry.cx - plan.ox
+            dy_r = branch_geometry.cy - plan.oy
+            base_t_arr = plan.tx * dx_r + plan.ty * dy_r
+            cos_t_arr = a_val * (plan.tx * gcos + plan.ty * gsin)
+            sin_t_arr = b_val * (-plan.tx * gsin + plan.ty * gcos)
+            amp_t_arr = np.hypot(cos_t_arr, sin_t_arr)
+            base_n_arr = plan.nx * dx_r + plan.ny * dy_r
+            cos_n_arr = a_val * (plan.nx * gcos + plan.ny * gsin)
+            sin_n_arr = b_val * (-plan.nx * gsin + plan.ny * gcos)
+            amp_n_arr = np.hypot(cos_n_arr, sin_n_arr)
+            reach_arr = ~(
+                (base_t_arr + amp_t_arr < plan.t_lo - reach_tol)
+                | (base_t_arr - amp_t_arr > plan.t_hi + reach_tol)
+                | (base_n_arr + amp_n_arr < plan.n_lo - reach_tol)
+                | (base_n_arr - amp_n_arr > plan.n_hi + reach_tol)
+            )
+            base_t = base_t_arr.tolist()
+            cos_t = cos_t_arr.tolist()
+            sin_t = sin_t_arr.tolist()
+            amp_t = amp_t_arr.tolist()
+            base_n = base_n_arr.tolist()
+            cos_n = cos_n_arr.tolist()
+            sin_n = sin_n_arr.tolist()
+            amp_n = amp_n_arr.tolist()
+            reach_list = reach_arr.tolist()
+        else:
+            base_t = cos_t = sin_t = amp_t = base_n = cos_n = sin_n = amp_n = []
+            reach_list = []
+
+        iv_cache: dict[tuple[int, tuple[tuple[float, float], ...]], list[dict[str, Any]]] = {}
+        constr_pos: list[int] = []
+        constr_row_slices: list[tuple[int, int, int]] = []  # (row, start_in_constr, stop_in_constr)
+        constr_los: list[float] = []
+        constr_his: list[float] = []
+        constr_meta: list[dict[str, Any]] = []
+
+        rows_list = bp.rows_list
+        unc_spans = bp.unc_spans
+        row_rect_idxs_list = bp.row_rect_idxs
+        row_has_manual_list = bp.row_has_manual
+        row_domains_list = bp.row_domains
+        row_raw_rects_list = bp.row_raw_rects
+
+        for pos in range(bp.n_rows):
+            row = rows_list[pos]
+            span_lo, span_hi = unc_spans[pos]
+            r_idxs = row_rect_idxs_list[pos]
+            domain = row_domains_list[pos]
+            if r_idxs:
+                reachable_ris = [ri for ri in r_idxs if reach_list[ri]]
+                matched = False
+                if span_hi > span_lo and reachable_ris:
+                    cand_indices = (
+                        (span_lo,)
+                        if span_hi - span_lo == 1
+                        else sorted(range(span_lo, span_hi), key=lambda k: (u_d[k], u_t[k]))
+                    )
+                    for k in cand_indices:
+                        cand_t = u_t[k]
+                        ct = math.cos(cand_t)
+                        st = math.sin(cand_t)
+                        for ri in reachable_ris:
+                            v0 = base_t[ri] + cos_t[ri] * ct + sin_t[ri] * st
+                            v1 = base_n[ri] + cos_n[ri] * ct + sin_n[ri] * st
+                            av0 = -v0 if v0 < 0.0 else v0
+                            av1 = -v1 if v1 < 0.0 else v1
+                            sc = scale_geom
+                            if av0 > sc:
+                                sc = av0
+                            if av1 > sc:
+                                sc = av1
+                            tol = 2.0e-10 * sc
+                            rect_c = compiled_rects[ri]
+                            if (
+                                rect_c.t_lo - tol <= v0 <= rect_c.t_hi + tol
+                                and rect_c.n_lo - tol <= v1 <= rect_c.n_hi + tol
+                            ):
+                                at_b = (
+                                    abs(v0 - rect_c.t_lo) <= bound_tol
+                                    or abs(v0 - rect_c.t_hi) <= bound_tol
+                                    or abs(v1 - rect_c.n_lo) <= bound_tol
+                                    or abs(v1 - rect_c.n_hi) <= bound_tol
+                                )
+                                t_out[row] = cand_t
+                                d_out[row] = u_d[k]
+                                gd_out[row] = u_gd[k]
+                                at_ep_out[row] = u_ep[k]
+                                ep_clip_out[row] = u_clip[k]
+                                comp_out[row] = rect_c.component_id
+                                iv_idx_out[row] = rect_c.segment_index
+                                sup_ep_out[row] = at_b
+                                man_ep_out[row] = u_ep[k]
+                                valid_out[row] = True
+                                infeas_out[row] = False
+                                viol_out[row] = 0.0
+                                obj_out[row] = u_d[k]
+                                matched = True
+                                break
+                        if matched:
+                            break
+                if matched:
+                    continue
+
+                c_start = len(constr_pos)
+                for ri in reachable_ris:
+                    iv_key = (ri, domain)
+                    ivs = iv_cache.get(iv_key)
+                    if ivs is None:
+                        br = _BranchRect(
+                            rect=compiled_rects[ri],
+                            base_t=base_t[ri],
+                            cos_t=cos_t[ri],
+                            sin_t=sin_t[ri],
+                            amp_t=amp_t[ri],
+                            base_n=base_n[ri],
+                            cos_n=cos_n[ri],
+                            sin_n=sin_n[ri],
+                            amp_n=amp_n[ri],
+                            reachable=True,
+                        )
+                        ivs = _branch_rect_intervals(branch_geometry, br, domain)
+                        iv_cache[iv_key] = ivs
+                    for interval in ivs:
+                        constr_pos.append(pos)
+                        constr_los.append(interval["lo"])
+                        constr_his.append(interval["hi"])
+                        constr_meta.append(interval)
+                c_stop = len(constr_pos)
+                if c_stop > c_start:
+                    constr_row_slices.append((row, c_start, c_stop))
+                else:
+                    if span_hi > span_lo:
+                        best_k = (
+                            span_lo
+                            if span_hi - span_lo == 1
+                            else min(range(span_lo, span_hi), key=lambda k: (u_d[k], u_t[k]))
+                        )
+                        pt_best = branch_geometry.point(u_t[best_k])
+                        rect_viol = _compiled_q_rectangle_violation(
+                            float(pt_best[0]), float(pt_best[1]), r_idxs, compiled_rects
+                        )
+                        penalty = max(u_d[best_k], rect_viol if rect_viol is not None else 0.0, 1.0e-12)
+                    else:
+                        penalty = _support_violation_q(
+                            bp.pts[pos], branch_geometry, row_raw_rects_list[pos], domain
+                        )
+                    valid_out[row] = False
+                    infeas_out[row] = True
+                    viol_out[row] = float(penalty)
+                    obj_out[row] = float(penalty)
+            elif row_has_manual_list[pos] and span_hi > span_lo:
+                best_k = (
+                    span_lo
+                    if span_hi - span_lo == 1
+                    else min(range(span_lo, span_hi), key=lambda k: (u_d[k], u_t[k]))
+                )
+                at_ep = u_ep[best_k]
+                t_out[row] = u_t[best_k]
+                d_out[row] = u_d[best_k]
+                gd_out[row] = u_gd[best_k]
+                at_ep_out[row] = at_ep
+                ep_clip_out[row] = u_clip[best_k]
+                comp_out[row] = None
+                iv_idx_out[row] = best_k - span_lo
+                sup_ep_out[row] = False
+                man_ep_out[row] = at_ep
+                valid_out[row] = True
+                infeas_out[row] = False
+                viol_out[row] = 0.0
+                obj_out[row] = u_d[best_k]
+            else:
+                if span_hi > span_lo:
+                    best_k = (
+                        span_lo
+                        if span_hi - span_lo == 1
+                        else min(range(span_lo, span_hi), key=lambda k: (u_d[k], u_t[k]))
+                    )
+                    penalty = max(u_d[best_k], 1.0e-12)
+                else:
+                    penalty = _support_violation_q(
+                        bp.pts[pos], branch_geometry, row_raw_rects_list[pos], domain
+                    )
+                valid_out[row] = False
+                infeas_out[row] = True
+                viol_out[row] = float(penalty)
+                obj_out[row] = float(penalty)
+
+        if constr_row_slices:
+            c_idx_arr = np.asarray(constr_pos, dtype=np.intp)
+            c_proj = _project_ellipse_arc(
+                branch_u[c_idx_arr],
+                branch_v[c_idx_arr],
+                a_val,
+                b_val,
+                np.asarray(constr_los, dtype=float),
+                np.asarray(constr_his, dtype=float),
+                include_global_oracle=include_global_oracle,
+            )
+            c_t = c_proj["t"].tolist()
+            c_d = c_proj["distance"].tolist()
+            c_gd = c_proj["global_distance"].tolist()
+            c_ep = c_proj["at_endpoint"].tolist()
+            c_clip = c_proj["endpoint_clipped"].tolist()
+            for row, c_start, c_stop in constr_row_slices:
+                best_k = (
+                    c_start
+                    if c_stop - c_start == 1
+                    else min(
+                        range(c_start, c_stop),
+                        key=lambda k: (c_d[k], c_t[k], str(constr_meta[k].get("component_id"))),
+                    )
+                )
+                meta = constr_meta[best_k]
+                at_ep = c_ep[best_k]
+                sup_ep = bool(at_ep and (meta.get("lo_support") or meta.get("hi_support")))
+                man_ep = bool(at_ep and (meta.get("lo_manual") or meta.get("hi_manual")))
+                t_out[row] = c_t[best_k]
+                d_out[row] = c_d[best_k]
+                gd_out[row] = c_gd[best_k]
+                at_ep_out[row] = at_ep
+                ep_clip_out[row] = c_clip[best_k]
+                comp_out[row] = meta.get("component_id")
+                iv_idx_out[row] = int(meta.get("support_interval_index", -1))
+                sup_ep_out[row] = sup_ep
+                man_ep_out[row] = man_ep
+                valid_out[row] = True
+                infeas_out[row] = False
+                viol_out[row] = 0.0
+                obj_out[row] = c_d[best_k]
+
+        imp_out[bp.rows] = ellipse_implicit(bp.pts, branch_geometry)
+
+    signed_distance = np.copysign(obj_out, imp_out)
+    signed_distance = np.nan_to_num(signed_distance, nan=1.0e12, posinf=1.0e12, neginf=-1.0e12)
+    objective_distance = np.nan_to_num(obj_out, nan=1.0e12, posinf=1.0e12, neginf=1.0e12)
+    return {
+        "t": t_out,
+        "distance": d_out,
+        "global_distance": gd_out,
+        "at_endpoint": at_ep_out,
+        "endpoint_clipped": ep_clip_out,
+        "support_endpoint_clipped": sup_ep_out,
+        "manual_bound_clipped": man_ep_out,
+        "projection_valid": valid_out,
+        "support_infeasible": infeas_out,
+        "support_violation_q": viol_out,
+        "objective_distance": objective_distance,
+        "support_component_id": comp_out,
+        "support_interval_index": iv_idx_out,
+        "implicit": imp_out,
+        "signed_distance": signed_distance,
+    }
 
 
 def _parameter_set_for_arcs(
@@ -1809,6 +2473,7 @@ def fit_arc_ellipses(
     if observed_tip_constraint:
         parameter_set = _observed_radius_seed(xy, parameter_set)
     sigma_weights = 1.0 / sigmas
+    projection_plan = _ArcProjectionPlan(xy, sides, interval_specs)
 
     def objective(candidate: ParameterSet, labels: np.ndarray) -> np.ndarray:
         raise_if_cancelled(cancel_event, "ellipse:arc:residual")
@@ -1820,6 +2485,7 @@ def fit_arc_ellipses(
             interval_specs,
             reference_axis,
             include_global_oracle=False,
+            _plan=projection_plan,
         )
         return projection["signed_distance"] * sigma_weights
 
@@ -1890,6 +2556,7 @@ def fit_arc_ellipses(
         interval_specs,
         reference_axis,
         include_global_oracle=True,
+        _plan=projection_plan,
     )
     signed_residuals = np.asarray(projection["signed_distance"], dtype=float)
     _update_diagnostics(

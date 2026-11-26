@@ -268,10 +268,15 @@ def analysis_overrides(args: argparse.Namespace) -> dict[str, Any]:
         ("valid_mask", "valid_mask"),
         ("mask_frame", "mask_frame"),
         ("mask_dataset", "mask_dataset"),
+        ("uncertainty_dataset", "uncertainty_dataset"),
+        ("intensity_mode", "intensity_mode"),
+        ("bright_axis_convention", "bright_axis_convention"),
     ):
         value = getattr(args, argument, None)
         if value is not None:
             mapping[key] = value
+    if getattr(args, "include_physics", None):
+        mapping["include_physics"] = True
     ellipse: dict[str, Any] = {}
     for argument, key in (
         ("ellipse_preset", "preset"),

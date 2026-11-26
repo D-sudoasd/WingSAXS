@@ -192,3 +192,25 @@ def test_large_offset_variance_guard_avoids_catastrophic_cancellation():
     assert result["summary"]["intensity"]["std"] == pytest.approx(expected_std, rel=1e-9)
     assert result["radial_rows"][0]["std"] == pytest.approx(expected_std, rel=1e-9)
     assert result["radial_rows"][0]["sem"] == pytest.approx(expected_std / np.sqrt(image.size), rel=1e-9)
+
+
+def test_measure_frame_raw_intensity_mode_withholds_q_win_invariant():
+    axis = np.linspace(-1.0, 1.0, 21)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    image = 2.0 + 30.0 * np.exp(-0.5 * ((q - 0.45) / 0.08) ** 2)
+
+    cal = measure_frame(image, qx, qy, q_unit="nm^-1", intensity_mode="calibrated")
+    assert cal["summary"]["intensity_mode"] == "calibrated"
+    assert cal["summary"]["q_win_invariant"] is not None
+    assert cal["summary"]["saxs_physics"]["q_win_invariant"] is not None
+
+    raw = measure_frame(image, qx, qy, q_unit="nm^-1", intensity_mode="raw")
+    assert raw["summary"]["intensity_mode"] == "raw"
+    assert raw["summary"]["q_win_invariant"] is None
+    assert raw["summary"]["saxs_physics"]["intensity_mode"] == "raw"
+    assert raw["summary"]["saxs_physics"]["q_win_invariant"] is None
+    assert any("raw" in note.lower() for note in raw["summary"]["saxs_physics"]["caveats"])
+
+    with pytest.raises(ValueError, match="intensity_mode"):
+        measure_frame(image, qx, qy, q_unit="nm^-1", intensity_mode="bogus")

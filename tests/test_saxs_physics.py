@@ -891,3 +891,47 @@ def test_run_window_sensitivity_audit_compares_windows_models_and_raw_isolation(
         assert row["q_win_invariant"] is None
         assert row["q_win_bg_subtracted"] is None
         assert row["q_win_stat_stderr"] is None
+
+
+def test_harmonics_opt_in_include_profile_and_outer_zero_sparse_shell_guard() -> None:
+    from butterfly_saxs.physics.radial import _estimate_radial_background_and_active_mask
+
+    img, qx, qy = _make_butterfly_2d(
+        n_grid=129, q_extent=1.0, q_star=0.38, sigma_q=0.06, c0=4.0, c2=-2.0
+    )
+    valid = np.hypot(qx, qy) >= 0.10
+
+    no_prof = compute_azimuthal_harmonics_and_order(
+        img, qx, qy, valid_mask=valid, q_window=(0.12, 0.90), include_profile=False
+    )
+    assert "profile" not in no_prof
+
+    with_prof = compute_azimuthal_harmonics_and_order(
+        img, qx, qy, valid_mask=valid, q_window=(0.12, 0.90), include_profile=True
+    )
+    assert "profile" in with_prof
+    assert len(with_prof["profile"]["angle_deg"]) == 360
+    assert len(with_prof["profile"]["intensity"]) == 360
+    assert len(with_prof["profile"]["counts"]) == 360
+
+    q_centers = np.linspace(0.2, 8.0, 20)
+    I_q = np.concatenate([np.full(16, 6.0), np.array([2.5, 0.5, 0.0, 0.4])])
+    I_q[2] = 45.0
+    counts = np.full(20, 200, dtype=np.int64)
+    # Outermost shell has 0.72 zeros right outside a 0.88 dead shell and 0.78 dead shell
+    zfrac = np.concatenate([np.full(16, 0.05), np.array([0.45, 0.78, 0.88, 0.72])])
+    active, i_bg, _, n_dead = _estimate_radial_background_and_active_mask(
+        q_centers, I_q, counts, zero_pixel_fraction=zfrac
+    )
+    assert n_dead >= 3
+    assert not bool(active[-1]) and not bool(active[-2]) and not bool(active[-3])
+    assert i_bg == pytest.approx(6.0)
+
+    # Low-count 1 s Poisson plateau (~0.54 zeros inside active zone) stays active inside cliff
+    zfrac_poisson = np.concatenate([np.full(16, 0.54), np.array([0.55, 0.92, 0.98, 0.99])])
+    zfrac_poisson[:4] = 0.25
+    active_p, _, _, n_dead_p = _estimate_radial_background_and_active_mask(
+        q_centers, I_q, counts, zero_pixel_fraction=zfrac_poisson
+    )
+    assert n_dead_p == 3
+    assert bool(active_p[16]) and not bool(active_p[17])

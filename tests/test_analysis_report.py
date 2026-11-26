@@ -299,3 +299,108 @@ def test_changed_report_status_cannot_be_promoted_by_receipt_reuse(tmp_path):
     second = build_analysis_report(folder, resume=True, **options)
     assert second["operation_status"] == "completed"
     assert second["exit_code"] == 1
+
+
+def test_analysis_report_propagates_saxs_physics_and_enforces_raw_unit_honesty(tmp_path):
+    y, x = np.indices((10, 12), dtype=float)
+    qx, qy = (x - 5.5) * 0.1, (y - 4.5) * 0.1
+    img = 3.0 + 25.0 * np.exp(-0.5 * ((np.hypot(qx, qy) - 0.35) / 0.08) ** 2)
+    mask = np.ones(img.shape, dtype=bool)
+    shared_phys = {
+        "q_unit": "nm^-1",
+        "harmonics": {
+            "status": "estimated",
+            "a2": 0.15,
+            "profile": {"angle_deg": [0.0] * 36, "intensity": [1.0] * 36, "counts": [10] * 36},
+        },
+        "radial": {
+            "full_azimuth": {
+                "I_bg_estimate": 3.1,
+                "q_centers": [0.1] * 24,
+                "I_q": [4.0] * 24,
+            }
+        },
+        "c2_bridge_fit": {
+            "success": True,
+            "alpha_deg": 32.5,
+            "lobe_fwhm_deg": 18.0,
+            "chi_sym_deg": 90.2,
+            "r_squared": 0.985,
+            "observed": [1.0] * 36,
+            "model": [1.0] * 36,
+            "flat_baseline_comparison": {"delta_bic": 14.2},
+        },
+        "streak": {
+            "status": "estimated",
+            "summary": {
+                "total_valid_slices": 8,
+                "linear": {"W_nm": 12.4, "mosaic_spread_deg": 3.1},
+                "quadrature": {"W_nm": 13.8, "mosaic_spread_deg": 2.9},
+            },
+            "wings": [{"wing_angle_deg": 32.5, "slices": [{"q_center": 0.3, "fwhm_q_perp": 0.5}]}],
+        },
+    }
+    res_cal = {
+        "image": img,
+        "qmap": {"qx": qx, "qy": qy, "q_unit": "nm^-1"},
+        "valid_mask": mask,
+        "ellipse_fit": {"q_unit": "nm^-1", "parameters": {"a": 0.35}},
+        "analysis": {"intensity_mode": "calibrated"},
+        "saxs_physics": {
+            **shared_phys,
+            "intensity_mode": "calibrated",
+            "q_win_invariant": 0.42,
+            "q_win_bg_subtracted": 0.31,
+            "q_win_stat_stderr": 0.012,
+        },
+    }
+    res_raw = {
+        "image": img,
+        "qmap": {"qx": qx, "qy": qy, "q_unit": "nm^-1"},
+        "valid_mask": mask,
+        "ellipse_fit": {"q_unit": "nm^-1", "parameters": {"a": 0.35}},
+        "analysis": {"intensity_mode": "raw"},
+        "saxs_physics": {
+            **shared_phys,
+            "intensity_mode": "raw",
+            "q_win_invariant": None,
+            "q_win_bg_subtracted": 999.0,  # report must strictly suppress in raw mode
+            "q_win_stat_stderr": 999.0,
+        },
+    }
+    folder = tmp_path / "batch_phys"
+    export_batch(
+        [
+            FrameFitResult(FrameRef("f0.npy", frame_id="cal", time=0.0), res_cal),
+            FrameFitResult(FrameRef("f1.npy", frame_id="raw", time=1.0), res_raw),
+        ],
+        folder,
+    )
+    out = build_analysis_report(folder, radial_bins=4, angular_bins=6, formats=("png",), dpi=30)
+    assert out["operation_status"] == "completed"
+    report_dir = Path(out["outputs"]["summary"]).parent
+
+    rows = _rows(report_dir / "frame_measurements.csv")
+    assert len(rows) == 2
+    assert rows[0]["intensity_mode"] == "calibrated"
+    assert float(rows[0]["I_bg_estimate"]) == pytest.approx(3.1)
+    assert float(rows[0]["q_win_bg_subtracted"]) == pytest.approx(0.31)
+    assert float(rows[0]["q_win_stat_stderr"]) == pytest.approx(0.012)
+    assert float(rows[0]["c2_alpha_deg"]) == pytest.approx(32.5)
+    assert float(rows[0]["c2_delta_bic"]) == pytest.approx(14.2)
+    assert float(rows[0]["streak_W_linear_nm"]) == pytest.approx(12.4)
+    assert float(rows[0]["streak_W_quad_nm"]) == pytest.approx(13.8)
+    assert float(rows[0]["streak_mosaic_deg"]) == pytest.approx(3.1)
+    assert int(rows[0]["streak_n_valid_slices"]) == 8
+
+    assert rows[1]["intensity_mode"] == "raw"
+    assert rows[1]["q_win_invariant"] in ("", None)
+    assert rows[1]["q_win_bg_subtracted"] in ("", None)
+    assert rows[1]["q_win_stat_stderr"] in ("", None)
+
+    diag_rows = _rows(report_dir / "fit_diagnostics_long.csv")
+    fields = {row["field"] for row in diag_rows}
+    assert "saxs_physics.c2_bridge_fit.alpha_deg" in fields
+    assert "saxs_physics.streak.summary.linear.W_nm" in fields
+    assert not any(f.startswith("saxs_physics.harmonics.profile") for f in fields)
+    assert not any("I_q[" in f or ".slices[" in f for f in fields)

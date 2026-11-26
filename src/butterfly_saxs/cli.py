@@ -359,6 +359,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="--report 使用的 JSON/TOML 片层示意参数；拟合前加载并校验",
     )
     batch_parser.add_argument(
+        "--report-journal-style",
+        choices=_JOURNAL_STYLES,
+        default="default",
+        help="--report 期刊出版风格预设（default/nature/nature_comm/science/macromolecules；默认保持原有风格）",
+    )
+    batch_parser.add_argument(
         "--resume", action="store_true", help="从已有检查点恢复"
     )
     batch_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
@@ -407,6 +413,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="独立拟合模式并行 worker 数（映射到 max_workers；默认 1，warm_start 自动顺序执行）",
+    )
+    batch_parser.add_argument(
+        "--uncertainty-dataset",
+        default=None,
+        metavar="PATH|auto",
+        help="HDF5 伴随统计不确定度数据集路径，或 auto 自动探测（例如 /entry/data/uncertainty/statistical）",
+    )
+    batch_parser.add_argument(
+        "--include-physics",
+        action="store_true",
+        default=None,
+        help="附加扩展 2D SAXS 物理观测量汇总（方位谐波/C2-bridge+4-lobe、径向粗化、Q_win 与条纹展宽）",
+    )
+    batch_parser.add_argument(
+        "--intensity-mode",
+        choices=_INTENSITY_MODES,
+        default=None,
+        help="强度标定模式（calibrated 或 raw；raw 模式下不报告无物理尺度的 Q_win）",
+    )
+    batch_parser.add_argument(
+        "--bright-axis-convention",
+        choices=_BRIGHT_AXIS_CONVENTIONS,
+        default=None,
+        help="预期亮桥/对称轴约定：draw（默认，与拉伸轴一致）或 reference（垂直拉伸轴，适用于赤道翼）",
     )
     _add_refinement_options(batch_parser)
 

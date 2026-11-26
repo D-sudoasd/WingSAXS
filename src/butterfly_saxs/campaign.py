@@ -259,10 +259,30 @@ def _file_sha256(path: Path, cache: dict[Path, str]) -> str:
     return digest
 
 
-def _inspect_h5_dataset(path: Path, dataset: str | None) -> tuple[str, tuple[int, ...]]:
-    """Inspect an HDF5 file read-only to resolve its 2D/3D frame dataset."""
+def _import_h5py() -> Any:
+    """Import ``h5py`` after registering ``hdf5plugin`` compression filters when available."""
 
+    try:
+        import hdf5plugin  # noqa: F401
+    except ImportError:
+        pass
     import h5py
+
+    return h5py
+
+
+def _is_supported_h5_dataset_shape(shape: tuple[int, ...]) -> bool:
+    """Return True for 2D, 3D stack, or singleton-channel 4D ``(N, 1, H, W)`` datasets."""
+
+    if len(shape) in {2, 3}:
+        return True
+    return len(shape) == 4 and shape[1] == 1 and shape[2] >= 4 and shape[3] >= 4
+
+
+def _inspect_h5_dataset(path: Path, dataset: str | None) -> tuple[str, tuple[int, ...]]:
+    """Inspect an HDF5 file read-only to resolve its 2D/3D/singleton-4D frame dataset."""
+
+    h5py = _import_h5py()
 
     with h5py.File(path, "r") as handle:
         if dataset is not None:
@@ -272,9 +292,9 @@ def _inspect_h5_dataset(path: Path, dataset: str | None) -> tuple[str, tuple[int
             if not isinstance(obj, h5py.Dataset):
                 raise ValueError(f"HDF5 path {dataset!r} in {path} is not a dataset")
             shape = tuple(int(dim) for dim in obj.shape)
-            if len(shape) not in {2, 3}:
+            if not _is_supported_h5_dataset_shape(shape):
                 raise ValueError(
-                    f"HDF5 dataset {dataset!r} in {path} must be 2D or 3D, got shape {shape!r}"
+                    f"HDF5 dataset {dataset!r} in {path} must be 2D, 3D, or singleton-channel 4D (N, 1, H, W), got shape {shape!r}"
                 )
             return dataset.lstrip("/"), shape
 
@@ -285,12 +305,15 @@ def _inspect_h5_dataset(path: Path, dataset: str | None) -> tuple[str, tuple[int
                 return
             if obj.dtype.kind not in {"f", "i", "u"}:
                 return
-            if obj.ndim in {2, 3}:
-                candidates.append((name, tuple(int(dim) for dim in obj.shape)))
+            shape = tuple(int(dim) for dim in obj.shape)
+            if _is_supported_h5_dataset_shape(shape):
+                candidates.append((name, shape))
 
         handle.visititems(visitor)
         if not candidates:
-            raise ValueError(f"no 2D/3D numeric dataset found in HDF5 file {path}")
+            raise ValueError(
+                f"no 2D, 3D, or singleton-channel 4D (N, 1, H, W) numeric dataset found in HDF5 file {path}"
+            )
         if len(candidates) == 1:
             return candidates[0]
         # Prefer well-known primary SAXS intensity datasets if uniquely matched.
@@ -420,7 +443,7 @@ def discover_manifest(
 
         if file_path.suffix.casefold() in _HDF5_SUFFIXES:
             ds_name, shape = _inspect_h5_dataset(file_path, dataset)
-            is_stack = len(shape) == 3
+            is_stack = len(shape) == 3 or (len(shape) == 4 and shape[0] != 1)
             n_frames = shape[0] if is_stack else 1
             for frame_idx in range(n_frames):
                 frame_id = unique_frame_id(

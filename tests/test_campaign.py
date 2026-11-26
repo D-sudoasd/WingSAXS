@@ -533,3 +533,34 @@ def test_run_campaign_parallel_process_pool_end_to_end_and_failure_isolation(
     assert summary["samples"][2]["n_frames"] == 2
     assert (out_root / "campaign_summary.json").is_file()
     json.dumps(summary, allow_nan=False, ensure_ascii=True)
+
+
+def test_discover_manifest_singleton_4d_h5_prefers_entry_data_data(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    from butterfly_saxs.campaign import _inspect_h5_dataset, discover_manifest
+
+    single_h5 = tmp_path / "series_master.h5"
+    with h5py.File(single_h5, "w") as handle:
+        handle.create_dataset("entry/data/data", data=np.ones((1, 1, 8, 8), dtype=np.uint32))
+        handle.create_dataset("entry/instrument/detector/flatfield", data=np.ones((8, 8), dtype=np.float32))
+        handle.create_dataset("entry/instrument/detector/pixel_mask", data=np.zeros((8, 8), dtype=np.uint32))
+
+    ds_name, shape = _inspect_h5_dataset(single_h5, None)
+    assert ds_name == "entry/data/data"
+    assert shape == (1, 1, 8, 8)
+    single_rows = discover_manifest(single_h5, parse_metadata=False)
+    assert len(single_rows) == 1
+    assert single_rows[0]["dataset"] == "entry/data/data"
+    assert single_rows[0]["frame"] is None
+
+    stack_h5 = tmp_path / "series_stack.h5"
+    with h5py.File(stack_h5, "w") as handle:
+        handle.create_dataset("entry/data/data", data=np.ones((3, 1, 8, 8), dtype=np.uint32))
+    stack_rows = discover_manifest(stack_h5, parse_metadata=False)
+    assert [row["frame"] for row in stack_rows] == [0, 1, 2]
+
+    bad_h5 = tmp_path / "bad_4d.h5"
+    with h5py.File(bad_h5, "w") as handle:
+        handle.create_dataset("entry/data/data", data=np.ones((2, 3, 8, 8), dtype=np.float32))
+    with pytest.raises(ValueError, match="singleton-channel 4D"):
+        _inspect_h5_dataset(bad_h5, "entry/data/data")

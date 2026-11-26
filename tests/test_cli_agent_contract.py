@@ -721,3 +721,64 @@ def test_cli_batch_and_campaign_v21_options_forward_and_pickle(monkeypatch, tmp_
     captured = capsys.readouterr()
     assert "max_workers" in captured.err
     assert json.loads(captured.out)["status"] == "ok"
+
+
+def test_cli_batch_parity_flags_and_describe_contract(monkeypatch, tmp_path, capsys) -> None:
+    import numpy as np
+    import butterfly_saxs.batch as batch_module
+    import butterfly_saxs.cli as cli_module
+    from butterfly_saxs.cli import build_parser
+
+    assert main(["describe", "batch"]) == 0
+    batch_contract = json.loads(capsys.readouterr().out)["commands"][0]
+    for opt in (
+        "include_physics",
+        "uncertainty_dataset",
+        "intensity_mode",
+        "bright_axis_convention",
+        "report_journal_style",
+    ):
+        assert opt in batch_contract["options"]
+
+    src = tmp_path / "f1.npy"
+    np.save(src, np.ones((8, 8), dtype=float))
+    analyze_seen: list[dict] = []
+    report_seen: list[dict] = []
+
+    def spy_analyze(path, **kwargs):
+        analyze_seen.append(dict(kwargs))
+        return {"parameters": {"axis_ratio": 0.42}, "image": np.ones((8, 8))}
+
+    def spy_build_report(output_dir, **kwargs):
+        report_seen.append({"output_dir": str(output_dir), **kwargs})
+        return {"status": "ready", "exit_code": 0, "outputs": {}}
+
+    monkeypatch.setattr(cli_module, "analyze_frame", spy_analyze)
+    monkeypatch.setattr(cli_module, "_build_analysis_report", spy_build_report)
+    real_run_batch = batch_module.run_batch
+    monkeypatch.setattr(batch_module, "run_batch", real_run_batch)
+
+    assert main([
+        "batch",
+        str(src),
+        "-o", str(tmp_path / "out_parity"),
+        "--include-physics",
+        "--uncertainty-dataset", "auto",
+        "--intensity-mode", "raw",
+        "--bright-axis-convention", "reference",
+        "--report",
+        "--report-journal-style", "nature",
+    ]) == 0
+    capsys.readouterr()
+    cfg = analyze_seen[-1]["config"]
+    assert cfg.analysis["include_physics"] is True
+    assert cfg.analysis["uncertainty_dataset"] == "auto"
+    assert cfg.analysis["intensity_mode"] == "raw"
+    assert cfg.analysis["bright_axis_convention"] == "reference"
+    assert report_seen[-1]["journal_style"] == "nature"
+
+    # Omitting --include-physics keeps TOML include_physics = true untouched.
+    parser = build_parser()
+    parsed = parser.parse_args(["batch", str(src)])
+    assert parsed.include_physics is None
+    assert "include_physics" not in cli_module._analysis_overrides(parsed)

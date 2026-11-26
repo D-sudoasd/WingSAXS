@@ -575,6 +575,13 @@ def _weighted_tensor(
     }
 
 
+def _normalize_intensity_mode(intensity_mode: str) -> str:
+    mode = str(intensity_mode or "calibrated").strip().lower()
+    if mode not in {"calibrated", "raw"}:
+        raise ValueError("intensity_mode must be 'calibrated' or 'raw'")
+    return mode
+
+
 def _saxs_physics_summary(
     *,
     edges: np.ndarray,
@@ -582,8 +589,10 @@ def _saxs_physics_summary(
     angle_edges: np.ndarray,
     angular_stats: dict[str, np.ndarray],
     q_unit: str,
+    intensity_mode: str = "calibrated",
 ) -> dict[str, Any]:
     """Compute additive strict-JSON-safe saxs_physics metrics from observed profiles."""
+    mode = _normalize_intensity_mode(intensity_mode)
     angle_centers = 0.5 * (angle_edges[:-1] + angle_edges[1:])
     ang_mean = angular_stats["mean"]
     ang_count = angular_stats["count"]
@@ -600,6 +609,7 @@ def _saxs_physics_summary(
         radial_stats["count"],
         radial_stats["candidate_count"],
         q_unit=q_unit,
+        intensity_mode=mode,
     )
 
     wing_half_opening = harmonics.get("wing_half_opening_estimate_deg")
@@ -618,10 +628,17 @@ def _saxs_physics_summary(
         if c2_fit.get("success") and c2_fit.get("alpha_deg") is not None:
             wing_half_opening = c2_fit["alpha_deg"]
 
-    caveats: list[str] = [
-        "q_win_invariant is a window-bounded scattering invariant proxy over observed q bins only; "
-        "it does not estimate delta_rho or volume fraction.",
-    ]
+    caveats: list[str] = []
+    if mode == "raw":
+        caveats.append(
+            "q_win_invariant is None because intensity_mode='raw' represents "
+            "uncalibrated detector counts rather than absolute intensity."
+        )
+    else:
+        caveats.append(
+            "q_win_invariant is a window-bounded scattering invariant proxy over observed q bins only; "
+            "it does not estimate delta_rho or volume fraction."
+        )
     if q_unit not in {"nm⁻¹", "Å⁻¹"}:
         caveats.append(
             f"L_star_direct_nm and L_star_kratky_nm are None because q_unit={q_unit!r} is not a calibrated physical unit."
@@ -629,6 +646,7 @@ def _saxs_physics_summary(
 
     return {
         "status": harmonics.get("status", "unavailable"),
+        "intensity_mode": mode,
         "a2": harmonics.get("a2"),
         "a4": harmonics.get("a4"),
         "a4_over_a2": harmonics.get("a4_over_a2"),
@@ -640,7 +658,7 @@ def _saxs_physics_summary(
         "phi4_deg": harmonics.get("phi4_deg"),
         "friedel_bisector_deg": harmonics.get("friedel_bisector_deg"),
         "wing_half_opening_deg": _finite_number(wing_half_opening),
-        "q_win_invariant": radial["q_win_invariant"],
+        "q_win_invariant": None if mode == "raw" else radial["q_win_invariant"],
         "q_star_direct": radial["q_star_direct"],
         "L_star_direct_nm": radial["L_star_direct_nm"],
         "edge_hit_direct": radial["edge_hit_direct"],
@@ -667,6 +685,7 @@ def measure_frame(
     q_mag: Any = None,
     chi_deg: Any = None,
     geometry_cache: Any = None,
+    intensity_mode: str = "calibrated",
 ) -> dict[str, Any]:
     """Summarize observed frame intensity and its 2-D reciprocal-space layout.
 
@@ -686,6 +705,7 @@ def measure_frame(
     count. It is descriptive spatial variability, not fit uncertainty.
     """
 
+    mode = _normalize_intensity_mode(intensity_mode)
     observed_image = _array2d(image, "image")
     shape = observed_image.shape
     qx_map = _array2d(qx, "qx", shape)
@@ -920,12 +940,14 @@ def measure_frame(
         angle_edges=angle_edges,
         angular_stats=angular_stats,
         q_unit=q_unit_canonical,
+        intensity_mode=mode,
     )
     n_geom = int(image_flat.size) if all_geom_finite else int(np.count_nonzero(geometry))
     n_geom_incl = int(np.count_nonzero(geom_and_incl))
     n_obs = int(obs_img.size)
     summary = {
         "q_unit": q_unit_label,
+        "intensity_mode": mode,
         "shape": [int(shape[0]), int(shape[1])],
         "pixel_counts": {
             "candidate_qmap": n_geom,

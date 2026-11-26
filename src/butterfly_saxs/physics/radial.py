@@ -112,11 +112,30 @@ def _estimate_radial_background_and_active_mask(
     if max_val > 1.0e-9 and obs_idx.size >= 4:
         if zero_pixel_fraction is not None:
             pos = obs_idx.size - 1
-            while pos >= 0 and float(zero_pixel_fraction[obs_idx[pos]]) > 0.90:
-                dead_outer[obs_idx[pos]] = True
+            dead_positions: list[int] = []
+            # Allow up to 1 outermost sparse corner shell when adjacent inner shell has >85% zeros.
+            if (
+                pos >= 1
+                and float(zero_pixel_fraction[obs_idx[pos]]) <= 0.75
+                and float(zero_pixel_fraction[obs_idx[pos - 1]]) > 0.85
+            ):
+                dead_positions.append(int(obs_idx[pos]))
                 pos -= 1
-            if np.any(dead_outer) and pos >= 0 and float(zero_pixel_fraction[obs_idx[pos]]) > 0.50:
-                dead_outer[obs_idx[pos]] = True
+            while pos >= 0 and float(zero_pixel_fraction[obs_idx[pos]]) > 0.75:
+                dead_positions.append(int(obs_idx[pos]))
+                pos -= 1
+            if (
+                dead_positions
+                and pos >= 2
+                and bool(np.any(zero_pixel_fraction[obs_idx[: pos + 1]] < 0.50))
+            ):
+                for bin_idx in dead_positions:
+                    dead_outer[bin_idx] = True
+                inner_slice = zero_pixel_fraction[obs_idx[max(0, pos - 8) : pos]]
+                inner_plateau_zf = float(np.median(inner_slice)) if inner_slice.size else 0.0
+                trans_thresh = min(0.74, max(0.50, inner_plateau_zf + 0.12))
+                if float(zero_pixel_fraction[obs_idx[pos]]) > trans_thresh:
+                    dead_outer[obs_idx[pos]] = True
         else:
             # 1D-profile fallback: detect trailing exact-zero shells preceded by a sharp cliff
             pos = obs_idx.size - 1
@@ -893,6 +912,7 @@ def _radial_metrics_from_1d_profile(
     candidate_counts: np.ndarray,
     *,
     q_unit: str,
+    intensity_mode: str = "calibrated",
 ) -> dict[str, Any]:
     """Lightweight helper used by ``report_measurements.measure_frame`` on pre-binned profiles."""
     q_unit_label, q_scale_nm_inv, _ = _q_unit_info(q_unit)
@@ -904,6 +924,7 @@ def _radial_metrics_from_1d_profile(
         q_scale_nm_inv=q_scale_nm_inv,
         q_unit_label=q_unit_label,
         channel_name="frame_radial",
+        intensity_mode=intensity_mode,
     )
     return {
         "q_win_invariant": channel["q_win_invariant"],

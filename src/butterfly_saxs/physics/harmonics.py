@@ -251,6 +251,7 @@ def compute_azimuthal_harmonics_and_order(
     geometry_cache: Any = None,
     intensity_mode: str = "calibrated",
     sigma: Any = None,
+    include_profile: bool = False,
 ) -> dict[str, Any]:
     """Compute even Fourier harmonics, Friedel symmetry bisector, and Hermans order parameters.
 
@@ -391,6 +392,17 @@ def compute_azimuthal_harmonics_and_order(
             "friedel_matched_bins_q2_q4": 0,
             "quadrant_means": quadrant_means,
             "flags": list(dict.fromkeys(flags)),
+            **(
+                {
+                    "profile": {
+                        "angle_deg": _finite_list(ang),
+                        "intensity": _finite_list(prof),
+                        "counts": [int(c) for c in cnts],
+                    }
+                }
+                if include_profile
+                else {}
+            ),
         })
 
     ang_obs = np.mod(ang[observed], 360.0)
@@ -575,6 +587,17 @@ def compute_azimuthal_harmonics_and_order(
         "friedel_matched_bins_q2_q4": n24,
         "quadrant_means": quadrant_means,
         "flags": list(dict.fromkeys(flags)),
+        **(
+            {
+                "profile": {
+                    "angle_deg": _finite_list(ang),
+                    "intensity": _finite_list(prof),
+                    "counts": [int(c) for c in cnts],
+                }
+            }
+            if include_profile
+            else {}
+        ),
         "definitions": {
             "harmonics": "Truncated even Fourier OLS on observed angular bins only: A0 + sum_{m=2,4,6} A_m cos(m*(chi - phi_m))",
             "hermans_f2_f4": "Uniaxial fiber-symmetry Legendre moments <P2(cos(beta))> and <P4(cos(beta))> weighted by max(I, 0)*|sin(beta)| over observed bins",

@@ -2278,6 +2278,9 @@ def _compute_saxs_physics_block(
         nominal_draw_axis_deg=draw_axis_deg,
         bright_axis_convention=bright_axis_convention,
         geometry_cache=saxs_geom_cache,
+        intensity_mode=intensity_mode,
+        sigma=uncertainty,
+        include_profile=True,
     )
     radial = _call_supported(
         physics_module.measure_radial_coarsening_observables,
@@ -2308,12 +2311,30 @@ def _compute_saxs_physics_block(
                     intensities,
                     counts=counts,
                     nominal_draw_axis_deg=draw_axis_deg,
+                    bright_axis_convention=bright_axis_convention,
                     initial_chi_sym_deg=harmonics.get("friedel_bisector_deg"),
                     initial_alpha_deg=harmonics.get("wing_half_opening_estimate_deg"),
                     max_nfev=1500,
                 )
             except Exception:
                 c2_fit = None
+
+    try:
+        streak = _call_supported(
+            physics_module.measure_perpendicular_streak_width,
+            image,
+            qx,
+            qy,
+            valid_mask=valid_mask,
+            q_window=q_window,
+            q_unit=q_unit,
+            nominal_draw_axis_deg=draw_axis_deg,
+            geometry_cache=saxs_geom_cache,
+            intensity_mode=intensity_mode,
+            sigma=uncertainty,
+        )
+    except Exception as exc:
+        streak = {"status": "unavailable", "reason": str(exc)}
 
     # Strictly enforce raw-intensity isolation for Q_win both standalone and after Slice A merges.
     radial_clean = _jsonable(radial, array_summary=False)
@@ -2406,6 +2427,7 @@ def _compute_saxs_physics_block(
         "harmonics": _jsonable(harmonics, array_summary=False),
         "radial": radial_clean,
         "c2_bridge_fit": _jsonable(c2_fit, array_summary=False) if c2_fit is not None else None,
+        "streak": _jsonable(streak, array_summary=False),
         "q_win_invariant": q_win_val,
         "q_win_bg_subtracted": q_win_bg_sub,
         "q_win_stat_stderr": None if intensity_mode == "raw" else q_win_stat_stderr,
@@ -2904,6 +2926,8 @@ def analyze_frame(
         key: value for key, value in options.items()
         if key not in {"butterfly_options", "_ellipse_parameter_settings"}
     }
+    public_analysis.setdefault("intensity_mode", resolved_intensity_mode)
+    public_analysis.setdefault("bright_axis_convention", resolved_convention)
     if beamstop_info["beamstop_radius_source"] is not None:
         public_analysis["beamstop_mask_applied"] = beamstop_info["beamstop_mask_applied"]
         public_analysis["beamstop_radius_px"] = beamstop_info["beamstop_radius_px"]

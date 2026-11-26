@@ -208,12 +208,132 @@ def _leaves(value: Any, path: str = "") -> Iterator[tuple[str, Any]]:
         yield path, value
 
 
+_SAXS_PHYSICS_SKIP_KEYS = frozenset(
+    {
+        "profile",
+        "slices",
+        "definitions",
+        "angle_deg",
+        "intensity",
+        "counts",
+        "observed",
+        "observed_intensity",
+        "model",
+        "fitted_intensity",
+        "bridge_component",
+        "lobes_component",
+        "residual",
+        "residuals",
+        "q_centers",
+        "I_q",
+        "I_sub_q",
+        "sem_q",
+        "zero_pixel_fraction",
+        "valid_q",
+        "valid_fwhm_q_perp",
+        "q_centers_nm_inv",
+    }
+)
+
+
+def _saxs_physics_leaves(value: Any, path: str = "saxs_physics") -> Iterator[tuple[str, Any]]:
+    """Yield scalar diagnostics and brief metadata from ``saxs_physics``, skipping 1D profile arrays."""
+    if isinstance(value, Mapping):
+        if "shape" in value and ("dtype" in value or "array_omitted" in value):
+            return
+        for key, item in value.items():
+            if str(key) in _SAXS_PHYSICS_SKIP_KEYS:
+                continue
+            yield from _saxs_physics_leaves(item, f"{path}.{key}" if path else str(key))
+    elif isinstance(value, (list, tuple)):
+        if len(value) > 8 and all(
+            item is None or isinstance(item, (int, float, np.number)) for item in value
+        ):
+            return
+        for index, item in enumerate(value):
+            yield from _saxs_physics_leaves(item, f"{path}[{index}]")
+    else:
+        yield path, value
+
+
+def _result_intensity_mode(record: Mapping[str, Any]) -> str:
+    result = _result_detail(record)
+    for section_name in ("saxs_physics", "analysis"):
+        section = result.get(section_name)
+        if isinstance(section, Mapping):
+            raw_mode = section.get("intensity_mode")
+            if raw_mode is not None:
+                token = str(raw_mode).strip().lower()
+                if token in {"calibrated", "raw"}:
+                    return token
+    return "calibrated"
+
+
+def _stored_saxs_physics_fields(
+    record: Mapping[str, Any], *, intensity_mode: str
+) -> dict[str, Any]:
+    result = _result_detail(record)
+    phys = result.get("saxs_physics")
+    if not isinstance(phys, Mapping):
+        return {}
+    radial = phys.get("radial")
+    radial_full: Mapping[str, Any] = {}
+    if isinstance(radial, Mapping):
+        if isinstance(radial.get("full_azimuth"), Mapping):
+            radial_full = radial["full_azimuth"]
+        else:
+            radial_full = radial
+    c2 = phys.get("c2_bridge_fit")
+    if not isinstance(c2, Mapping):
+        c2 = {}
+    flat_cmp = c2.get("flat_baseline_comparison")
+    if not isinstance(flat_cmp, Mapping):
+        flat_cmp = {}
+    streak = phys.get("streak")
+    streak_sum = streak.get("summary") if isinstance(streak, Mapping) else None
+    if not isinstance(streak_sum, Mapping):
+        streak_sum = {}
+    lin = streak_sum.get("linear") if isinstance(streak_sum.get("linear"), Mapping) else {}
+    quad = streak_sum.get("quadrature") if isinstance(streak_sum.get("quadrature"), Mapping) else {}
+    raw_valid_slices = streak_sum.get("total_valid_slices")
+    n_valid_slices = (
+        int(raw_valid_slices)
+        if isinstance(raw_valid_slices, (int, float))
+        and not isinstance(raw_valid_slices, bool)
+        else None
+    )
+    return {
+        "intensity_mode": intensity_mode,
+        "I_bg_estimate": _number(radial_full.get("I_bg_estimate")),
+        "q_win_bg_subtracted": None if intensity_mode == "raw" else _number(phys.get("q_win_bg_subtracted")),
+        "q_win_stat_stderr": None if intensity_mode == "raw" else _number(phys.get("q_win_stat_stderr")),
+        "c2_alpha_deg": _number(c2.get("alpha_deg")),
+        "c2_lobe_fwhm_deg": _number(c2.get("lobe_fwhm_deg")),
+        "c2_chi_sym_deg": _number(c2.get("chi_sym_deg")),
+        "c2_r_squared": _number(c2.get("r_squared")),
+        "c2_delta_bic": _number(
+            flat_cmp["delta_bic"] if "delta_bic" in flat_cmp else c2.get("delta_bic")
+        ),
+        "streak_W_linear_nm": _number(lin.get("W_nm")),
+        "streak_W_quad_nm": _number(quad.get("W_nm")),
+        "streak_mosaic_deg": _number(
+            lin.get("mosaic_spread_deg")
+            if lin.get("mosaic_spread_deg") is not None
+            else quad.get("mosaic_spread_deg")
+        ),
+        "streak_n_valid_slices": n_valid_slices,
+    }
+
+
 def _diagnostic_rows(base: Mapping[str, Any], record: Mapping[str, Any]) -> Iterator[dict[str, Any]]:
     result = _result_detail(record)
     for name in ("ellipse_fit", "butterfly", "full2d", "analysis", "flags", "analysis_domain", "fit_audit"):
         if name in result:
             for path, value in _leaves(result[name], name):
                 yield {**base, "field": path, "value": value, "value_type": type(value).__name__}
+    if "saxs_physics" in result:
+        for path, value in _saxs_physics_leaves(result["saxs_physics"], "saxs_physics"):
+            yield {**base, "field": path, "value": value, "value_type": type(value).__name__}
     observables = result.get("observables", {})
     if isinstance(observables, Mapping) and "butterfly" in observables and "butterfly" not in result:
         for path, value in _leaves(observables["butterfly"], "observables.butterfly"):
@@ -704,8 +824,18 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                     if image is None:
                         raise ValueError("Stored detector image is missing for this frame; other frames remain available.")
                     qx, qy, mask = _coordinates(archive, keys)
-                    measurement = measure_frame(image, qx, qy, valid_mask=mask, q_unit=unit,
-                                                q_edges=grids.get(unit), radial_bins=settings["radial_bins"], angular_bins=settings["angular_bins"])
+                    intensity_mode = _result_intensity_mode(record)
+                    measurement = measure_frame(
+                        image,
+                        qx,
+                        qy,
+                        valid_mask=mask,
+                        q_unit=unit,
+                        q_edges=grids.get(unit),
+                        radial_bins=settings["radial_bins"],
+                        angular_bins=settings["angular_bins"],
+                        intensity_mode=intensity_mode,
+                    )
                     plot_record = {**record, "result": plot_result}
                     tables["normal_profiles"].write(_normal_profile_rows(base, plot_result))
                     ridges = plot_result.get("ridges", [])
@@ -715,7 +845,10 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                     if observed_points:
                         measurement["measured_ridge_qx"] = np.asarray([point["qx"] for point in observed_points])
                         measurement["measured_ridge_qy"] = np.asarray([point["qy"] for point in observed_points])
-                    summary = {**base, **measurement["summary"]}
+                    stored_physics = _stored_saxs_physics_fields(record, intensity_mode=intensity_mode)
+                    summary = {**base, **measurement["summary"], **stored_physics}
+                    if intensity_mode == "raw":
+                        summary["q_win_invariant"] = None
                     measurement["summary"] = summary
                     summaries.append(summary)
                     tables["radial_profiles"].write([{**base, **row} for row in measurement["radial_rows"]])

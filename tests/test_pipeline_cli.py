@@ -1024,3 +1024,99 @@ def test_pipeline_include_physics_raw_mode_and_h5_uncertainty(tmp_path: Path) ->
     default_res = analyze_frame(image, qmap=qmap)
     assert default_res.saxs_physics is None
     assert "saxs_physics" not in default_res.to_mapping()
+
+
+def test_pipeline_saxs_physics_c2_bridge_and_streak_and_batch_cli(tmp_path: Path, capsys) -> None:
+    import csv
+
+    pyfai_az = pytest.importorskip("pyFAI.azimuthalIntegrator")
+    h5py = pytest.importorskip("h5py")
+
+    image, qmap = synthetic_butterfly(
+        (64, 64), q0=0.45, width=0.07, q_scale=0.03, return_qmap=True, seed=11
+    )
+    qmap["q_unit"] = "nm^-1"
+
+    cal_res = analyze_frame(
+        image,
+        qmap=qmap,
+        include_physics=True,
+        bright_axis_convention="reference",
+    )
+    assert cal_res.saxs_physics is not None
+    assert cal_res.saxs_physics["c2_bridge_fit"] is not None
+    assert cal_res.saxs_physics["c2_bridge_fit"]["success"] is True
+    assert cal_res.saxs_physics["streak"] is not None
+    assert "summary" in cal_res.saxs_physics["streak"]
+    assert cal_res.analysis["intensity_mode"] == "calibrated"
+    assert cal_res.analysis["bright_axis_convention"] == "reference"
+
+    # End-to-end bsaxs batch CLI with --include-physics + --report + --report-journal-style
+    poni_path = tmp_path / "geom.poni"
+    ai = pyfai_az.AzimuthalIntegrator(
+        dist=0.18, poni1=0.0032, poni2=0.0032, pixel1=1e-4, pixel2=1e-4, wavelength=1e-10
+    )
+    ai.save(str(poni_path))
+
+    h5_1 = tmp_path / "f1.h5"
+    h5_2 = tmp_path / "f2.h5"
+    sigma = np.full(image.shape, 0.05, dtype=np.float32)
+    for idx, hp in enumerate((h5_1, h5_2)):
+        with h5py.File(hp, "w") as handle:
+            handle.create_dataset("entry/data/data", data=((1.0 + 0.1 * idx) * image).astype(np.float32))
+            handle.create_dataset("entry/data/uncertainty/statistical", data=sigma)
+
+    out_dir = tmp_path / "batch_physics_out"
+    rc = main([
+        "batch",
+        str(h5_1),
+        str(h5_2),
+        "--dataset", "entry/data/data",
+        "--poni", str(poni_path),
+        "-o", str(out_dir),
+        "--beamstop-radius-px", "auto",
+        "--uncertainty-dataset", "auto",
+        "--include-physics",
+        "--intensity-mode", "calibrated",
+        "--bright-axis-convention", "reference",
+        "--report",
+        "--report-journal-style", "nature",
+        "--report-formats", "png",
+        "--report-dpi", "60",
+    ])
+    batch_payload = json.loads(capsys.readouterr().out)
+    assert rc in (0, 1)
+    records = [
+        json.loads(line)
+        for line in (out_dir / "frame_details.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(batch_payload["frames"]) == 2
+    assert not records[0].get("error"), records[0]
+    assert records[0]["result"]["saxs_physics"]["c2_bridge_fit"] is not None
+    assert "streak" in records[0]["result"]["saxs_physics"]
+
+    report_dir = Path(batch_payload["analysis_report"]["outputs"]["index"]).parent
+    meas_csv = report_dir / "frame_measurements.csv"
+    assert meas_csv.is_file()
+    with meas_csv.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    for col in (
+        "intensity_mode",
+        "I_bg_estimate",
+        "q_win_bg_subtracted",
+        "q_win_stat_stderr",
+        "c2_alpha_deg",
+        "c2_lobe_fwhm_deg",
+        "c2_chi_sym_deg",
+        "c2_r_squared",
+        "c2_delta_bic",
+        "streak_W_linear_nm",
+        "streak_W_quad_nm",
+        "streak_mosaic_deg",
+        "streak_n_valid_slices",
+    ):
+        assert col in rows[0]
+    assert rows[0]["intensity_mode"] == "calibrated"
+    assert float(rows[0]["c2_alpha_deg"]) > 0.0

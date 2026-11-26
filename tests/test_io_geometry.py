@@ -208,3 +208,48 @@ def test_simple_poni_geometry_maps_match_pyfai_and_shape(tmp_path):
     assert maps.metadata["q_unit"] == "nm^-1"
     assert maps.metadata["chi_zero_deg"] == "+qx"
     assert maps.metadata["chi_ninety_deg"] == "+qy"
+
+
+def test_hdf5_singleton_channel_4d_and_hdf5plugin_helper(tmp_path, monkeypatch):
+    import sys
+    import butterfly_saxs.io as bsaxs_io
+
+    h5py = pytest.importorskip("h5py")
+    assert bsaxs_io._import_h5py() is h5py
+
+    # Missing optional hdf5plugin filter package falls back cleanly to standard h5py.
+    monkeypatch.setitem(sys.modules, "hdf5plugin", None)
+    assert bsaxs_io._import_h5py() is h5py
+
+    single_h5 = tmp_path / "eiger_single.h5"
+    single_arr = np.arange(1 * 1 * 8 * 8, dtype=np.uint32).reshape(1, 1, 8, 8)
+    with h5py.File(single_h5, "w") as handle:
+        handle.create_dataset("entry/data/data", data=single_arr)
+
+    loaded_default = load_image(single_h5)
+    assert loaded_default.frame is None
+    np.testing.assert_array_equal(loaded_default.data, single_arr[0, 0])
+
+    loaded_zero = load_image(single_h5, frame=0)
+    assert loaded_zero.frame == 0
+    np.testing.assert_array_equal(loaded_zero.data, single_arr[0, 0])
+
+    with pytest.raises(FrameSelectionError, match="one image"):
+        load_image(single_h5, frame=1)
+
+    stack_h5 = tmp_path / "eiger_stack.h5"
+    stack_arr = np.arange(3 * 1 * 8 * 8, dtype=np.uint32).reshape(3, 1, 8, 8)
+    with h5py.File(stack_h5, "w") as handle:
+        handle.create_dataset("entry/data/data", data=stack_arr)
+
+    with pytest.raises(FrameSelectionError, match="explicit frame"):
+        load_image(stack_h5)
+    loaded_two = load_image(stack_h5, frame=2)
+    assert loaded_two.frame == 2
+    np.testing.assert_array_equal(loaded_two.data, stack_arr[2, 0])
+
+    bad_4d_h5 = tmp_path / "nonsingleton_4d.h5"
+    with h5py.File(bad_4d_h5, "w") as handle:
+        handle.create_dataset("entry/data/data", data=np.zeros((2, 3, 8, 8), dtype=np.float32))
+    with pytest.raises(DataShapeError, match="unsupported 4-D shape"):
+        load_image(bad_4d_h5, frame=0)

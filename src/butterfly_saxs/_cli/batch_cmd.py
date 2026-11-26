@@ -660,15 +660,21 @@ def _handle_batch_locked(
             lamellar_settings_path=args.report_lamellar_settings,
         )
         try:
+            report_kwargs: dict[str, Any] = {
+                "resume": report_resume,
+                "force": bool(args.force),
+                "radial_bins": args.report_radial_bins,
+                "angular_bins": args.report_angular_bins,
+                "formats": args.report_formats,
+                "dpi": args.report_dpi,
+                "lamellar_settings": lamellar_settings,
+            }
+            report_journal_style = getattr(args, "report_journal_style", None)
+            if report_journal_style not in (None, "default"):
+                report_kwargs["journal_style"] = report_journal_style
             report_result = cli_module()._build_analysis_report(
                 output_dir,
-                resume=report_resume,
-                force=bool(args.force),
-                radial_bins=args.report_radial_bins,
-                angular_bins=args.report_angular_bins,
-                formats=args.report_formats,
-                dpi=args.report_dpi,
-                lamellar_settings=lamellar_settings,
+                **report_kwargs,
             )
             status = report_result.get(
                 "status", report_result.get("operation_status", "completed")

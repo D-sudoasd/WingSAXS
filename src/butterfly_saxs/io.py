@@ -520,6 +520,15 @@ def _as_detector_plane(array: np.ndarray, *, source: Path, source_kind: str) -> 
     )
 
 
+def _is_singleton_channel_4d_shape(shape: Sequence[int]) -> bool:
+    return (
+        len(shape) == 4
+        and int(shape[1]) == 1
+        and int(shape[2]) >= 4
+        and int(shape[3]) >= 4
+    )
+
+
 def _select_frame(
     array: Any,
     *,
@@ -528,6 +537,14 @@ def _select_frame(
     source_kind: str,
 ) -> tuple[np.ndarray, int | None]:
     ary = _as_detector_plane(np.asarray(array), source=source, source_kind=source_kind)
+    if ary.ndim == 4:
+        shape = tuple(int(dim) for dim in ary.shape)
+        if not _is_singleton_channel_4d_shape(shape):
+            raise DataShapeError(
+                f"{source_kind} source {source} has unsupported 4-D shape {shape!r}; "
+                "expected singleton-channel (N, 1, H, W) intensity frames"
+            )
+        ary = ary[0, 0] if shape[0] == 1 else np.squeeze(ary, axis=1)
     if ary.ndim < 2:
         raise DataShapeError(
             f"selected object from {source} must be 2-D, got {ary.shape!r}"
@@ -909,6 +926,39 @@ def _read_hdf5_node_frame(
                 f"frame {index} from {source} is not a 2-D image: {selected.shape!r}"
             )
         return selected, index
+    if len(shape) == 4:
+        if not _is_singleton_channel_4d_shape(shape):
+            raise DataShapeError(
+                f"HDF5 source {source} has unsupported 4-D shape {shape!r}; "
+                "expected singleton-channel (N, 1, H, W) intensity frames"
+            )
+        if shape[0] == 1:
+            if frame is not None and int(frame) != 0:
+                raise FrameSelectionError(
+                    f"HDF5 source {source} contains one image; frame must be 0"
+                )
+            selected = np.asarray(node[0, 0])
+            if selected.ndim != 2:
+                raise DataShapeError(
+                    f"selected object from {source} must be 2-D, got {selected.shape!r}"
+                )
+            return selected, 0 if frame is not None else None
+        if frame is None:
+            raise FrameSelectionError(
+                f"HDF5 source {source} contains multiple dimensions/frames; "
+                "select an explicit frame=..."
+            )
+        index = int(frame)
+        if index >= shape[0]:
+            raise FrameSelectionError(
+                f"frame {index} is outside HDF5 source {source} with {shape[0]} frames"
+            )
+        selected = np.asarray(node[index, 0])
+        if selected.ndim != 2:
+            raise DataShapeError(
+                f"frame {index} from {source} is not a 2-D image: {selected.shape!r}"
+            )
+        return selected, index
     array = np.asarray(node[...])
     return _select_frame(array, frame=frame, source=source, source_kind="HDF5")
 
@@ -1007,6 +1057,20 @@ def _read_hdf5_uncertainty_from_handle(
     return np.array(unc, dtype=np.float64, copy=True), selected
 
 
+def _import_h5py() -> Any:
+    """Import ``h5py`` after registering ``hdf5plugin`` compression filters when available."""
+
+    try:
+        import hdf5plugin  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import h5py
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise DataIOError("HDF5 support requires h5py; install butterfly-saxs[hdf5]") from exc
+    return h5py
+
+
 def load_h5_uncertainty(
     path: str | Path,
     *,
@@ -1031,10 +1095,7 @@ def load_h5_uncertainty(
     if not isinstance(uncertainty_dataset, str):
         raise DatasetSelectionError("uncertainty_dataset must be a string path or 'auto'")
     shape_tuple = _validate_shape(expected_shape) if expected_shape is not None else None
-    try:
-        import h5py
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise DataIOError("HDF5 support requires h5py; install butterfly-saxs[hdf5]") from exc
+    h5py = _import_h5py()
     try:
         with h5py.File(source, "r") as handle:
             return _read_hdf5_uncertainty_from_handle(
@@ -1061,10 +1122,7 @@ def _read_hdf5(
 ) -> tuple[np.ndarray, dict[str, Any], int | None, str, np.ndarray | None, str | None]:
     if dataset is not None and not dataset:
         raise DatasetSelectionError("HDF5 dataset path cannot be empty")
-    try:
-        import h5py
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise DataIOError("HDF5 support requires h5py; install butterfly-saxs[hdf5]") from exc
+    h5py = _import_h5py()
     try:
         with h5py.File(source, "r") as handle:
             datasets: list[str]

@@ -285,13 +285,23 @@ def _detect_active_outer_q_cutoff(
     zero_frac = np.zeros(n_shells, dtype=np.float64)
     zero_frac[populated] = zero_counts[populated] / counts[populated]
 
-    # Walk inward from outermost populated shell while >90% pixels are exact zero
+    # Walk inward from outermost populated shell while >75% pixels are exact zero
+    # (allow up to 1 outermost sparse low-count corner shell if adjacent inner shell >0.85)
     last_active_pos = populated.size - 1
     dead_shells = 0
     dead_pixels = 0
+    if (
+        last_active_pos >= 1
+        and zero_frac[int(populated[last_active_pos])] <= 0.75
+        and zero_frac[int(populated[last_active_pos - 1])] > 0.85
+    ):
+        b_outer = int(populated[last_active_pos])
+        dead_shells += 1
+        dead_pixels += int(counts[b_outer])
+        last_active_pos -= 1
     while last_active_pos >= 0:
         b = int(populated[last_active_pos])
-        if zero_frac[b] > 0.90:
+        if zero_frac[b] > 0.75:
             dead_shells += 1
             dead_pixels += int(counts[b])
             last_active_pos -= 1
@@ -308,8 +318,12 @@ def _detect_active_outer_q_cutoff(
     if not np.any(zero_frac[inner_bins] < 0.50):
         return q_max_obs, False
 
-    # Step past any partial-zero transition shell immediately adjacent to the cliff
-    while last_active_pos > 3 and zero_frac[int(populated[last_active_pos])] > 0.20:
+    # Step past partial-zero transition shells immediately adjacent to the cliff,
+    # calibrated against the local interior plateau so low-count Poisson frames stay intact.
+    plateau_slice = populated[max(0, last_active_pos - 12) : last_active_pos]
+    inner_plateau_zf = float(np.median(zero_frac[plateau_slice])) if plateau_slice.size else 0.0
+    transition_zf_thresh = min(0.74, max(0.20, inner_plateau_zf + 0.12))
+    while last_active_pos > 3 and zero_frac[int(populated[last_active_pos])] > transition_zf_thresh:
         last_active_pos -= 1
 
     active_bin = int(populated[last_active_pos])
@@ -730,6 +744,15 @@ def _radial_profile_and_window(
         obs_starts = np.zeros(n_rbins, dtype=np.int64)
         obs_ends = np.zeros(n_rbins, dtype=np.int64)
 
+    bin_zero_frac = np.ones(n_rbins, dtype=np.float64)
+    if np.any(has_obs_bin):
+        zero_sums = np.bincount(
+            obs_idx,
+            weights=(obs_i == 0.0).astype(np.float64),
+            minlength=n_rbins,
+        )
+        bin_zero_frac[has_obs_bin] = zero_sums[has_obs_bin] / obs_counts_raw[has_obs_bin]
+
     # Estimate active outer diffuse background floor & noise from outermost 20% of active bins.
     # Use raw strided bin counts (obs_counts_raw) for sample-size thresholds and standard errors,
     # since radial_mean/p90 average obs_counts_raw pixels rather than obs_counts_raw * coarse_scale.
@@ -737,8 +760,15 @@ def _radial_profile_and_window(
     if valid_bins.size == 0:
         valid_bins = np.flatnonzero(np.isfinite(radial_med))
 
-    tail_count = max(2, int(math.ceil(0.20 * valid_bins.size)))
-    tail_bins = valid_bins[-tail_count:] if valid_bins.size else np.array([], dtype=np.int64)
+    cov_valid_bins = valid_bins[radial_cov[valid_bins] >= 0.20] if valid_bins.size else valid_bins
+    tail_pool = cov_valid_bins if cov_valid_bins.size >= 2 else valid_bins
+    if tail_pool.size >= 2 and np.any(bin_zero_frac[tail_pool] < 0.50):
+        nonzero_pool = tail_pool[bin_zero_frac[tail_pool] < 0.50]
+        if nonzero_pool.size >= max(2, int(math.ceil(0.35 * tail_pool.size))):
+            tail_pool = nonzero_pool
+
+    tail_count = max(2, int(math.ceil(0.20 * tail_pool.size)))
+    tail_bins = tail_pool[-tail_count:] if tail_pool.size else np.array([], dtype=np.int64)
     if tail_bins.size:
         if tail_bins.size == 1 or np.all(np.diff(tail_bins) == 1):
             tail_pixels = i_grouped[obs_starts[tail_bins[0]] : obs_ends[tail_bins[-1]]]
@@ -748,6 +778,14 @@ def _radial_profile_and_window(
         bg_mad = float(1.4826 * np.median(np.abs(tail_pixels - bg_level)))
         bg_p90 = float(np.median(radial_p90[tail_bins]))
         bg_aniso = float(np.median(radial_p90[tail_bins] - radial_p25[tail_bins]))
+        # Low-count 1 s Poisson frames can have >50% exact zeros/dark pixels in the active
+        # diffuse tail while still having a strictly positive mean photon count.
+        if abs(bg_level) <= 1e-12 and bg_p90 > 1e-9:
+            tail_mean_med = float(np.median(radial_mean[tail_bins]))
+            if np.isfinite(tail_mean_med) and tail_mean_med > 0.02 * bg_p90:
+                bg_level = tail_mean_med
+                if bg_mad <= 1e-12:
+                    bg_mad = float(np.std(tail_pixels))
     else:
         bg_level = float(np.median(i_vals))
         bg_mad = float(1.4826 * np.median(np.abs(i_vals - bg_level)))
