@@ -222,6 +222,8 @@ def _walk_arrays(
     if isinstance(value, Mapping):
         try:
             for key, item in value.items():
+                if key == "object" and (prefix == "qmap" or prefix.endswith("__qmap")):
+                    continue
                 _walk_arrays(item, f"{prefix}__{_safe_key(key)}", output, _active)
         finally:
             _active.remove(object_id)
