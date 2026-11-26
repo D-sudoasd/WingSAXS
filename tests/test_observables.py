@@ -544,3 +544,83 @@ def test_fit_branch_assignment_is_written_to_valid_measured_points_only():
     assert points[0].branch_id == 1
     assert points[1].branch_id is None
     assert points[2].branch_id == 0
+
+
+def test_wrap_distance_modular_equivalence_and_batched_radial_ridges_wraparound(monkeypatch):
+    import butterfly_saxs.observables as obs_mod
+    from butterfly_saxs._observables_angular import _wrap_distance
+    from butterfly_saxs._observables_ridges import (
+        _batched_radial_profiles,
+        _resolve_radial_profile,
+        measure_radial_profile,
+    )
+
+    test_angles = np.array([-np.pi, -np.pi + 1e-6, -0.4, 0.0, np.pi - 1e-6, np.pi, 2.75 * np.pi, np.nan])
+    for centre in (-np.pi, -0.7, 0.0, np.pi - 1e-4, np.pi):
+        got = _wrap_distance(test_angles, centre)
+        ref = np.abs(np.angle(np.exp(1j * (test_angles - float(centre)))))
+        np.testing.assert_allclose(got, ref, rtol=0.0, atol=1e-14, equal_nan=True)
+    scalar_got = _wrap_distance(0.25, -np.pi)
+    scalar_ref = np.abs(np.angle(np.exp(1j * (np.asarray(0.25) - float(-np.pi)))))
+    assert type(scalar_got) is type(scalar_ref)
+    assert np.shape(scalar_got) == np.shape(scalar_ref)
+    np.testing.assert_allclose(scalar_got, scalar_ref, rtol=0.0, atol=1e-14)
+    np.testing.assert_allclose(
+        _wrap_distance(np.pi, -np.pi),
+        np.abs(np.angle(np.exp(1j * (np.pi - (-np.pi))))),
+        rtol=0.0,
+        atol=1e-14,
+    )
+
+    axis = np.linspace(-1.0, 1.0, 65)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    chi = np.arctan2(qy, qx)
+    # Peak straddles both sides of -pi/+pi seam plus an oblique wing
+    img = 1.0 + 30.0 * np.exp(-0.5 * ((q - (0.55 + 0.08 * np.cos(2.0 * chi))) / 0.05) ** 2)
+    mask = np.zeros_like(img, dtype=bool)
+    mask[:10, 50:] = True
+    frame = SyntheticFrame(img, mask)
+    qmap = SyntheticQMap(qx, qy)
+
+    # Compare _batched_radial_profiles against measure_radial_profile across wraparound & wide sectors
+    probe_angles = np.array([-np.pi, -np.pi + 0.02, -0.1, 0.0, np.pi - 0.02, np.pi])
+    for sec_w in (np.deg2rad(12.0), 2.5 * np.pi):
+        batched = _batched_radial_profiles(
+            frame,
+            qmap,
+            probe_angles,
+            (0.20, 0.95),
+            q_range=None,
+            n_bins=48,
+            sector_width=sec_w,
+            mask=None,
+            q_unit="nm^-1",
+            cancel_event=None,
+            cancel_stage="test",
+        )
+        for ang, prof_b in zip(probe_angles, batched):
+            prof_ref = measure_radial_profile(
+                frame, qmap, float(ang), (0.20, 0.95), n_bins=48, sector_width=sec_w
+            )
+            np.testing.assert_array_equal(prof_b.counts, prof_ref.counts)
+            np.testing.assert_array_equal(prof_b.candidate_counts, prof_ref.candidate_counts)
+            np.testing.assert_allclose(prof_b.intensity, prof_ref.intensity, rtol=0.0, atol=1e-14, equal_nan=True)
+            np.testing.assert_allclose(prof_b.coverage, prof_ref.coverage, rtol=0.0, atol=1e-14, equal_nan=True)
+
+    # Verify measure_radial_ridges batched continuity path == fallback via measure_radial_profile
+    fast_track = measure_radial_ridges(frame, qmap, (0.20, 0.95), n_angles=24, n_bins=48)
+    calls = []
+    real_fn = measure_radial_profile
+
+    def spy_profile(*args, **kwargs):
+        calls.append(float(args[2]))
+        return real_fn(*args, **kwargs)
+
+    monkeypatch.setattr(obs_mod, "measure_radial_profile", spy_profile)
+    assert _resolve_radial_profile() is spy_profile
+    fallback_track = measure_radial_ridges(frame, qmap, (0.20, 0.95), n_angles=24, n_bins=48)
+    assert len(calls) == 24
+    np.testing.assert_array_equal(fast_track.valid, fallback_track.valid)
+    np.testing.assert_allclose(fast_track.q, fallback_track.q, rtol=0.0, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(fast_track.coverage, fallback_track.coverage, rtol=0.0, atol=1e-12, equal_nan=True)

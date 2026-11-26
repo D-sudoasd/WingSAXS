@@ -36,8 +36,13 @@ class EllipseGeometry:
     theta: float = 0.0
 
     def __post_init__(self) -> None:
-        values = (self.cx, self.cy, self.a, self.axis_ratio, self.theta)
-        if not all(np.isfinite(values)):
+        if not (
+            math.isfinite(self.cx)
+            and math.isfinite(self.cy)
+            and math.isfinite(self.a)
+            and math.isfinite(self.axis_ratio)
+            and math.isfinite(self.theta)
+        ):
             raise ValueError("ellipse geometry must be finite")
         if self.a <= 0:
             raise ValueError("a must be greater than zero")
@@ -365,6 +370,49 @@ def ellipse_implicit(points: Any, parameters: Any) -> np.ndarray:
     return (u / geometry.a) ** 2 + (v / geometry.b) ** 2 - 1.0
 
 
+_TINY_FLOAT = float(np.finfo(float).tiny)
+
+
+def _sampson_residuals_xy(
+    px: np.ndarray,
+    py: np.ndarray,
+    cx: float,
+    cy: float,
+    a: float,
+    b: float,
+    theta: float,
+) -> np.ndarray:
+    """Fast-path Sampson residuals from pre-split point coordinates and validated scalars."""
+
+    dx = px - cx
+    dy = py - cy
+    c = math.cos(theta)
+    s = math.sin(theta)
+    u = c * dx + s * dy
+    v = -s * dx + c * dy
+    aa = a * a
+    bb = b * b
+    f = u * u / aa + v * v / bb - 1.0
+    gx = 2.0 * (u * c / aa - v * s / bb)
+    gy = 2.0 * (u * s / aa + v * c / bb)
+    denominator = np.maximum(np.hypot(gx, gy), _TINY_FLOAT)
+    return f / denominator
+
+
+def _sampson_residuals_fast(points: np.ndarray, geometry: EllipseGeometry) -> np.ndarray:
+    """Fast-path Sampson residuals for already-validated points and geometry."""
+
+    return _sampson_residuals_xy(
+        points[:, 0],
+        points[:, 1],
+        geometry.cx,
+        geometry.cy,
+        geometry.a,
+        geometry.a * geometry.axis_ratio,
+        geometry.theta,
+    )
+
+
 def ellipse_sampson_residuals(points: Any, parameters: Any, *, weights: Any = None) -> np.ndarray:
     """Signed q-space Sampson distance to an ellipse.
 
@@ -375,17 +423,7 @@ def ellipse_sampson_residuals(points: Any, parameters: Any, *, weights: Any = No
 
     points = _coerce_points(points)
     geometry = _geometry(parameters)
-    dx = points[:, 0] - geometry.cx
-    dy = points[:, 1] - geometry.cy
-    c, s = math.cos(geometry.theta), math.sin(geometry.theta)
-    u = c * dx + s * dy
-    v = -s * dx + c * dy
-    aa, bb = geometry.a * geometry.a, geometry.b * geometry.b
-    f = u * u / aa + v * v / bb - 1.0
-    gx = 2.0 * (u * c / aa - v * s / bb)
-    gy = 2.0 * (u * s / aa + v * c / bb)
-    denominator = np.maximum(np.hypot(gx, gy), np.finfo(float).tiny)
-    result = f / denominator
+    result = _sampson_residuals_fast(points, geometry)
     if weights is not None:
         result = result * np.sqrt(_coerce_weights(weights, points.shape[0]))
     return result
@@ -634,6 +672,20 @@ def _closest_ellipse_distances(u: Any, v: Any, a: float, b: float) -> np.ndarray
     return result.reshape(original_shape)
 
 
+def _geometric_residuals_fast(points: np.ndarray, geometry: EllipseGeometry) -> np.ndarray:
+    """Fast-path exact closest-point residuals for validated points and geometry."""
+
+    dx = points[:, 0] - geometry.cx
+    dy = points[:, 1] - geometry.cy
+    c, s = math.cos(geometry.theta), math.sin(geometry.theta)
+    u = c * dx + s * dy
+    v = -s * dx + c * dy
+    a, b = geometry.a, geometry.b
+    distance = _closest_ellipse_distances(u, v, a, b)
+    implicit = (u / a) ** 2 + (v / b) ** 2 - 1.0
+    return np.copysign(distance, implicit)
+
+
 def ellipse_geometric_residuals(points: Any, parameters: Any, *, weights: Any = None,
                                  max_iter: int = 32) -> np.ndarray:
     """Signed true closest-point distance to an ellipse.
@@ -647,15 +699,7 @@ def ellipse_geometric_residuals(points: Any, parameters: Any, *, weights: Any = 
     del max_iter
     points = _coerce_points(points)
     geometry = _geometry(parameters)
-    dx = points[:, 0] - geometry.cx
-    dy = points[:, 1] - geometry.cy
-    c, s = math.cos(geometry.theta), math.sin(geometry.theta)
-    u = c * dx + s * dy
-    v = -s * dx + c * dy
-    a, b = geometry.a, geometry.b
-    distance = _closest_ellipse_distances(u, v, a, b)
-    implicit = ellipse_implicit(points, geometry)
-    result = np.copysign(distance, implicit)
+    result = _geometric_residuals_fast(points, geometry)
     if weights is not None:
         result = result * np.sqrt(_coerce_weights(weights, points.shape[0]))
     return result
@@ -783,6 +827,15 @@ def _make_parameter_set(points: np.ndarray, parameters: Any) -> ParameterSet:
         b_spec = b_spec.copy(expr="a*axis_ratio", vary=False, name="b")
     raw["b"] = b_spec
     return ParameterSet(raw)
+
+
+def _fast_residual_function(kind: str) -> Callable[[np.ndarray, EllipseGeometry], np.ndarray]:
+    kind = str(kind).lower()
+    if kind in {"sampson", "sampson_distance"}:
+        return _sampson_residuals_fast
+    if kind in {"geometric", "distance", "closest"}:
+        return _geometric_residuals_fast
+    raise ValueError("residual must be 'sampson' or 'geometric'")
 
 
 def _residual_function(kind: str) -> Callable[..., np.ndarray]:
@@ -1102,13 +1155,25 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
                 x0[index] = np.nextafter(hi, lo if np.isfinite(lo) else -np.inf)
             if np.isfinite(lo) and np.isfinite(hi) and not lo < hi:
                 raise ValueError("free parameter bounds must have min < max")
+        scratch = parameters._fast_copy()
+        scratch_specs = tuple(scratch._parameters[name] for name in free_names)
+        ratio_flags = tuple(name in {"axis_ratio", "ratio"} for name in free_names)
+
         def residual_at(vector: np.ndarray) -> np.ndarray:
             raise_if_cancelled(cancel_event, f"ellipse:{model}:residual")
-            candidate = parameters.copy()
             clipped = np.clip(np.asarray(vector, dtype=float), lower, upper)
             try:
-                candidate.set_free_vector(clipped)
-                return np.asarray(objective(candidate), dtype=float)
+                for spec, is_ratio, val in zip(scratch_specs, ratio_flags, clipped.tolist()):
+                    if not math.isfinite(val):
+                        raise ValueError("value must be finite")
+                    if spec.min is not None and val < spec.min:
+                        raise ValueError(f"value {val} is below min {spec.min}")
+                    if spec.max is not None and val > spec.max:
+                        raise ValueError(f"value {val} exceeds max {spec.max}")
+                    if is_ratio and not (0.0 < val <= 1.0):
+                        raise ValueError("axis_ratio must be in (0, 1]")
+                    spec.value = val
+                return np.asarray(objective(scratch), dtype=float)
             except (ValueError, FloatingPointError, OverflowError):
                 # Physical constraints expressed through a tied expression can
                 # be tighter than scipy's direct bounds.  A finite penalty
@@ -1142,7 +1207,7 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
             max_nfev=max_nfev,
         )
         raise_if_cancelled(cancel_event, f"ellipse:{model}:complete")
-        fitted = parameters.copy().set_free_vector(np.clip(np.asarray(result.x, dtype=float), lower, upper))
+        fitted = parameters._fast_copy().set_free_vector(np.clip(np.asarray(result.x, dtype=float), lower, upper))
         try:
             residuals = np.asarray(objective(fitted), dtype=float)
         except (ValueError, FloatingPointError, OverflowError):
@@ -1197,11 +1262,12 @@ def fit_ellipse(points: Any, parameters: ParameterSet | Mapping[str, Any] | None
     if residual_kind is not None:
         residual = residual_kind
     points = _coerce_points(points)
-    weights = _coerce_weights(weights, points.shape[0])
+    sqrt_weights = None if weights is None else np.sqrt(_coerce_weights(weights, points.shape[0]))
     parameter_set = _make_parameter_set(points, parameters if parameters is not None else params)
-    residual_function = _residual_function(residual)
+    fast_residual_function = _fast_residual_function(residual)
     def objective(candidate: Mapping[str, float]) -> np.ndarray:
-        return residual_function(points, candidate, weights=weights)
+        values = fast_residual_function(points, _geometry(candidate))
+        return values * sqrt_weights if sqrt_weights is not None else values
     return _run_fit(points, parameter_set, objective, loss=loss, f_scale=f_scale, max_nfev=max_nfev,
                     model="ellipse", components=1, labels=None,
                     residual=residual,
@@ -1219,6 +1285,30 @@ def _coerce_labels(labels: Any, n: int) -> np.ndarray | None:
     return result.astype(int)
 
 
+def _symmetric_residuals_fast(
+    points: np.ndarray,
+    geometry: EllipseGeometry,
+    *,
+    reference: float,
+    fast_residual_function: Callable[[np.ndarray, EllipseGeometry], np.ndarray],
+    labels: np.ndarray | None,
+    sqrt_weights: np.ndarray | None,
+) -> np.ndarray:
+    positive = EllipseGeometry(
+        geometry.cx, geometry.cy, geometry.a, geometry.axis_ratio, reference + geometry.theta
+    )
+    negative = EllipseGeometry(
+        geometry.cx, geometry.cy, geometry.a, geometry.axis_ratio, reference - geometry.theta
+    )
+    r_positive = fast_residual_function(points, positive)
+    r_negative = fast_residual_function(points, negative)
+    if labels is None:
+        result = np.where(np.abs(r_positive) <= np.abs(r_negative), r_positive, r_negative)
+    else:
+        result = np.where(labels == 0, r_positive, r_negative)
+    return result * sqrt_weights if sqrt_weights is not None else result
+
+
 def symmetric_ellipse_residuals(points: Any, parameters: Any, *, residual: ResidualKind = "sampson",
                                  labels: Any = None, weights: Any = None,
                                  reference_axis_deg: float = 0.0,
@@ -1227,23 +1317,17 @@ def symmetric_ellipse_residuals(points: Any, parameters: Any, *, residual: Resid
 
     points = _coerce_points(points)
     labels = _coerce_labels(labels, points.shape[0])
-    weights_array = _coerce_weights(weights, points.shape[0])
+    sqrt_weights = None if weights is None else np.sqrt(_coerce_weights(weights, points.shape[0]))
     geometry = _geometry(parameters)
     reference = math.radians(float(reference_axis_deg)) if reference_axis is None else float(reference_axis)
-    positive = EllipseGeometry(
-        geometry.cx, geometry.cy, geometry.a, geometry.axis_ratio, reference + geometry.theta
+    return _symmetric_residuals_fast(
+        points,
+        geometry,
+        reference=reference,
+        fast_residual_function=_fast_residual_function(residual),
+        labels=labels,
+        sqrt_weights=sqrt_weights,
     )
-    negative = EllipseGeometry(
-        geometry.cx, geometry.cy, geometry.a, geometry.axis_ratio, reference - geometry.theta
-    )
-    residual_function = _residual_function(residual)
-    r_positive = residual_function(points, positive)
-    r_negative = residual_function(points, negative)
-    if labels is None:
-        result = np.where(np.abs(r_positive) <= np.abs(r_negative), r_positive, r_negative)
-    else:
-        result = np.where(labels == 0, r_positive, r_negative)
-    return result * np.sqrt(weights_array)
 
 
 double_ellipse_residuals = symmetric_ellipse_residuals
@@ -1362,7 +1446,11 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
         residual = residual_kind
     points = _coerce_points(points)
     labels = _coerce_labels(labels, points.shape[0])
-    weights = _coerce_weights(weights, points.shape[0])
+    sqrt_weights = None if weights is None else np.sqrt(_coerce_weights(weights, points.shape[0]))
+    fast_residual_function = _fast_residual_function(residual)
+    is_sampson = fast_residual_function is _sampson_residuals_fast
+    px = np.ascontiguousarray(points[:, 0], dtype=float)
+    py = np.ascontiguousarray(points[:, 1], dtype=float)
     source_parameters = parameters if parameters is not None else params
     parameter_set = _make_parameter_set(points, source_parameters)
     reference = math.radians(float(reference_axis_deg)) if reference_axis is None else float(reference_axis)
@@ -1395,13 +1483,40 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
             name="theta",
         )
     def objective(candidate: Mapping[str, float]) -> np.ndarray:
-        return symmetric_ellipse_residuals(
+        if is_sampson:
+            vals = candidate.resolve() if isinstance(candidate, ParameterSet) else _values_from_parameters(candidate)
+            cx = float(vals["cx"])
+            cy = float(vals["cy"])
+            a = float(vals["a"])
+            ratio = float(vals["axis_ratio"])
+            theta = float(vals["theta"])
+            if not (
+                math.isfinite(cx)
+                and math.isfinite(cy)
+                and math.isfinite(a)
+                and math.isfinite(ratio)
+                and math.isfinite(theta)
+            ):
+                raise ValueError("ellipse geometry must be finite")
+            if a <= 0.0:
+                raise ValueError("a must be greater than zero")
+            if not 0.0 < ratio <= 1.0:
+                raise ValueError("axis_ratio must be in (0, 1]")
+            b = a * ratio
+            r_positive = _sampson_residuals_xy(px, py, cx, cy, a, b, reference + theta)
+            r_negative = _sampson_residuals_xy(px, py, cx, cy, a, b, reference - theta)
+            if labels is None:
+                res = np.where(np.abs(r_positive) <= np.abs(r_negative), r_positive, r_negative)
+            else:
+                res = np.where(labels == 0, r_positive, r_negative)
+            return res * sqrt_weights if sqrt_weights is not None else res
+        return _symmetric_residuals_fast(
             points,
-            candidate,
-            residual=residual,
+            _geometry(candidate),
+            reference=reference,
+            fast_residual_function=fast_residual_function,
             labels=labels,
-            weights=weights,
-            reference_axis=reference,
+            sqrt_weights=sqrt_weights,
         )
     multistart_count = _validate_multistart_count(multistart)
     starts = _multistart_parameter_sets(parameter_set, multistart_count)

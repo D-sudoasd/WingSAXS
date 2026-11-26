@@ -213,7 +213,11 @@ def _supported_angular_noise(
 
 
 def _wrap_distance(angle: np.ndarray | float, centre: float) -> np.ndarray:
-    return np.abs(np.angle(np.exp(1j * (np.asarray(angle) - float(centre)))))
+    delta = (
+        np.remainder(np.asarray(angle, dtype=float) - float(centre) + np.pi, 2.0 * np.pi)
+        - np.pi
+    )
+    return np.abs(delta)
 
 
 def _quadratic_peak(x: np.ndarray, y: np.ndarray, index: int, period: float | None = None) -> tuple[float, float]:

@@ -1634,6 +1634,148 @@ def _azimuthal_peak_ridges(
 
 
 
+def _batched_radial_profiles(
+    frame: Any,
+    qmap: Any,
+    angle_array: np.ndarray,
+    q_window: Any,
+    *,
+    q_range: Any,
+    n_bins: int,
+    sector_width: float,
+    mask: Any,
+    q_unit: str,
+    cancel_event: Any,
+    cancel_stage: str,
+) -> list[RadialProfile]:
+    """Compute uniform/arbitrary-sector radial profiles in a single map pass."""
+
+    n = int(n_bins)
+    if n < 8:
+        raise ValueError("n_bins must be at least 8")
+    values, q, phi, valid = _extract_maps(frame, qmap, mask)
+    q_min, q_max = _q_limits(q, q_window, q_range)
+    edges = np.linspace(q_min, q_max, n + 1)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+
+    in_q = np.isfinite(values) & np.isfinite(q) & np.isfinite(phi) & (q >= q_min) & (q <= q_max)
+    q_in = q[in_q]
+    phi_in = phi[in_q]
+    val_in = values[in_q]
+    valid_in = valid[in_q]
+    bin_in = np.clip(np.digitize(q_in, edges, right=False) - 1, 0, n - 1)
+
+    order = np.argsort(phi_in)
+    phi_s = phi_in[order]
+    val_s = val_in[order]
+    valid_s = valid_in[order]
+    bin_s = bin_in[order]
+    total_n = int(phi_s.size)
+
+    half_width = float(sector_width) / 2.0
+    flags = _flags_with_q_unit(APPARENT_FLAGS, q_unit)
+    eps = 1.0e-12
+    full_circle_cand: np.ndarray | None = None
+    full_circle_prof: np.ndarray | None = None
+    full_circle_cnt: np.ndarray | None = None
+    full_circle_cov: np.ndarray | None = None
+
+    profiles: list[RadialProfile] = []
+    for raw_angle in angle_array:
+        raise_if_cancelled(cancel_event, cancel_stage)
+        angle_f = float(raw_angle)
+        if half_width < 0.0 or total_n == 0:
+            candidate_counts = np.zeros(n, dtype=int)
+            counts = np.zeros(n, dtype=int)
+            profile = np.full(n, np.nan, dtype=float)
+            coverage = np.zeros(n, dtype=float)
+        elif half_width >= np.pi - 2.0 * eps:
+            if full_circle_prof is None:
+                cand_full = np.bincount(bin_s, minlength=n).astype(int)
+                sel_full = bin_s[valid_s]
+                val_full = val_s[valid_s]
+                cnt_full = np.bincount(sel_full, minlength=n).astype(int)
+                sum_full = np.bincount(sel_full, weights=val_full, minlength=n).astype(float)
+                prof_full = np.full(n, np.nan, dtype=float)
+                np.divide(sum_full, cnt_full, out=prof_full, where=cnt_full > 0)
+                cov_full = np.divide(
+                    cnt_full, cand_full, out=np.zeros_like(prof_full), where=cand_full > 0
+                )
+                full_circle_cand = cand_full
+                full_circle_cnt = cnt_full
+                full_circle_prof = prof_full
+                full_circle_cov = cov_full
+            assert full_circle_cand is not None
+            assert full_circle_cnt is not None
+            assert full_circle_prof is not None
+            assert full_circle_cov is not None
+            candidate_counts = full_circle_cand.copy()
+            counts = full_circle_cnt.copy()
+            profile = full_circle_prof.copy()
+            coverage = full_circle_cov.copy()
+        else:
+            centre = ((angle_f + np.pi) % (2.0 * np.pi)) - np.pi
+            lo = centre - half_width - eps
+            hi = centre + half_width + eps
+            if lo < -np.pi:
+                s1_end = int(np.searchsorted(phi_s, hi, side="right"))
+                s2_start = int(np.searchsorted(phi_s, lo + 2.0 * np.pi, side="left"))
+                if s1_end >= s2_start:
+                    slices: tuple[tuple[int, int], ...] = ((0, total_n),)
+                else:
+                    slices = ((0, s1_end), (s2_start, total_n))
+            elif hi >= np.pi:
+                s1_start = int(np.searchsorted(phi_s, lo, side="left"))
+                s2_end = int(np.searchsorted(phi_s, hi - 2.0 * np.pi, side="right"))
+                if s2_end >= s1_start:
+                    slices = ((0, total_n),)
+                else:
+                    slices = ((0, s2_end), (s1_start, total_n))
+            else:
+                s_start = int(np.searchsorted(phi_s, lo, side="left"))
+                s_end = int(np.searchsorted(phi_s, hi, side="right"))
+                slices = ((s_start, s_end),)
+
+            candidate_counts = np.zeros(n, dtype=int)
+            counts = np.zeros(n, dtype=int)
+            sums = np.zeros(n, dtype=float)
+            for start, stop in slices:
+                if stop <= start:
+                    continue
+                phi_sl = phi_s[start:stop]
+                in_sec = _wrap_distance(phi_sl, angle_f) <= half_width
+                if not np.any(in_sec):
+                    continue
+                bin_sl = bin_s[start:stop]
+                candidate_counts += np.bincount(bin_sl[in_sec], minlength=n).astype(int)
+                sel_mask = in_sec & valid_s[start:stop]
+                if np.any(sel_mask):
+                    sel_bins = bin_sl[sel_mask]
+                    sel_vals = val_s[start:stop][sel_mask]
+                    counts += np.bincount(sel_bins, minlength=n).astype(int)
+                    sums += np.bincount(sel_bins, weights=sel_vals, minlength=n).astype(float)
+            profile = np.full(n, np.nan, dtype=float)
+            np.divide(sums, counts, out=profile, where=counts > 0)
+            coverage = np.divide(
+                counts, candidate_counts, out=np.zeros_like(profile), where=candidate_counts > 0
+            )
+        profiles.append(
+            RadialProfile(
+                angle=angle_f,
+                q=centres,
+                intensity=profile,
+                counts=counts,
+                candidate_counts=candidate_counts,
+                coverage=coverage,
+                q_min=q_min,
+                q_max=q_max,
+                flags=flags,
+                q_unit=q_unit,
+            )
+        )
+    return profiles
+
+
 def measure_radial_ridges(
     frame: Any,
     qmap: Any,
@@ -1769,19 +1911,34 @@ def measure_radial_ridges(
     profile_fn = _resolve_radial_profile()
     points: list[RidgePoint]
     if continuity_mode:
-        profiles: list[RadialProfile] = []
-        for angle in angle_array:
-            raise_if_cancelled(cancel_event, "ridges:continuity-sector")
-            profiles.append(profile_fn(
+        if profile_fn is measure_radial_profile:
+            profiles = _batched_radial_profiles(
                 frame,
                 qmap,
-                float(angle),
+                angle_array,
                 q_window,
                 q_range=q_range,
                 n_bins=n_bins,
-                sector_width=sector_width,
+                sector_width=float(sector_width),
                 mask=mask,
-            ))
+                q_unit=q_unit,
+                cancel_event=cancel_event,
+                cancel_stage="ridges:continuity-sector",
+            )
+        else:
+            profiles = []
+            for angle in angle_array:
+                raise_if_cancelled(cancel_event, "ridges:continuity-sector")
+                profiles.append(profile_fn(
+                    frame,
+                    qmap,
+                    float(angle),
+                    q_window,
+                    q_range=q_range,
+                    n_bins=n_bins,
+                    sector_width=sector_width,
+                    mask=mask,
+                ))
         raise_if_cancelled(cancel_event, "ridges:continuity-noise")
         noise_floor = _radial_noise_floor(
             frame,
@@ -1797,6 +1954,28 @@ def measure_radial_ridges(
             min_coverage=ridge_min_coverage,
         )
         raise_if_cancelled(cancel_event, "ridges:continuity-complete")
+    elif not curvature_mode and profile_fn is measure_radial_profile:
+        batched_profiles = _batched_radial_profiles(
+            frame,
+            qmap,
+            angle_array,
+            q_window,
+            q_range=q_range,
+            n_bins=n_bins,
+            sector_width=float(sector_width),
+            mask=mask,
+            q_unit=q_unit,
+            cancel_event=cancel_event,
+            cancel_stage="ridges:sector",
+        )
+        points = [
+            _radial_peak(
+                radial,
+                snr_threshold=snr_threshold,
+                min_coverage=ridge_min_coverage,
+            )
+            for radial in batched_profiles
+        ]
     else:
         points = []
         for angle in angle_array:

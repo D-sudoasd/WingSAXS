@@ -10,6 +10,7 @@ cannot execute arbitrary code.
 from __future__ import annotations
 
 import ast
+from functools import lru_cache
 import math
 import operator
 import re
@@ -74,23 +75,102 @@ def _validate_identifier(name: str) -> str:
     return name
 
 
+@lru_cache(maxsize=512)
+def _parse_expression_tree(expr: str) -> ast.Expression:
+    try:
+        return ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"invalid parameter expression {expr!r}: {exc.msg}") from exc
+
+
 def _expression_tree(expr: str) -> ast.Expression:
     if not isinstance(expr, str) or not expr.strip():
         raise ValueError("expr must be a non-empty string")
-    try:
-        tree = ast.parse(expr, mode="eval")
-    except SyntaxError as exc:
-        raise ValueError(f"invalid parameter expression {expr!r}: {exc.msg}") from exc
-    return tree
+    return _parse_expression_tree(expr)
 
 
-def _expression_names(expr: str) -> set[str]:
+@lru_cache(maxsize=512)
+def _expression_names_cached(expr: str) -> frozenset[str]:
     tree = _expression_tree(expr)
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             names.add(node.id)
-    return names - set(_CONSTANTS) - set(_FUNCTIONS)
+    return frozenset(names - set(_CONSTANTS) - set(_FUNCTIONS))
+
+
+def _expression_names(expr: str) -> set[str]:
+    return set(_expression_names_cached(expr))
+
+
+@lru_cache(maxsize=512)
+def _compiled_evaluator(expr: str):
+    """Compile a validated parameter expression AST into a reusable pure-Python evaluator."""
+
+    tree = _expression_tree(expr)
+
+    def _compile(node: ast.AST):
+        if isinstance(node, ast.Expression):
+            return _compile(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (bool, np.bool_)) or not isinstance(node.value, Real):
+                raise ValueError("parameter expressions only support numeric constants")
+            const_val = _as_finite_float(node.value, "expression constant")
+            return lambda _values, val=const_val: val
+        if isinstance(node, ast.Name):
+            ident = node.id
+            has_const = ident in _CONSTANTS
+            const_fallback = _CONSTANTS.get(ident, 0.0)
+
+            def _eval_name(values: Mapping[str, float], _id: str = ident, _hc: bool = has_const, _cf: float = const_fallback) -> float:
+                if _id in values:
+                    return float(values[_id])
+                if _hc:
+                    return _cf
+                raise ValueError(f"unknown variable in parameter expression: {_id}")
+
+            return _eval_name
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARYOPS:
+            op_fn = _UNARYOPS[type(node.op)]
+            operand_fn = _compile(node.operand)
+            return lambda values, _op=op_fn, _fn=operand_fn: float(_op(_fn(values)))
+        if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+            op_fn = _BINOPS[type(node.op)]
+            left_fn = _compile(node.left)
+            right_fn = _compile(node.right)
+
+            def _eval_binop(values: Mapping[str, float], _op=op_fn, _l=left_fn, _r=right_fn) -> float:
+                left = _l(values)
+                right = _r(values)
+                try:
+                    res = _op(left, right)
+                except (ArithmeticError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"could not evaluate parameter expression: {exc}") from exc
+                if type(res) is float and math.isfinite(res):
+                    return res
+                return _as_finite_float(res, "expression result")
+
+            return _eval_binop
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _FUNCTIONS:
+            if node.keywords:
+                raise ValueError("keyword arguments are not allowed in parameter expressions")
+            fn_obj = _FUNCTIONS[node.func.id]
+            arg_fns = tuple(_compile(arg) for arg in node.args)
+
+            def _eval_call(values: Mapping[str, float], _fn=fn_obj, _args=arg_fns) -> float:
+                args = [af(values) for af in _args]
+                try:
+                    res = _fn(*args)
+                except (ArithmeticError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"could not evaluate parameter expression: {exc}") from exc
+                if type(res) is float and math.isfinite(res):
+                    return res
+                return _as_finite_float(res, "expression result")
+
+            return _eval_call
+        raise ValueError(f"unsupported syntax in parameter expression: {ast.dump(node, include_attributes=False)}")
+
+    return _compile(tree)
 
 
 def _evaluate_tree(node: ast.AST, values: Mapping[str, float]) -> float:
@@ -244,6 +324,8 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
 
     def __init__(self, parameters: Mapping[str, Any] | "ParameterSet" | None = None, **kwargs: Any) -> None:
         self._parameters: dict[str, ParameterSpec] = {}
+        self._topo_cache_key: tuple[tuple[str, str | None], ...] | None = None
+        self._topo_cache_order: tuple[str, ...] | None = None
         self._suspend_checks = True
         try:
             if parameters is not None:
@@ -341,6 +423,27 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
     def copy(self) -> "ParameterSet":
         return ParameterSet(self)
 
+    def _fast_copy(self) -> "ParameterSet":
+        """Clone validated specs without repeating regex, AST, or dependency checks."""
+
+        clone = object.__new__(ParameterSet)
+        params: dict[str, ParameterSpec] = {}
+        spec_new = object.__new__
+        for name, spec in self._parameters.items():
+            dup = spec_new(ParameterSpec)
+            dup.value = spec.value
+            dup.min = spec.min
+            dup.max = spec.max
+            dup.vary = spec.vary
+            dup.expr = spec.expr
+            dup.name = spec.name
+            params[name] = dup
+        clone._parameters = params
+        clone._suspend_checks = False
+        clone._topo_cache_key = getattr(self, "_topo_cache_key", None)
+        clone._topo_cache_order = getattr(self, "_topo_cache_order", None)
+        return clone
+
     @property
     def names(self) -> tuple[str, ...]:
         return tuple(self._parameters)
@@ -365,15 +468,18 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
         graph: dict[str, frozenset[str]] = {}
         available = set(self._parameters)
         for name, spec in self._parameters.items():
-            deps = _expression_names(spec.expr) if spec.expr is not None else set()
+            deps = _expression_names_cached(spec.expr) if spec.expr is not None else frozenset()
             unknown = deps - available
             if unknown:
                 unknown_text = ", ".join(sorted(unknown))
                 raise ValueError(f"parameter {name!r} references unknown variable(s): {unknown_text}")
-            graph[name] = frozenset(deps)
+            graph[name] = deps
         return graph
 
     def topological_order(self) -> tuple[str, ...]:
+        key = tuple((name, spec.expr) for name, spec in self._parameters.items())
+        if getattr(self, "_topo_cache_key", None) == key and getattr(self, "_topo_cache_order", None) is not None:
+            return self._topo_cache_order  # type: ignore[return-value]
         graph = self.dependency_graph()
         state: dict[str, int] = {}
         order: list[str] = []
@@ -397,7 +503,10 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
 
         for name in self._parameters:
             visit(name)
-        return tuple(order)
+        order_tuple = tuple(order)
+        self._topo_cache_key = key
+        self._topo_cache_order = order_tuple
+        return order_tuple
 
     def _check_dependencies(self) -> None:
         # Empty sets are valid and useful while a UI builds a configuration.
@@ -406,16 +515,22 @@ class ParameterSet(MutableMapping[str, ParameterSpec]):
 
     def resolve(self, *, check_bounds: bool = True) -> dict[str, float]:
         values: dict[str, float] = {}
+        params = self._parameters
         for name in self.topological_order():
-            spec = self._parameters[name]
+            spec = params[name]
             if spec.expr is None:
                 value = spec.value
             else:
-                tree = _expression_tree(spec.expr)
-                value = _evaluate_tree(tree, values)
-            value = _as_finite_float(value, f"resolved value for {name}")
+                value = _compiled_evaluator(spec.expr)(values)
+            if type(value) is not float or not math.isfinite(value):
+                value = _as_finite_float(value, f"resolved value for {name}")
             if check_bounds:
-                spec._validate_value(value)
+                spec_min = spec.min
+                spec_max = spec.max
+                if spec_min is not None and value < spec_min:
+                    raise ValueError(f"value {value} is below min {spec_min}")
+                if spec_max is not None and value > spec_max:
+                    raise ValueError(f"value {value} exceeds max {spec_max}")
                 if name in {"axis_ratio", "ratio"} and not (0 < value <= 1):
                     raise ValueError("axis_ratio must be in (0, 1]")
             values[name] = value

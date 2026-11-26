@@ -153,3 +153,48 @@ def test_grubb_ellipticity_is_eccentricity_not_one_minus_axis_ratio() -> None:
     geometry = EllipseGeometry(cx=0.0, cy=0.0, a=2.0, axis_ratio=0.5, theta=0.0)
     assert geometry.eccentricity == pytest.approx(np.sqrt(0.75))
     assert geometry.ellipticity == pytest.approx(geometry.eccentricity)
+
+
+def test_fit_ellipse_and_symmetric_fast_residuals_equivalence_with_weights_and_labels() -> None:
+    from butterfly_saxs.ellipse import (
+        ellipse_geometric_residuals,
+        ellipse_sampson_residuals,
+        fit_ellipse,
+        symmetric_ellipse_residuals,
+    )
+
+    truth = default_ellipse_parameters(center=(0.05, -0.04), a=1.5, axis_ratio=0.45, theta=0.32)
+    phi = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
+    plus, minus = symmetric_ellipse_points(truth, phi)
+    weights = np.linspace(0.8, 1.5, plus.shape[0])
+
+    for residual_kind, pub_fn in (
+        ("sampson", ellipse_sampson_residuals),
+        ("geometric", ellipse_geometric_residuals),
+    ):
+        fit_single = fit_ellipse(plus, residual=residual_kind, weights=weights, max_nfev=400)
+        assert fit_single.success
+        ref_res = pub_fn(plus, fit_single.parameters, weights=weights)
+        np.testing.assert_allclose(fit_single.residuals, ref_res, rtol=0.0, atol=1e-12)
+
+    pts_sym = np.vstack((plus, minus))
+    labels = np.r_[np.zeros(plus.shape[0], dtype=int), np.ones(minus.shape[0], dtype=int)]
+    weights_sym = np.linspace(0.7, 1.4, pts_sym.shape[0])
+    for residual_kind in ("sampson", "geometric"):
+        fit_sym = fit_symmetric_ellipses(
+            pts_sym,
+            labels=labels,
+            weights=weights_sym,
+            residual=residual_kind,
+            multistart=2,
+            max_nfev=400,
+        )
+        assert fit_sym.success
+        ref_sym = symmetric_ellipse_residuals(
+            pts_sym,
+            fit_sym.parameters,
+            residual=residual_kind,
+            labels=labels,
+            weights=weights_sym,
+        )
+        np.testing.assert_allclose(fit_sym.residuals, ref_sym, rtol=0.0, atol=1e-12)
