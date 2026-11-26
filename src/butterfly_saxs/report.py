@@ -10,6 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 import csv
+import gc
 import hashlib
 import html
 import json
@@ -146,6 +147,153 @@ def _get_array(archive: Any, keys: Mapping[str, str], *names: str) -> np.ndarray
         if name in keys:
             return np.asarray(archive[keys[name]])
     return None
+
+
+_COORD_CACHE_MAX_ENTRIES = 4
+_CACHE_MISS = object()
+
+
+def _first_present_member(keys: Mapping[str, str], *names: str) -> str | None:
+    for name in names:
+        if name in keys:
+            return keys[name]
+    return None
+
+
+def _resolve_coord_member_names(
+    keys: Mapping[str, str],
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve ``(qx, qy, mask)`` archive member keys in exact ``_coordinates`` priority."""
+    return (
+        _first_present_member(keys, "qmap__qx", "qmap__qx_nm_inv", "qx", "qx_nm_inv"),
+        _first_present_member(keys, "qmap__qy", "qmap__qy_nm_inv", "qy", "qy_nm_inv"),
+        _first_present_member(
+            keys,
+            "analysis_domain__fit_valid_mask",
+            "valid_mask",
+            "fit_valid_mask",
+            "qmap__valid_mask",
+        ),
+    )
+
+
+def _zip_member_signature(
+    zip_obj: Any, member: str | None
+) -> tuple[int, int] | None:
+    """Return ``(CRC, file_size)`` for an archive member when lookup succeeds."""
+    if zip_obj is None or not member:
+        return None
+    zip_name = member if member.endswith(".npy") else f"{member}.npy"
+    try:
+        info = zip_obj.getinfo(zip_name)
+    except (AttributeError, KeyError):
+        return None
+    return (int(info.CRC), int(info.file_size))
+
+
+def _bounded_cache_get(cache: dict[Any, Any], key: Any) -> Any:
+    if key not in cache:
+        return _CACHE_MISS
+    value = cache.pop(key)
+    cache[key] = value
+    return value
+
+
+def _bounded_cache_put(
+    cache: dict[Any, Any],
+    key: Any,
+    value: Any,
+    *,
+    max_entries: int = _COORD_CACHE_MAX_ENTRIES,
+) -> None:
+    if key in cache:
+        cache.pop(key)
+    elif len(cache) >= max_entries:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
+def _freeze_array(array: np.ndarray) -> np.ndarray:
+    if array.flags.writeable:
+        try:
+            array.setflags(write=False)
+        except ValueError:
+            pass
+    return array
+
+
+def _load_cached_coordinates(
+    archive: Any,
+    zip_obj: Any,
+    keys: Mapping[str, str],
+    *,
+    qx_cache: dict[tuple[int, int], np.ndarray],
+    qy_cache: dict[tuple[int, int], np.ndarray],
+    mask_cache: dict[tuple[int, int], np.ndarray],
+    qmag_cache: dict[tuple[tuple[int, int], tuple[int, int]], np.ndarray],
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray,
+    tuple[int, int] | None,
+    tuple[int, int] | None,
+    tuple[int, int] | None,
+]:
+    """Load ``(qx, qy, mask, q_mag)`` reusing read-only arrays keyed by zip ``(CRC, size)``."""
+    qx_member, qy_member, mask_member = _resolve_coord_member_names(keys)
+    qx_sig = _zip_member_signature(zip_obj, qx_member)
+    qy_sig = _zip_member_signature(zip_obj, qy_member)
+    mask_sig = _zip_member_signature(zip_obj, mask_member) if mask_member is not None else None
+    if (
+        zip_obj is None
+        or qx_member is None
+        or qy_member is None
+        or qx_sig is None
+        or qy_sig is None
+        or (mask_member is not None and mask_sig is None)
+    ):
+        qx, qy, mask = _coordinates(archive, keys)
+        q_mag = np.hypot(qx, qy)
+        return qx, qy, mask, q_mag, None, None, None
+
+    qx = _bounded_cache_get(qx_cache, qx_sig)
+    if qx is _CACHE_MISS:
+        qx = np.asarray(archive[qx_member])
+        if qx.ndim != 2:
+            raise ValueError("Stored qx/qy maps must be matching two-dimensional arrays.")
+        _bounded_cache_put(qx_cache, qx_sig, _freeze_array(qx))
+
+    qy = _bounded_cache_get(qy_cache, qy_sig)
+    if qy is _CACHE_MISS:
+        qy = np.asarray(archive[qy_member])
+        if qy.ndim != 2:
+            raise ValueError("Stored qx/qy maps must be matching two-dimensional arrays.")
+        _bounded_cache_put(qy_cache, qy_sig, _freeze_array(qy))
+
+    if qx.ndim != 2 or qy.shape != qx.shape:
+        raise ValueError("Stored qx/qy maps must be matching two-dimensional arrays.")
+
+    mask: np.ndarray | None = None
+    if mask_member is not None:
+        assert mask_sig is not None
+        mask = _bounded_cache_get(mask_cache, mask_sig)
+        if mask is _CACHE_MISS:
+            loaded_mask = np.asarray(archive[mask_member])
+            if loaded_mask.shape != qx.shape:
+                raise ValueError("Stored usable-pixel mask does not match the q maps.")
+            mask = _freeze_array(loaded_mask.astype(bool))
+            _bounded_cache_put(mask_cache, mask_sig, mask)
+        elif mask.shape != qx.shape:
+            raise ValueError("Stored usable-pixel mask does not match the q maps.")
+
+    qmag_key = (qx_sig, qy_sig)
+    q_mag = _bounded_cache_get(qmag_cache, qmag_key)
+    if q_mag is _CACHE_MISS:
+        q_mag = _freeze_array(np.hypot(qx, qy))
+        _bounded_cache_put(qmag_cache, qmag_key, q_mag)
+
+    return qx, qy, mask, q_mag, qx_sig, qy_sig, mask_sig
 
 
 def _coordinates(archive: Any, keys: Mapping[str, str]) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
@@ -753,7 +901,16 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
         # Units can change between input sources. Each group receives its own
         # q-bin grid and sequence plots, with no conversion inferred here.
         bounds: dict[str, list[float]] = {}
+        qx_cache: dict[tuple[int, int], np.ndarray] = {}
+        qy_cache: dict[tuple[int, int], np.ndarray] = {}
+        mask_cache: dict[tuple[int, int], np.ndarray] = {}
+        qmag_cache: dict[tuple[tuple[int, int], tuple[int, int]], np.ndarray] = {}
+        bounds_cache: dict[
+            tuple[tuple[int, int], tuple[int, int], tuple[int, int] | None],
+            tuple[float, float] | None,
+        ] = {}
         with np.load(archive_path, allow_pickle=False) as archive:
+            zip_obj = getattr(archive, "zip", None)
             groups = _array_groups(archive.files)
             unit_records = _detail_records(folder, prefix)
             for position, source in enumerate(frames):
@@ -761,11 +918,53 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                 unit = _q_unit(record)
                 keys = groups.get(position, {})
                 try:
-                    qx, qy, mask = _coordinates(archive, keys)
-                    q = np.hypot(qx, qy)
-                    usable = np.isfinite(q) if mask is None else np.isfinite(q) & mask
-                    if np.any(usable):
-                        low, high = float(q[usable].min()), float(q[usable].max())
+                    qx_member, qy_member, mask_member = _resolve_coord_member_names(keys)
+                    qx_sig = _zip_member_signature(zip_obj, qx_member)
+                    qy_sig = _zip_member_signature(zip_obj, qy_member)
+                    mask_sig = (
+                        _zip_member_signature(zip_obj, mask_member)
+                        if mask_member is not None
+                        else None
+                    )
+                    if (
+                        zip_obj is not None
+                        and qx_sig is not None
+                        and qy_sig is not None
+                        and (mask_member is None or mask_sig is not None)
+                    ):
+                        bounds_key = (qx_sig, qy_sig, mask_sig)
+                        cached_bound = _bounded_cache_get(bounds_cache, bounds_key)
+                        if cached_bound is not _CACHE_MISS:
+                            if cached_bound is not None:
+                                low, high = cached_bound
+                                previous = bounds.get(unit, [low, high])
+                                bounds[unit] = [min(low, previous[0]), max(high, previous[1])]
+                            continue
+                    qx, qy, mask, q_mag, loaded_qx_sig, loaded_qy_sig, loaded_mask_sig = (
+                        _load_cached_coordinates(
+                            archive,
+                            zip_obj,
+                            keys,
+                            qx_cache=qx_cache,
+                            qy_cache=qy_cache,
+                            mask_cache=mask_cache,
+                            qmag_cache=qmag_cache,
+                        )
+                    )
+                    usable = np.isfinite(q_mag) if mask is None else np.isfinite(q_mag) & mask
+                    frame_bound = (
+                        (float(q_mag[usable].min()), float(q_mag[usable].max()))
+                        if np.any(usable)
+                        else None
+                    )
+                    if loaded_qx_sig is not None and loaded_qy_sig is not None:
+                        _bounded_cache_put(
+                            bounds_cache,
+                            (loaded_qx_sig, loaded_qy_sig, loaded_mask_sig),
+                            frame_bound,
+                        )
+                    if frame_bound is not None:
+                        low, high = frame_bound
                         previous = bounds.get(unit, [low, high])
                         bounds[unit] = [min(low, previous[0]), max(high, previous[1])]
                 except ValueError:
@@ -818,12 +1017,20 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                     **{key: morphology.get(key) for key in (
                         "status", "source_status", "source_reason", "ellipse", "parameter_rows")},
                     "observed_direction_summary": _direction_summary(morphology["observed_directions"] or morphology["observed_radial_peaks"])}})
-                image = qx = qy = mask = None
+                image = qx = qy = mask = q_mag = model = residual = None
                 try:
                     image = _get_array(archive, keys, "image", "data")
                     if image is None:
                         raise ValueError("Stored detector image is missing for this frame; other frames remain available.")
-                    qx, qy, mask = _coordinates(archive, keys)
+                    qx, qy, mask, q_mag, _, _, _ = _load_cached_coordinates(
+                        archive,
+                        zip_obj,
+                        keys,
+                        qx_cache=qx_cache,
+                        qy_cache=qy_cache,
+                        mask_cache=mask_cache,
+                        qmag_cache=qmag_cache,
+                    )
                     intensity_mode = _result_intensity_mode(record)
                     measurement = measure_frame(
                         image,
@@ -834,6 +1041,7 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                         q_edges=grids.get(unit),
                         radial_bins=settings["radial_bins"],
                         angular_bins=settings["angular_bins"],
+                        q_mag=q_mag,
                         intensity_mode=intensity_mode,
                     )
                     plot_record = {**record, "result": plot_result}
@@ -889,6 +1097,15 @@ def _build_sample(summary_path: Path, *, force: bool, resume: bool, settings: Ma
                         frame_report["lamellar_report_status"] = "incomplete"
                         frame_report["lamellar_error"] = str(exc)
                 frame_reports.append(frame_report)
+                del image, qx, qy, mask, q_mag, model, residual
+                if (position + 1) % 10 == 0:
+                    gc.collect()
+        qx_cache.clear()
+        qy_cache.clear()
+        mask_cache.clear()
+        qmag_cache.clear()
+        bounds_cache.clear()
+        gc.collect()
         for table in tables.values():
             table.close()
         sequence_folder = stage / "sequence"

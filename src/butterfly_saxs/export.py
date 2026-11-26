@@ -63,6 +63,47 @@ from .output_lock import output_lock
 from .producer import exporter_identity
 
 
+_NPZ_CHUNK_BYTES = 1_048_576
+_QMAP_STORED_MIN_BYTES = 1_048_576
+_UNCOMPRESSED_QMAP_SUFFIXES = (
+    "__qmap__qx",
+    "__qmap__qy",
+    "__qmap__q",
+    "__qmap__theta",
+    "__qmap__chi",
+)
+
+
+class _ChunkedBinaryWriter:
+    """Slice large binary writes into <= chunk_bytes pieces before calling the zip handle."""
+
+    def __init__(self, handle: Any, *, chunk_bytes: int = _NPZ_CHUNK_BYTES) -> None:
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be positive")
+        self._handle = handle
+        self._chunk_bytes = int(chunk_bytes)
+
+    def write(self, data: Any) -> int:
+        view = memoryview(data).cast("B")
+        total = view.nbytes
+        if total == 0:
+            return 0
+        step = self._chunk_bytes
+        written = 0
+        offset = 0
+        while offset < total:
+            chunk = view[offset : offset + step]
+            n = self._handle.write(chunk)
+            written += len(chunk) if n is None else int(n)
+            offset += len(chunk)
+        return written
+
+    def flush(self) -> None:
+        flush = getattr(self._handle, "flush", None)
+        if callable(flush):
+            flush()
+
+
 def _artifact_digest(path: Path) -> str:
     return sha256_file(path)
 
@@ -893,8 +934,24 @@ class StreamingBatchExporter:
         if not (item.resumed and self._old_npz is not None):
             _walk_arrays(item.result, array_prefix, arrays)
         for name, value in arrays.items():
-            with self._npz.open(name + ".npy", "w") as handle:
-                np.lib.format.write_array(handle, np.asarray(value), allow_pickle=False)
+            arr = np.asarray(value)
+            member_name = name + ".npy"
+            if (
+                name.endswith(_UNCOMPRESSED_QMAP_SUFFIXES)
+                and arr.dtype.kind == "f"
+                and arr.nbytes >= _QMAP_STORED_MIN_BYTES
+            ):
+                zinfo = zipfile.ZipInfo(member_name)
+                zinfo.compress_type = zipfile.ZIP_STORED
+                handle_cm = self._npz.open(zinfo, "w", force_zip64=True)
+            else:
+                handle_cm = self._npz.open(member_name, "w", force_zip64=True)
+            with handle_cm as handle:
+                np.lib.format.write_array(
+                    _ChunkedBinaryWriter(handle, chunk_bytes=_NPZ_CHUNK_BYTES),
+                    arr,
+                    allow_pickle=False,
+                )
             self._array_names.append(name)
         frame_array_names = list(arrays)
         if item.resumed and self._old_npz is not None:
@@ -1056,8 +1113,13 @@ class StreamingBatchExporter:
                         raise ValueError("Cannot retain unbound arrays from a previous NPZ; recover its producing commit marker before resuming.")
                     if not calculation_producers_compatible(self._old_producer, current_producer):
                         raise ValueError("Cannot retain arrays from a different calculation producer; rerun the affected frames.")
+                    old_info = self._old_npz.getinfo(name)
+                    zinfo = zipfile.ZipInfo(name)
+                    zinfo.compress_type = old_info.compress_type
+                    if zinfo.compress_type == zipfile.ZIP_DEFLATED:
+                        zinfo._compresslevel = self._npz.compresslevel
                     with self._old_npz.open(name, "r") as source_handle:
-                        with self._npz.open(name, "w") as target_handle:
+                        with self._npz.open(zinfo, "w", force_zip64=True) as target_handle:
                             shutil.copyfileobj(source_handle, target_handle)
                     merged_names.append(name)
                 metadata["arrays"] = [name[:-4] for name in merged_names if name.endswith(".npy")] + self._array_names
@@ -1069,7 +1131,7 @@ class StreamingBatchExporter:
                 self._old_npz = None
             metadata_bytes = io.BytesIO()
             np.lib.format.write_array(metadata_bytes, np.asarray(_json_text(metadata)), allow_pickle=False)
-            with self._npz.open("__metadata__.npy", "w") as handle:
+            with self._npz.open("__metadata__.npy", "w", force_zip64=True) as handle:
                 handle.write(metadata_bytes.getvalue())
             self._npz.close()
             for handle in self._handles.values():

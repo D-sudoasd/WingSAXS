@@ -404,3 +404,137 @@ def test_analysis_report_propagates_saxs_physics_and_enforces_raw_unit_honesty(t
     assert "saxs_physics.streak.summary.linear.W_nm" in fields
     assert not any(f.startswith("saxs_physics.harmonics.profile") for f in fields)
     assert not any("I_q[" in f or ".slices[" in f for f in fields)
+
+
+def test_build_analysis_report_reuses_identical_crc_coords_and_handles_geometry_change(
+    tmp_path, monkeypatch
+):
+    import shutil
+    from collections import Counter
+
+    import butterfly_saxs.report as report_mod
+    import butterfly_saxs.report_measurements as rm_mod
+
+    y, x = np.indices((10, 12), dtype=float)
+    qx_a, qy_a = (x - 5.5) * 0.1, (y - 4.5) * 0.1
+    mask_a = np.ones((10, 12), dtype=bool)
+    mask_a[:2, :2] = False
+
+    qx_b, qy_b = (x - 4.5) * 0.12, (y - 3.5) * 0.12
+    mask_b = np.ones((10, 12), dtype=bool)
+    mask_b[-2:, -2:] = False
+
+    def make_result(idx, qx, qy, mask):
+        q = np.hypot(qx, qy)
+        img = 2.0 + 15.0 * np.exp(-0.5 * ((q - 0.35) / 0.1) ** 2) * (1.0 + 0.1 * idx)
+        return {
+            "image": img,
+            "qmap": {"qx": qx, "qy": qy, "q_unit": "nm^-1"},
+            "valid_mask": mask,
+            "ellipse_fit": {"q_unit": "nm^-1", "parameters": {"a": 0.35}},
+        }
+
+    records = [
+        FrameFitResult(FrameRef("f0.edf", frame_id="f0", time=0.0), make_result(0, qx_a, qy_a, mask_a)),
+        FrameFitResult(FrameRef("f1.edf", frame_id="f1", time=1.0), make_result(1, qx_a, qy_a, mask_a)),
+        FrameFitResult(FrameRef("f2.edf", frame_id="f2", time=2.0), make_result(2, qx_b, qy_b, mask_b)),
+        FrameFitResult(FrameRef("f3.edf", frame_id="f3", time=3.0), make_result(3, qx_b, qy_b, mask_b)),
+    ]
+    cached_folder = tmp_path / "cached_batch"
+    uncached_folder = tmp_path / "uncached_batch"
+    export_batch(records, cached_folder)
+    shutil.copytree(cached_folder, uncached_folder)
+
+    loaded_counts: Counter[str] = Counter()
+    real_np_load = report_mod.np.load
+
+    class _ArchiveSpy:
+        def __init__(self, inner):
+            self._inner = inner
+            self.zip = inner.zip
+            self.files = inner.files
+
+        def __getitem__(self, key):
+            loaded_counts[key] += 1
+            return self._inner[key]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+    def spied_np_load(file, *args, **kwargs):
+        inner = real_np_load(file, *args, **kwargs)
+        if Path(file) == cached_folder / "results.npz":
+            return _ArchiveSpy(inner)
+        return inner
+
+    hypot_calls = 0
+    real_hypot = report_mod.np.hypot
+
+    class _HypotWrappedNp:
+        load = staticmethod(spied_np_load)
+
+        def __getattr__(self, name):
+            if name == "hypot":
+                def wrapped(*args, **kwargs):
+                    nonlocal hypot_calls
+                    hypot_calls += 1
+                    return real_hypot(*args, **kwargs)
+
+                return wrapped
+            return getattr(np, name)
+
+    seen_flags: list[tuple[bool, bool, bool, bool]] = []
+    real_measure_frame = rm_mod.measure_frame
+
+    def wrapped_measure_frame(image, qx, qy, **kwargs):
+        valid_mask = kwargs.get("valid_mask")
+        q_mag = kwargs.get("q_mag")
+        assert q_mag is not None
+        seen_flags.append((
+            qx.flags.writeable,
+            qy.flags.writeable,
+            bool(valid_mask.flags.writeable) if valid_mask is not None else False,
+            q_mag.flags.writeable,
+        ))
+        return real_measure_frame(image, qx, qy, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(report_mod, "np", _HypotWrappedNp())
+        patch.setattr(rm_mod, "measure_frame", wrapped_measure_frame)
+        cached_rep = build_analysis_report(cached_folder, radial_bins=6, angular_bins=8, formats=("png",), dpi=40)
+
+    assert hypot_calls == 2
+    assert seen_flags == [(False, False, False, False)] * 4
+    assert loaded_counts["frame_0000__qmap__qx"] == 1
+    assert loaded_counts["frame_0001__qmap__qx"] == 0
+    assert loaded_counts["frame_0002__qmap__qx"] == 1
+    assert loaded_counts["frame_0003__qmap__qx"] == 0
+    assert loaded_counts["frame_0000__valid_mask"] == 1
+    assert loaded_counts["frame_0001__valid_mask"] == 0
+    assert loaded_counts["frame_0002__valid_mask"] == 1
+    assert loaded_counts["frame_0003__valid_mask"] == 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(report_mod, "_zip_member_signature", lambda *_a, **_kw: None)
+        uncached_rep = build_analysis_report(uncached_folder, radial_bins=6, angular_bins=8, formats=("png",), dpi=40)
+
+    cached_dir = Path(cached_rep["outputs"]["summary"]).parent
+    uncached_dir = Path(uncached_rep["outputs"]["summary"]).parent
+    for fname in ("frame_measurements.csv", "radial_profiles.csv"):
+        c_rows = _rows(cached_dir / fname)
+        u_rows = _rows(uncached_dir / fname)
+        assert len(c_rows) == len(u_rows)
+        for c_row, u_row in zip(c_rows, u_rows, strict=True):
+            assert list(c_row) == list(u_row)
+            for key in c_row:
+                cv, uv = c_row[key], u_row[key]
+                try:
+                    cf, uf = float(cv), float(uv)
+                except (TypeError, ValueError):
+                    assert cv == uv
+                else:
+                    assert abs(cf - uf) <= 1e-12
+
