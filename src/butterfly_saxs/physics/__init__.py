@@ -14,13 +14,23 @@ from .radial import (
     _radial_metrics_from_1d_profile as _radial_metrics_from_1d_profile,
     measure_radial_coarsening_observables,
 )
+from .spinodal import (
+    analyze_cahn_hilliard_cook_early,
+    analyze_joint_spinodal_exponents,
+    analyze_khachaturyan_complex_scaling,
+    compute_dynamical_scaling_collapse,
+)
 from .streak import (
     _fit_1d_transverse_gaussian as _fit_1d_transverse_gaussian,
     measure_perpendicular_streak_width,
 )
 
 __all__ = [
+    "analyze_cahn_hilliard_cook_early",
+    "analyze_joint_spinodal_exponents",
+    "analyze_khachaturyan_complex_scaling",
     "compute_azimuthal_harmonics_and_order",
+    "compute_dynamical_scaling_collapse",
     "evaluate_c2_bridge_four_lobe",
     "fit_arrhenius_rate",
     "fit_c2_bridge_four_lobe",
